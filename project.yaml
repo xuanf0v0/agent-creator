@@ -1,28 +1,12 @@
 version: '1'
 name: 我的第一个智能体项目
-project_dir: /Users/ypc/agent-harness/examples
+project_dir: /Users/ypc/openagent
 agents:
-- id: echo
-  name: 回声智能体
-  description: 原样返回用户发送的消息，用于测试服务是否正常运行
-  mode: primary
-  model: kax/grok-4.5
-  prompt: '你是一个简单的回声智能体。
-
-    请理解用户输入，并用简洁、友好的中文回应。
-
-    '
-  max_steps: 10
-  tools: {}
-  permission:
-    edit: deny
-    bash: deny
-    webfetch: deny
 - id: coding
-  name: 代码助手
-  description: 在示例项目中完成任务，并在结束前运行验证命令
+  name: OpenCode 代码助手
+  description: 通过真实 OpenCode 模型在当前项目中完成任务
   mode: primary
-  model: kax/grok-4.5
+  model: deepseek/deepseek-v4-flash
   prompt: '你是一名谨慎的代码助手。
 
     开始工作前先阅读项目说明，完成任务后运行验证命令。
@@ -37,57 +21,37 @@ agents:
     bash: ask
     webfetch: ask
 providers:
-- id: kax
-  name: KAX 模型服务
+- id: deepseek
+  name: DeepSeek API
   npm: '@ai-sdk/openai-compatible'
-  base_url: https://ai.kaxhub.com/v1
-  api_key_env: KAX_API_KEY
+  base_url: https://api.deepseek.com
+  api_key_env: OPENAI_API_KEY
+  env_file: /Users/ypc/agent-manager/agents/listing-optimization/.env
   models:
-    grok-4.5:
-      name: Grok 4.5
+    deepseek-v4-flash:
+      name: DeepSeek V4 Flash
 harness:
-- id: echo
-  name: 回声服务
-  description: Agent Harness 自带的最小 HTTP 服务示例
-  cwd: /Users/ypc/agent-harness/examples/echo_agent
-  service:
-    command:
-    - uv
-    - run
-    - uvicorn
-    - app:app
-    - --host
-    - 127.0.0.1
-    - --port
-    - '8766'
-    port: 8766
-    health:
-      path: /health
-      timeout_seconds: 15
-  env_file: .env
-  config:
-  - key: ECHO_PREFIX
-    label: 回声前缀
-    type: string
-    default: Echo
 - id: coding
-  name: 代码任务
-  description: Agent Harness 自带的受治理代码任务示例
-  cwd: /Users/ypc/agent-harness/examples/coding_agent
+  name: OpenCode 模型任务
+  description: Agent Harness 治理下的真实 OpenCode CLI 任务
+  cwd: /Users/ypc/openagent
   task:
     command:
-    - uv
-    - run
-    - python
-    - worker.py
+    - /Users/ypc/openagent/.venv/bin/python
+    - -m
+    - openagent_studio.harness_opencode
+    - --model
+    - deepseek/deepseek-v4-flash
+    - --agent
+    - build
+    - --env-file
+    - /Users/ypc/agent-manager/agents/listing-optimization/.env
     verification:
-    - name: 检查输出文件
+    - name: 运行项目测试
       command:
-      - uv
-      - run
-      - python
-      - verify.py
-      timeout_seconds: 30
+      - /Users/ypc/openagent/.venv/bin/pytest
+      - -q
+      timeout_seconds: 120
     tools:
       allow:
       - read
@@ -99,32 +63,191 @@ harness:
   env_file: .env
   config: []
 workflows:
-- id: example-flow
-  name: 代码任务示例流程
+- id: product-selection
+  name: 智能选品决策流程
   nodes:
-  - id: 开始代码任务
-    type: agent
+  - id: selection-start
+    type: manual_trigger
     data:
-      agent_id: coding
+      description: 输入选品目标
     position:
       x: 80.0
-      y: 80.0
-  - id: 运行验证
-    type: validator
+      y: 180.0
+  - id: requirement-analysis
+    type: agent
     data:
-      description: 检查代码任务是否通过验证
+      description: 整理选品需求与评价标准
+      agent_id: coding
+      title: 选品需求分析
+      prompt: '你是一名跨境电商选品需求分析师。
+
+        目标：把用户输入整理为可执行的选品约束和评分标准。
+
+        输入：{{input}}
+
+        约束：不要虚构用户未提供的硬性数据；缺失信息要明确标注为假设；至少覆盖目标市场、渠道、品类、价格带、客群、预算、毛利目标和风险偏好。
+
+        输出：使用中文 Markdown，依次给出“需求摘要”“硬性约束”“待验证假设”“加权评分维度”，评分权重总和必须为 100%。'
+      relative_path: .
     position:
       x: 320.0
-      y: 80.0
-  - id: 输出结果
-    type: output
-    data: {}
+      y: 180.0
+  - id: market-research
+    type: agent
+    data:
+      description: 研究市场与候选商品
+      agent_id: coding
+      title: 市场机会研究
+      prompt: '你是一名严谨的电商市场研究员。
+
+        目标：根据上游需求提出 3-5 个候选商品并比较市场机会。
+
+        用户原始输入：{{input}}
+
+        上游需求分析：{{latest}}
+
+        约束：明确区分已知事实、合理推断和需要外部数据验证的内容；不得伪造实时销量、搜索量或竞品数据；每个候选品都要列出需求驱动、季节性、竞争强度、供应链难度和合规风险。
+
+        输出：使用中文 Markdown 表格列出候选商品，并在表后给出数据缺口与下一步调研建议。'
+      relative_path: .
     position:
       x: 560.0
-      y: 80.0
+      y: 180.0
+  - id: competitor-analysis
+    type: agent
+    data:
+      description: 分析竞品与差异化空间
+      agent_id: coding
+      title: 竞品与差异化分析
+      prompt: '你是一名电商竞品策略分析师。
+
+        目标：对候选商品进行竞品结构、用户痛点和差异化机会分析，并淘汰明显不合适的候选品。
+
+        用户原始输入：{{input}}
+
+        候选商品研究：{{latest}}
+
+        约束：不能把未经验证的估算表述成事实；必须说明判断依据和置信度；重点检查价格战、评论壁垒、专利商标、认证、运输和售后风险。
+
+        输出：使用中文 Markdown，逐项给出“主要竞品形态、未满足需求、可执行差异化、进入风险、置信度”，最后保留最多 3 个候选品进入利润评估。'
+      relative_path: .
+    position:
+      x: 800.0
+      y: 180.0
+  - id: profit-evaluation
+    type: agent
+    data:
+      description: 评估利润、风险并给出推荐
+      agent_id: coding
+      title: 选品利润与风险评估
+      prompt: '你是一名电商商品经理和单位经济模型分析师。
+
+        目标：基于候选品分析给出最终选品建议，并建立可复核的利润与风险门槛。
+
+        用户原始输入：{{input}}
+
+        竞品分析：{{latest}}
+
+        约束：对售价、采购、物流、平台佣金、广告、退货和税费分别列出假设；计算贡献毛利率时展示公式；缺数据时给出保守/基准/乐观三种情景；只有在基准情景满足用户毛利目标且不存在不可接受合规风险时才可通过。
+
+        输出：使用中文 Markdown，包含候选品评分表、三情景单位经济模型、主要风险、7 天验证计划和唯一首选商品。最后单独一行严格输出 `DECISION=PASS`
+        或 `DECISION=REJECT`，不得添加其他字符。'
+      relative_path: .
+    position:
+      x: 1040.0
+      y: 180.0
+  - id: profit-gate
+    type: condition
+    data:
+      description: 判断是否达到推荐门槛
+      expression: latest.text contains DECISION=PASS
+    position:
+      x: 1280.0
+      y: 180.0
+  - id: selection-approval
+    type: approval
+    data:
+      description: 人工确认推荐商品与验证预算
+      instructions: 请核对利润假设、合规风险和 7 天验证计划；确认后才输出正式选品报告。
+    position:
+      x: 1520.0
+      y: 100.0
+  - id: selected-output
+    type: output
+    data:
+      description: 输出通过审批的选品报告
+      template: '# 最终选品报告
+
+
+        {{nodes.profit-evaluation.text}}
+
+
+        审批结果：已通过，可进入小规模验证。'
+    position:
+      x: 1760.0
+      y: 100.0
+  - id: rejected-output
+    type: output
+    data:
+      description: 输出未通过门槛的评估报告
+      template: '# 选品暂不通过
+
+
+        {{nodes.profit-evaluation.text}}
+
+
+        当前候选品未达到利润或风险门槛，请补充数据或调整约束后重新运行。'
+    position:
+      x: 1520.0
+      y: 280.0
+  - id: market-knowledge
+    type: knowledge_retrieval
+    data:
+      description: 检索市场与品类知识
+      query: 根据选品需求检索目标市场的品类趋势、需求机会与竞争知识：{{nodes.requirement-analysis.text}}
+      top_k: 5
+      documents: 市场趋势报告、品类洞察文档、竞品情报与行业调研资料集
+    position:
+      x: 80.0
+      y: 530.0
+  - id: analysis-validator
+    type: validator
+    data:
+      description: 校验候选品分析质量
+      agent_id: coding
+      prompt: '你是一名电商选品流程质检员。
+
+        目标：校验上游竞品分析是否达到进入利润评估的质量门槛。
+
+        输入：{{nodes.competitor-analysis.text}}
+
+        约束：检查是否保留 1-3 个候选商品；每个候选品是否都包含主要竞品形态、未满足需求、可执行差异化、进入风险和置信度；若缺字段、数据虚构或结论自相矛盾，必须逐条列出问题。
+
+        输出：使用中文 Markdown，先给出一行“校验结论：通过/需修订”，再列出通过项与问题项；只有“通过”才允许进入利润评估。'
+    position:
+      x: 340.0
+      y: 530.0
   edges:
-  - source: 开始代码任务
-    target: 运行验证
-  - source: 运行验证
-    target: 输出结果
+  - source: selection-start
+    target: requirement-analysis
+  - source: market-research
+    target: competitor-analysis
+  - source: profit-evaluation
+    target: profit-gate
+  - source: profit-gate
+    target: selection-approval
+    condition: 'true'
+  - source: profit-gate
+    target: rejected-output
+    condition: 'false'
+  - source: selection-approval
+    target: selected-output
+  - source: requirement-analysis
+    target: market-knowledge
+  - source: market-knowledge
+    target: market-research
+  - source: competitor-analysis
+    target: analysis-validator
+  - source: analysis-validator
+    target: profit-evaluation
 description: 用于体验 OpenAgent Studio 中文配置界面的示例项目

@@ -4,6 +4,15 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+WORKFLOW_NODE_TYPES = {
+    "manual_trigger", "webhook", "schedule",
+    "llm", "agent", "knowledge_retrieval", "tool", "http_request", "code",
+    "prompt", "variable_set", "transform", "merge",
+    "condition", "switch", "parallel", "iteration", "loop",
+    "approval", "validator", "subworkflow", "delay", "output",
+}
+
+
 class PermissionConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
     edit: Literal["ask", "allow", "deny"] = "ask"
@@ -33,6 +42,7 @@ class ProviderSpec(BaseModel):
     npm: str = "@ai-sdk/openai-compatible"
     base_url: str | None = None
     api_key_env: str | None = None
+    env_file: str | None = None
     models: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -50,9 +60,16 @@ class HarnessSpec(BaseModel):
 
 class WorkflowNode(BaseModel):
     id: str
-    type: Literal["agent", "prompt", "condition", "parallel", "loop", "approval", "validator", "output"]
+    type: str
     data: dict[str, Any] = Field(default_factory=dict)
     position: dict[str, float] = Field(default_factory=lambda: {"x": 80, "y": 80})
+
+    @field_validator("type")
+    @classmethod
+    def supported_type(cls, value: str) -> str:
+        if value not in WORKFLOW_NODE_TYPES:
+            raise ValueError(f"unsupported workflow node type: {value}")
+        return value
 
 
 class WorkflowEdge(BaseModel):

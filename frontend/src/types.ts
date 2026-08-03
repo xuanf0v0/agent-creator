@@ -1,6 +1,9 @@
-export type NodeKind = 'agent' | 'prompt' | 'condition' | 'parallel' | 'loop' | 'approval' | 'validator' | 'output'
+export type NodeKind = 'manual_trigger' | 'webhook' | 'schedule' | 'llm' | 'agent' | 'knowledge_retrieval' | 'tool' | 'http_request' | 'code' | 'prompt' | 'variable_set' | 'transform' | 'merge' | 'condition' | 'switch' | 'parallel' | 'iteration' | 'loop' | 'approval' | 'validator' | 'subworkflow' | 'delay' | 'output'
 export type WorkflowNode = { id: string; type: NodeKind; data: Record<string, unknown>; position: { x: number; y: number } }
 export type WorkflowEdge = { source: string; target: string; condition?: string | null }
 export type Workflow = { id: string; name: string; nodes: WorkflowNode[]; edges: WorkflowEdge[] }
 export type Agent = { id: string; name: string; description?: string; model?: string }
-export type ProjectSpec = { version: '1'; name: string; description?: string; project_dir: string; agents: Agent[]; providers: unknown[]; harness: unknown[]; workflows: Workflow[] }
+export type Harness = { id: string; name: string; description?: string; cwd: string; task?: Record<string, unknown>; service?: Record<string, unknown> }
+export type ProjectSpec = { version: '1'; name: string; description?: string; project_dir: string; agents: Agent[]; providers: unknown[]; harness: Harness[]; workflows: Workflow[] }
+export type NodeRunState = { status: 'pending' | 'running' | 'waiting' | 'completed' | 'failed' | 'skipped'; output?: unknown; error?: string }
+export type WorkflowRun = { id: string; workflow_id: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'; input: unknown; node_states: Record<string, NodeRunState>; outputs: Record<string, unknown>; waiting_approvals: string[]; error: string }

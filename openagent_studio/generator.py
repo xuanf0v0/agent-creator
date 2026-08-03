@@ -12,20 +12,38 @@ import time
 import uuid
 from typing import Any
 
-from .models import WorkflowSpec
+from .models import WORKFLOW_NODE_TYPES, WorkflowSpec
 from .store import SpecStore
 
 
-SYSTEM_PROMPT = """你是 OpenAgent Studio 的工作流生成核心。你的唯一职责是把用户需求转换为智能体工作流。
+NODE_DATA_FIELDS = {
+    "description", "agent_id", "title", "prompt", "template", "expression", "iterations", "relative_path",
+    "service_path", "method", "body", "headers", "url", "timeout_seconds", "fail_on_error", "allow_private",
+    "path", "cron", "timezone", "query", "top_k", "documents", "variables", "operation", "fields", "mode",
+    "separator", "cases", "default_case", "instructions", "workflow_id", "input_template", "seconds",
+    "auto_start", "auto_setup", "retry_count", "retry_delay_seconds", "on_error", "fallback_value",
+}
+
+
+SYSTEM_PROMPT = """你是 OpenAgent Studio 的工作流生成核心。你的唯一职责是把用户需求转换为可直接执行的智能体工作流。
 不要修改文件、不要运行命令、不要调用外部工具。请用中文简短说明你的设计，并逐个输出操作。
 每个操作必须独占一行，格式为 <op>{JSON}</op>。支持：
-add_node: {"action":"add_node","id":"英文小写编号","type":"agent|prompt|condition|parallel|loop|approval|validator|output","description":"中文说明","agent_id":"可选"}
-update_node: {"action":"update_node","id":"节点编号","description":"中文说明","agent_id":"可选"}
+add_node: {"action":"add_node","id":"英文小写编号","type":"下方支持的节点类型","data":{"description":"中文说明","agent_id":"AI节点必填","prompt":"任务提示词","template":"模板","expression":"表达式"}}
+update_node: {"action":"update_node","id":"节点编号","data":{"description":"中文说明","prompt":"完整任务提示词等"}}
 delete_node: {"action":"delete_node","id":"节点编号"}
-connect_nodes: {"action":"connect_nodes","source":"来源节点","target":"目标节点"}
+connect_nodes: {"action":"connect_nodes","source":"来源节点","target":"目标节点","condition":"条件分支可选，通常为true或false"}
 disconnect_nodes: {"action":"disconnect_nodes","source":"来源节点","target":"目标节点"}
 完成时必须输出 <op>{"action":"finalize_workflow"}</op>。不要把多个操作放进一个 JSON 数组。
 优先增量修改已有工作流；不要删除与需求无关的节点。节点编号只能使用小写字母、数字和短横线。
+配置要求：
+支持的节点类型：manual_trigger, webhook, schedule, llm, agent, knowledge_retrieval, tool, http_request, code, prompt, variable_set, transform, merge, condition, switch, parallel, iteration, loop, approval, validator, subworkflow, delay, output。
+1. llm/agent/tool/code 节点必须从“可用 Harness 智能体”中选择 agent_id，并填写具体、可执行、包含输入上下文的 prompt；不要只复述节点名称。
+2. prompt 节点必须填写 template；condition 必须填写 expression，并给出带 true/false condition 的出边。
+3. iteration/loop 必须填写 1-100 的 iterations 和 template；validator 如选择智能体必须填写 agent_id 和 prompt。
+4. 模板可使用 {{input}}、{{latest}}、{{nodes.节点ID}}，循环模板还可使用 {{index}}。
+5. 每个任务提示词要写明角色、目标、输入、约束和预期输出，确保单独交给智能体也能执行。
+6. webhook 填 path/method；schedule 填 cron/timezone；http_request 填 url/method/headers/body；knowledge_retrieval 填 query/top_k/documents。
+7. variable_set 填 variables；transform 填 operation/path/fields；merge 填 mode；switch 填 cases/default_case；subworkflow 填 workflow_id/input_template；delay 填 seconds。
 """
 
 
@@ -44,6 +62,8 @@ class Generation:
     completed: bool = False
     session_id: str | None = None
     operation_ids: set[str] = field(default_factory=set)
+    harness_agent_ids: set[str] = field(default_factory=set)
+    model: str = ""
 
     def emit(self, event: str, data: dict[str, Any]) -> None:
         item = {"event": event, "data": data, "sequence": len(self.events), "timestamp": time.time()}
@@ -57,8 +77,53 @@ class GeneratorManager:
         self.generations: dict[str, Generation] = {}
         self.active: dict[str, str] = {}
         self.sessions: dict[str, str] = {}
+        self.session_models: dict[str, str] = {}
         self.history: dict[str, list[dict[str, str]]] = {}
         self._lock = threading.RLock()
+
+    def model(self, spec: Any | None = None) -> str:
+        project = spec or self.store.load()
+        model = os.environ.get("OPENCODE_GENERATOR_MODEL") or next((agent.model for agent in project.agents if agent.model), None)
+        if not model:
+            raise RuntimeError("未配置 OpenCode 生成模型，请设置 OPENCODE_GENERATOR_MODEL 或 agents[].model")
+        return model
+
+    def status(self, spec: Any | None = None) -> dict[str, Any]:
+        project = spec or self.store.load()
+        model = self.model(project)
+        provider_id = model.split("/", 1)[0] if "/" in model else ""
+        provider = next((item for item in project.providers if item.id == provider_id), None)
+        credential_env = provider.api_key_env if provider else None
+        credential_ready = not credential_env or bool(self._environment(project).get(credential_env))
+        return {
+            "backend": "opencode", "binary": os.environ.get("OPENCODE_BIN", "opencode"),
+            "model": model, "ready": credential_ready, "credential_env": credential_env,
+        }
+
+    def ensure_ready(self, spec: Any | None = None) -> dict[str, Any]:
+        status = self.status(spec)
+        if not status["ready"]:
+            raise RuntimeError(f"真实模型 {status['model']} 缺少环境变量 {status['credential_env']}")
+        return status
+
+    @staticmethod
+    def _environment(spec: Any) -> dict[str, str]:
+        environment = os.environ.copy()
+        model = os.environ.get("OPENCODE_GENERATOR_MODEL") or next((agent.model for agent in spec.agents if agent.model), "")
+        provider_id = model.split("/", 1)[0] if "/" in model else ""
+        provider = next((item for item in spec.providers if item.id == provider_id), None)
+        if provider and provider.env_file:
+            path = Path(provider.env_file).expanduser()
+            if path.is_file():
+                for raw in path.read_text(encoding="utf-8").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key, value = key.strip(), value.strip().strip("'\"")
+                    if key and not environment.get(key):
+                        environment[key] = value
+        return environment
 
     def start(self, workflow_id: str, message: str) -> Generation:
         message = message.strip()
@@ -69,6 +134,7 @@ class GeneratorManager:
             if active_id and not self.generations[active_id].completed:
                 raise RuntimeError("这个工作流正在生成，请先等待或停止当前生成")
             spec = self.store.load()
+            model = self.ensure_ready(spec)["model"]
             workflow = next((item for item in spec.workflows if item.id == workflow_id), None)
             if workflow is None:
                 raise KeyError(workflow_id)
@@ -79,7 +145,9 @@ class GeneratorManager:
                 draft=workflow.model_dump(mode="json"),
                 prompt=message,
                 messages=[{"role": "user", "content": message}],
-                session_id=self.sessions.get(workflow_id),
+                session_id=self.sessions.get(workflow_id) if self.session_models.get(workflow_id) == model else None,
+                harness_agent_ids={item.id for item in spec.harness},
+                model=model,
             )
             self.generations[generation.id] = generation
             self.active[workflow_id] = generation.id
@@ -104,11 +172,14 @@ class GeneratorManager:
 
     def _run(self, generation: Generation, spec: Any) -> None:
         generation.emit("generation.started", {"generation_id": generation.id, "workflow_id": generation.workflow_id})
-        model = os.environ.get("OPENCODE_GENERATOR_MODEL") or next((agent.model for agent in spec.agents if agent.model), None)
-        prompt = f"{SYSTEM_PROMPT}\n当前工作流：\n{json.dumps(generation.draft, ensure_ascii=False)}\n\n用户需求：{generation.prompt}"
+        model = generation.model or self.ensure_ready(spec)["model"]
+        catalog = [
+            {"id": item.id, "name": item.name, "description": item.description, "runtime": "task" if item.task else "service"}
+            for item in spec.harness
+        ]
+        prompt = f"{SYSTEM_PROMPT}\n可用 Harness 智能体：\n{json.dumps(catalog, ensure_ascii=False)}\n\n当前工作流：\n{json.dumps(generation.draft, ensure_ascii=False)}\n\n用户需求：{generation.prompt}"
         command = [os.environ.get("OPENCODE_BIN", "opencode"), "run", "--format", "json", "--agent", "plan", "--title", f"OpenAgent生成-{generation.workflow_id}"]
-        if model:
-            command += ["--model", model]
+        command += ["--model", model]
         if generation.session_id:
             command += ["--session", generation.session_id]
         command.append(prompt)
@@ -116,11 +187,12 @@ class GeneratorManager:
         if not workdir.is_dir():
             workdir = self.store.path.parent
         assistant_text = ""
+        diagnostics: list[str] = []
         parsed_until = 0
         try:
             generation.process = subprocess.Popen(
                 command, cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                bufsize=1, env=os.environ.copy(),
+                bufsize=1, env=self._environment(spec),
             )
             assert generation.process.stdout is not None
             for raw in generation.process.stdout:
@@ -129,7 +201,12 @@ class GeneratorManager:
                 try:
                     item = json.loads(raw)
                 except json.JSONDecodeError:
+                    if raw.strip():
+                        diagnostics.append(raw.strip())
                     continue
+                error_text = _extract_error(item)
+                if error_text:
+                    diagnostics.append(error_text)
                 generation.session_id = generation.session_id or _find_string(item, "sessionID")
                 text = _extract_text(item)
                 if not text:
@@ -155,7 +232,8 @@ class GeneratorManager:
             if generation.cancelled:
                 return
             if code != 0:
-                raise RuntimeError(f"OpenCode 退出，代码 {code}")
+                detail = diagnostics[-1] if diagnostics else "没有返回错误详情，请检查 OpenCode 日志"
+                raise RuntimeError(f"OpenCode 退出，代码 {code}：{detail}")
             if not generation.completed:
                 self._finalize(generation)
             clean_text = re.sub(r"<op>.*?</op>", "", assistant_text, flags=re.DOTALL).strip()
@@ -163,6 +241,7 @@ class GeneratorManager:
                 self.history[generation.workflow_id].append({"role": "assistant", "content": clean_text})
             if generation.session_id:
                 self.sessions[generation.workflow_id] = generation.session_id
+                self.session_models[generation.workflow_id] = model
         except Exception as exc:
             generation.completed = True
             generation.emit("generation.failed", {"message": str(exc)})
@@ -185,12 +264,12 @@ class GeneratorManager:
             if len(nodes) >= 50:
                 raise ValueError("节点数量不能超过 50")
             kind = operation["type"]
-            if kind not in {"agent", "prompt", "condition", "parallel", "loop", "approval", "validator", "output"}:
+            if kind not in WORKFLOW_NODE_TYPES:
                 raise ValueError(f"不支持的节点类型：{kind}")
             index = len(nodes)
-            data = {"description": operation.get("description", node_id)}
-            if operation.get("agent_id"):
-                data["agent_id"] = operation["agent_id"]
+            data = _operation_data(kind, operation, node_id)
+            if data.get("agent_id") and data["agent_id"] not in generation.harness_agent_ids:
+                raise ValueError(f"不存在的 Harness 智能体：{data['agent_id']}")
             node = {"id": node_id, "type": kind, "data": data, "position": {"x": 80 + (index % 3) * 260, "y": 80 + (index // 3) * 150}}
             nodes.append(node)
             generation.emit("workflow.node.added", {"node": node})
@@ -198,10 +277,10 @@ class GeneratorManager:
             node = next((item for item in nodes if item["id"] == operation["id"]), None)
             if node is None:
                 raise ValueError(f"找不到节点：{operation['id']}")
-            if "description" in operation:
-                node["data"]["description"] = operation["description"]
-            if "agent_id" in operation:
-                node["data"]["agent_id"] = operation["agent_id"]
+            updates = operation.get("data") if isinstance(operation.get("data"), dict) else operation
+            node["data"].update({key: value for key, value in updates.items() if key in NODE_DATA_FIELDS})
+            if node["data"].get("agent_id") and node["data"]["agent_id"] not in generation.harness_agent_ids:
+                raise ValueError(f"不存在的 Harness 智能体：{node['data']['agent_id']}")
             generation.emit("workflow.node.updated", {"node": node})
         elif action == "delete_node":
             node_id = operation["id"]
@@ -215,6 +294,8 @@ class GeneratorManager:
             if len(edges) >= 100:
                 raise ValueError("连线数量不能超过 100")
             edge = {"source": source, "target": target}
+            if operation.get("condition"):
+                edge["condition"] = str(operation["condition"])
             if edge not in edges:
                 edges.append(edge)
                 generation.emit("workflow.edge.added", {"edge": edge})
@@ -265,3 +346,71 @@ def _extract_text(item: dict[str, Any]) -> str:
     if item.get("type") == "text" and isinstance(item.get("text"), str):
         return item["text"]
     return ""
+
+
+def _extract_error(item: dict[str, Any]) -> str:
+    event_type = str(item.get("type", "")).lower()
+    if "error" not in event_type and not item.get("error"):
+        return ""
+    value: Any = item.get("error") or item.get("properties") or item
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, dict):
+        for key in ("message", "name", "error"):
+            if isinstance(value.get(key), str):
+                return value[key][:1000]
+        nested = value.get("data")
+        if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+            return nested["message"][:1000]
+    return "OpenCode 返回错误事件"
+
+
+def _operation_data(kind: str, operation: dict[str, Any], node_id: str) -> dict[str, Any]:
+    supplied = operation.get("data") if isinstance(operation.get("data"), dict) else operation
+    description = str(supplied.get("description") or operation.get("description") or node_id)
+    data = {key: value for key, value in supplied.items() if key in NODE_DATA_FIELDS}
+    data["description"] = description
+    if kind in {"llm", "agent", "tool", "code"}:
+        agent_id = data.get("agent_id") or operation.get("agent_id")
+        if not agent_id:
+            raise ValueError(f"智能体节点 {node_id} 缺少 agent_id")
+        data["agent_id"] = agent_id
+        data.setdefault("prompt", f"你负责{description}。请基于工作流输入与上游结果完成任务。\n\n工作流输入：{{{{input}}}}\n上游结果：{{{{latest}}}}\n\n请输出结构清晰、可供后续节点使用的结果。")
+    elif kind == "prompt":
+        data.setdefault("template", f"{description}\n\n输入：{{{{input}}}}\n上游结果：{{{{latest}}}}")
+    elif kind == "knowledge_retrieval":
+        data.setdefault("query", "{{latest}}")
+        data.setdefault("top_k", 3)
+        data.setdefault("documents", [])
+    elif kind == "http_request":
+        data.setdefault("method", "GET")
+        data.setdefault("headers", {})
+        data.setdefault("timeout_seconds", 30)
+        data.setdefault("fail_on_error", True)
+    elif kind == "variable_set":
+        data.setdefault("variables", {})
+    elif kind == "transform":
+        data.setdefault("operation", "json_stringify")
+    elif kind == "merge":
+        data.setdefault("mode", "array")
+    elif kind == "condition":
+        data.setdefault("expression", "latest")
+    elif kind == "switch":
+        data.setdefault("cases", [])
+        data.setdefault("default_case", "default")
+    elif kind in {"iteration", "loop"}:
+        data.setdefault("iterations", 3)
+        data.setdefault("template", f"{description}（第 {{{{index}}}} 次）\n{{{{latest}}}}")
+    elif kind == "validator" and data.get("agent_id"):
+        data.setdefault("prompt", f"你负责{description}。请验证以下上游结果并明确给出是否通过、问题清单和修正建议：\n\n{{{{latest}}}}")
+    elif kind == "webhook":
+        data.setdefault("path", f"/hooks/{node_id}")
+        data.setdefault("method", "POST")
+    elif kind == "schedule":
+        data.setdefault("cron", "0 9 * * *")
+        data.setdefault("timezone", "Asia/Shanghai")
+    elif kind == "approval":
+        data.setdefault("instructions", description)
+    elif kind == "delay":
+        data.setdefault("seconds", 1)
+    return data

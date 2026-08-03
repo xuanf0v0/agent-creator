@@ -4,27 +4,45 @@ import os
 import signal
 import subprocess
 import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from .compiler import compile_harness, compile_opencode
 from .models import ProjectSpec, WorkflowSpec
 from .store import SpecStore
 from .generator import GeneratorManager
+from .workflow_runner import TERMINAL_RUN_STATES, WorkflowManager, validate_executable_workflow
 
 
 class HarnessManager:
-    def __init__(self) -> None:
+    def __init__(self, project_root: Path | None = None) -> None:
         root = Path(os.environ.get("AGENT_HARNESS_ROOT", Path.home() / "agent-harness"))
         self.command = Path(os.environ.get("AGENT_HARNESS_BIN", root / ".venv/bin/agent-harness"))
-        self.manifests = Path(os.environ.get("AGENT_HARNESS_MANIFESTS", root / "agents"))
+        self.manifests = Path(os.environ.get("AGENT_HARNESS_MANIFESTS", (project_root or Path.cwd()) / ".openagent-agents"))
         self.root = root
         self.process: subprocess.Popen | None = None
         self.error = ""
         self.operations: dict[str, dict[str, str]] = {}
+
+    def sync(self, spec: ProjectSpec) -> None:
+        if not spec.harness or os.environ.get("OPENAGENT_SYNC_HARNESS", "1") == "0":
+            return
+        try:
+            self.manifests.mkdir(parents=True, exist_ok=True)
+            for item in spec.harness:
+                target = self.manifests / f"{item.id}.yaml"
+                content = compile_harness(spec, item.id)
+                if not target.is_file() or target.read_text(encoding="utf-8") != content:
+                    temporary = target.with_suffix(".yaml.tmp")
+                    temporary.write_text(content, encoding="utf-8")
+                    temporary.replace(target)
+        except OSError as exc:
+            self.error = f"无法同步 Harness manifests：{exc}"
+            raise RuntimeError(self.error) from exc
 
     def reachable(self) -> bool:
         try:
@@ -46,6 +64,16 @@ class HarnessManager:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if self.reachable():
+                    self.error = ""
+                    return
+                if self.process.poll() is not None:
+                    self.error = f"Harness 启动进程已退出（code={self.process.returncode}）"
+                    return
+                time.sleep(0.1)
+            self.error = "Harness 启动超时，请检查 manifest 和 Harness 日志"
         except OSError as exc:
             self.error = f"Harness 启动失败：{exc}"
 
@@ -61,21 +89,29 @@ class HarnessManager:
 
 def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = None) -> FastAPI:
     store = SpecStore(spec_path or Path(os.environ.get("OPENAGENT_SPEC", "project.yaml")))
-    manager = HarnessManager()
+    manager = HarnessManager(store.path.resolve().parent)
     generator = GeneratorManager(store)
+    workflows = WorkflowManager(os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"))
     enabled = auto_start_harness if auto_start_harness is not None else os.environ.get("OPENAGENT_START_HARNESS", "1") != "0"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         if enabled:
-            manager.start()
+            try:
+                manager.sync(store.load())
+                manager.start()
+            except RuntimeError:
+                pass
+        workflows.start_scheduler(store.load)
         yield
+        workflows.stop_scheduler()
         manager.stop()
 
     app = FastAPI(title="OpenAgent Studio", version="0.1.0", lifespan=lifespan)
     app.state.store = store
     app.state.harness_manager = manager
     app.state.generator_manager = generator
+    app.state.workflow_manager = workflows
     static_dir = Path(__file__).parent / "static"
     assets_dir = static_dir / "assets"
     if assets_dir.is_dir():
@@ -91,6 +127,11 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
             etag = store.save(spec, if_match)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if enabled:
+            try:
+                manager.sync(spec)
+            except RuntimeError:
+                pass
         return {"etag": etag, "spec": spec.model_dump(mode="json", exclude_none=True)}
 
     @app.post("/api/spec/validate")
@@ -131,13 +172,7 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
         workflow = next((item for item in store.load().workflows if item.id == workflow_id), None)
         if workflow is None:
             raise HTTPException(status_code=404, detail="找不到工作流")
-        node_ids = {node.id for node in workflow.nodes}
-        errors = []
-        for edge in workflow.edges:
-            if edge.source not in node_ids or edge.target not in node_ids:
-                errors.append(f"连线引用了不存在的节点：{edge.source} → {edge.target}")
-            if edge.source == edge.target:
-                errors.append(f"节点不能连接到自身：{edge.source}")
+        errors = validate_executable_workflow(store.load(), workflow)
         return {"valid": not errors, "errors": errors}
 
     @app.put("/api/workflows/{workflow_id}")
@@ -157,9 +192,102 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"etag": etag, "workflow": workflow.model_dump(mode="json")}
 
+    @app.post("/api/workflows/{workflow_id}/runs", status_code=202)
+    def start_workflow_run(workflow_id: str, body: dict[str, object] | None = None):
+        try:
+            run = workflows.start(store.load(), workflow_id, body)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到工作流") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return run.payload()
+
+    @app.api_route("/hooks/{hook_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], status_code=202)
+    async def trigger_workflow_webhook(hook_path: str, request: Request):
+        project = store.load()
+        requested_path = "/hooks/" + hook_path.strip("/")
+        matches = [(workflow, node) for workflow in project.workflows for node in workflow.nodes if node.type == "webhook" and str(node.data.get("path", "")).rstrip("/") == requested_path.rstrip("/")]
+        if not matches:
+            raise HTTPException(status_code=404, detail="找不到 Webhook 节点")
+        if len(matches) > 1:
+            raise HTTPException(status_code=409, detail="Webhook 路径重复")
+        workflow, node = matches[0]
+        expected = str(node.data.get("method", "POST")).upper()
+        if request.method != expected:
+            raise HTTPException(status_code=405, detail=f"Webhook 只接受 {expected}")
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            body = raw.decode(errors="replace")
+        run = workflows.start(project, workflow.id, {"input": {"trigger": "webhook", "node_id": node.id, "query": dict(request.query_params), "headers": dict(request.headers), "body": body}, "_trigger_node_id": node.id})
+        return run.payload()
+
+    @app.get("/api/workflow-runs")
+    def list_workflow_runs(workflow_id: str | None = None):
+        values = list(workflows.runs.values())
+        if workflow_id:
+            values = [run for run in values if run.workflow_id == workflow_id]
+        return [run.payload() for run in sorted(values, key=lambda item: item.created_at, reverse=True)]
+
+    @app.get("/api/workflow-runs/{run_id}")
+    def get_workflow_run(run_id: str):
+        try:
+            return workflows.require(run_id).payload()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到工作流运行记录") from exc
+
+    @app.get("/api/workflow-runs/{run_id}/events")
+    def workflow_run_events(run_id: str):
+        try:
+            run = workflows.require(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到工作流运行记录") from exc
+
+        def stream():
+            cursor = 0
+            while True:
+                with run.event_signal:
+                    if cursor >= len(run.events) and run.status not in TERMINAL_RUN_STATES:
+                        run.event_signal.wait(timeout=15)
+                    events = run.events[cursor:]
+                    cursor = len(run.events)
+                for item in events:
+                    yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
+                if run.status in TERMINAL_RUN_STATES and cursor >= len(run.events):
+                    return
+                if not events:
+                    yield ": heartbeat\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/api/workflow-runs/{run_id}/cancel")
+    def cancel_workflow_run(run_id: str):
+        try:
+            return workflows.cancel(run_id).payload()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到工作流运行记录") from exc
+
+    @app.post("/api/workflow-runs/{run_id}/nodes/{node_id}/approval")
+    def resolve_workflow_approval(run_id: str, node_id: str, body: dict[str, object]):
+        try:
+            run = workflows.approve(run_id, node_id, bool(body.get("approved")), str(body.get("comment", "")))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到工作流运行记录") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return run.payload()
+
     @app.get("/api/generator/workflows/{workflow_id}/messages")
     def generator_messages(workflow_id: str):
         return generator.history.get(workflow_id, [])
+
+    @app.get("/api/generator/status")
+    def generator_status():
+        try:
+            return generator.status()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.post("/api/generator/workflows/{workflow_id}/messages", status_code=202)
     def generator_message(workflow_id: str, body: dict[str, str]):

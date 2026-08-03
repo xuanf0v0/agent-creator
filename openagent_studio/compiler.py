@@ -22,9 +22,10 @@ def compile_opencode(spec: ProjectSpec) -> dict[str, Any]:
         if provider.base_url:
             value.setdefault("options", {})["baseURL"] = provider.base_url
         if provider.api_key_env:
-            value.setdefault("env", []).append(provider.api_key_env)
+            value.setdefault("options", {})["apiKey"] = f"{{env:{provider.api_key_env}}}"
         value.pop("base_url", None)
         value.pop("api_key_env", None)
+        value.pop("env_file", None)
         providers[provider.id] = value
     return {"$schema": "https://opencode.ai/config.json", "agent": agents, "provider": providers}
 

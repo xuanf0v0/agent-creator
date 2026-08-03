@@ -1,0 +1,746 @@
+from __future__ import annotations
+
+import json
+import ipaddress
+import re
+import socket
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+from uuid import uuid4
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import httpx
+
+from .models import HarnessSpec, ProjectSpec, WorkflowEdge, WorkflowNode, WorkflowSpec
+
+
+TERMINAL_TASK_STATES = {"completed", "failed", "blocked", "cancelled"}
+TERMINAL_RUN_STATES = {"completed", "failed", "cancelled"}
+
+
+class RunCancelled(Exception):
+    pass
+
+
+@dataclass
+class WorkflowRun:
+    id: str
+    workflow_id: str
+    input: Any
+    relative_path: str = "."
+    status: str = "queued"
+    node_states: dict[str, dict[str, Any]] = field(default_factory=dict)
+    outputs: dict[str, Any] = field(default_factory=dict)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    completed_at: float | None = None
+    error: str = ""
+    depth: int = 0
+    trigger_node_id: str | None = None
+    active_task_ids: set[str] = field(default_factory=set)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    event_signal: threading.Condition = field(default_factory=threading.Condition, repr=False)
+    approval_signals: dict[str, threading.Event] = field(default_factory=dict, repr=False)
+    approval_decisions: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "workflow_id": self.workflow_id,
+            "status": self.status,
+            "input": self.input,
+            "node_states": self.node_states,
+            "outputs": self.outputs,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "error": self.error,
+            "waiting_approvals": [node_id for node_id, state in self.node_states.items() if state.get("status") == "waiting"],
+        }
+
+
+class WorkflowManager:
+    def __init__(self, base_url: str | None = None, poll_interval: float = 0.5, max_workers: int = 8) -> None:
+        self.base_url = (base_url or "http://127.0.0.1:8765").rstrip("/")
+        self.poll_interval = poll_interval
+        self.max_workers = max_workers
+        self.runs: dict[str, WorkflowRun] = {}
+        self._lock = threading.RLock()
+        self._schedule_stop = threading.Event()
+        self._schedule_thread: threading.Thread | None = None
+        self._schedule_last: dict[str, str] = {}
+
+    def start_scheduler(self, project_loader: Any) -> None:
+        if self._schedule_thread and self._schedule_thread.is_alive():
+            return
+        self._schedule_stop.clear()
+        self._schedule_thread = threading.Thread(target=self._schedule_loop, args=(project_loader,), daemon=True, name="workflow-scheduler")
+        self._schedule_thread.start()
+
+    def stop_scheduler(self) -> None:
+        self._schedule_stop.set()
+        if self._schedule_thread:
+            self._schedule_thread.join(timeout=2)
+
+    def _schedule_loop(self, project_loader: Any) -> None:
+        while not self._schedule_stop.wait(1):
+            try:
+                project = project_loader()
+                for workflow in project.workflows:
+                    for node in workflow.nodes:
+                        if node.type != "schedule":
+                            continue
+                        timezone = str(node.data.get("timezone", "UTC"))
+                        try:
+                            now = datetime.now(ZoneInfo(timezone))
+                        except ZoneInfoNotFoundError:
+                            continue
+                        minute_key = now.strftime("%Y-%m-%dT%H:%M%z")
+                        key = f"{workflow.id}:{node.id}"
+                        if self._schedule_last.get(key) == minute_key or not _cron_matches(str(node.data.get("cron", "")), now):
+                            continue
+                        self._schedule_last[key] = minute_key
+                        self.start(project, workflow.id, {"input": {"trigger": "schedule", "node_id": node.id, "scheduled_at": now.isoformat()}, "_trigger_node_id": node.id})
+            except Exception:
+                continue
+
+    def start(self, project: ProjectSpec, workflow_id: str, body: dict[str, Any] | None = None) -> WorkflowRun:
+        workflow = next((item for item in project.workflows if item.id == workflow_id), None)
+        if workflow is None:
+            raise KeyError(workflow_id)
+        errors = validate_executable_workflow(project, workflow, runtime=True)
+        if errors:
+            raise ValueError("；".join(errors))
+        body = body or {}
+        run = WorkflowRun(
+            id=uuid4().hex,
+            workflow_id=workflow_id,
+            input=body.get("input", ""),
+            relative_path=str(body.get("relative_path", ".")),
+            depth=int(body.get("_depth", 0)),
+            trigger_node_id=str(body["_trigger_node_id"]) if body.get("_trigger_node_id") else None,
+            node_states={node.id: {"status": "pending"} for node in workflow.nodes},
+        )
+        with self._lock:
+            self.runs[run.id] = run
+        self._emit(run, "run.queued", {"run": run.payload()})
+        threading.Thread(target=self._execute, args=(run, project, workflow), daemon=True).start()
+        return run
+
+    def require(self, run_id: str) -> WorkflowRun:
+        with self._lock:
+            run = self.runs.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        return run
+
+    def cancel(self, run_id: str) -> WorkflowRun:
+        run = self.require(run_id)
+        if run.status in TERMINAL_RUN_STATES:
+            return run
+        run.cancel_event.set()
+        for signal in run.approval_signals.values():
+            signal.set()
+        for task_id in list(run.active_task_ids):
+            try:
+                self._request("POST", f"/api/tasks/{task_id}/cancel")
+            except RuntimeError:
+                pass
+        self._emit(run, "run.cancelling", {"run_id": run.id})
+        return run
+
+    def approve(self, run_id: str, node_id: str, approved: bool, comment: str = "") -> WorkflowRun:
+        run = self.require(run_id)
+        signal = run.approval_signals.get(node_id)
+        if signal is None or run.node_states.get(node_id, {}).get("status") != "waiting":
+            raise ValueError("该节点当前不在等待审批")
+        run.approval_decisions[node_id] = {"approved": approved, "comment": comment}
+        signal.set()
+        return run
+
+    def _execute(self, run: WorkflowRun, project: ProjectSpec, workflow: WorkflowSpec) -> None:
+        run.status, run.started_at = "running", time.time()
+        self._emit(run, "run.started", {"run": run.payload()})
+        nodes = {node.id: node for node in workflow.nodes}
+        incoming = {node_id: [] for node_id in nodes}
+        outgoing = {node_id: [] for node_id in nodes}
+        for index, edge in enumerate(workflow.edges):
+            incoming[edge.target].append(index)
+            outgoing[edge.source].append(index)
+        edge_states: list[str] = ["pending"] * len(workflow.edges)
+        futures: dict[Future[Any], str] = {}
+        completed: set[str] = set()
+        scheduled: set[str] = set()
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix=f"workflow-{run.id[:6]}") as pool:
+                while len(completed) < len(nodes):
+                    self._check_cancelled(run)
+                    progressed = False
+                    for node_id, node in nodes.items():
+                        if node_id in scheduled or node_id in completed:
+                            continue
+                        inbound = incoming[node_id]
+                        if not inbound and node.type in {"manual_trigger", "webhook", "schedule"}:
+                            selected = node_id == run.trigger_node_id if run.trigger_node_id else node.type == "manual_trigger"
+                            if not selected:
+                                self._set_node_state(run, node_id, "skipped")
+                                completed.add(node_id)
+                                scheduled.add(node_id)
+                                for index in outgoing[node_id]:
+                                    edge_states[index] = "inactive"
+                                progressed = True
+                                continue
+                        if inbound and any(edge_states[index] == "pending" for index in inbound):
+                            continue
+                        if inbound and not any(edge_states[index] == "active" for index in inbound):
+                            self._set_node_state(run, node_id, "skipped")
+                            completed.add(node_id)
+                            for index in outgoing[node_id]:
+                                edge_states[index] = "inactive"
+                            progressed = True
+                            continue
+                        scheduled.add(node_id)
+                        futures[pool.submit(self._run_node, run, project, node, incoming[node_id], workflow.edges, edge_states)] = node_id
+                        progressed = True
+
+                    if not futures:
+                        if len(completed) == len(nodes):
+                            break
+                        if not progressed:
+                            raise RuntimeError("工作流无法继续调度，请检查循环或不可达连线")
+                        continue
+
+                    done, _ = wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        node_id = futures.pop(future)
+                        try:
+                            output = future.result()
+                        except Exception:
+                            run.cancel_event.set()
+                            for signal in run.approval_signals.values():
+                                signal.set()
+                            raise
+                        run.outputs[node_id] = output
+                        completed.add(node_id)
+                        node = nodes[node_id]
+                        for index in outgoing[node_id]:
+                            edge_states[index] = "active" if self._edge_matches(workflow.edges[index], output, run) else "inactive"
+
+            self._check_cancelled(run)
+            run.status, run.completed_at = "completed", time.time()
+            final_ids = [node.id for node in workflow.nodes if node.type == "output"]
+            final = {node_id: run.outputs.get(node_id) for node_id in final_ids} or run.outputs
+            self._emit(run, "run.completed", {"run": run.payload(), "output": final})
+        except RunCancelled:
+            run.status, run.completed_at = "cancelled", time.time()
+            self._emit(run, "run.cancelled", {"run": run.payload()})
+        except Exception as exc:
+            run.status, run.error, run.completed_at = "failed", str(exc), time.time()
+            self._emit(run, "run.failed", {"run": run.payload(), "message": str(exc)})
+
+    def _run_node(
+        self,
+        run: WorkflowRun,
+        project: ProjectSpec,
+        node: WorkflowNode,
+        inbound: list[int],
+        edges: list[WorkflowEdge],
+        edge_states: list[str],
+    ) -> Any:
+        self._check_cancelled(run)
+        self._set_node_state(run, node.id, "running", started_at=time.time())
+        inputs = [run.outputs.get(edges[index].source) for index in inbound if edge_states[index] == "active"]
+        latest = inputs[-1] if inputs else run.input
+        retries = max(0, min(int(node.data.get("retry_count", 0)), 5))
+        output: Any = None
+        for attempt in range(retries + 1):
+            try:
+                output = self._execute_node(run, project, node, inputs, latest)
+                break
+            except RunCancelled:
+                raise
+            except Exception as exc:
+                if attempt < retries:
+                    self._emit(run, "node.retry", {"run_id": run.id, "node_id": node.id, "attempt": attempt + 1, "message": str(exc)})
+                    delay = max(0.0, min(float(node.data.get("retry_delay_seconds", 1)), 30.0))
+                    if run.cancel_event.wait(delay):
+                        raise RunCancelled()
+                    continue
+                if node.data.get("on_error") == "continue":
+                    output = node.data.get("fallback_value")
+                    self._set_node_state(run, node.id, "completed", warning=str(exc), output=output, completed_at=time.time())
+                    return output
+                self._set_node_state(run, node.id, "failed", error=str(exc), completed_at=time.time())
+                raise
+        self._set_node_state(run, node.id, "completed", output=output, completed_at=time.time())
+        return output
+
+    def _execute_node(self, run: WorkflowRun, project: ProjectSpec, node: WorkflowNode, inputs: list[Any], latest: Any) -> Any:
+        if node.type in {"manual_trigger", "webhook", "schedule"}:
+            return run.input
+        if node.type == "prompt":
+            return self._render(str(node.data.get("template") or node.data.get("prompt") or node.data.get("description") or "{{input}}"), run, latest)
+        if node.type in {"llm", "agent", "tool", "code", "validator"}:
+            return self._agent_or_validator(run, project, node, latest)
+        if node.type == "knowledge_retrieval":
+            return self._retrieve_knowledge(run, node, latest)
+        if node.type == "http_request":
+            return self._http_request(run, node, latest)
+        if node.type == "variable_set":
+            values = node.data.get("variables", {})
+            if not isinstance(values, dict):
+                raise RuntimeError("变量赋值节点的 variables 必须是对象")
+            return {key: self._render(str(value), run, latest) if isinstance(value, str) else value for key, value in values.items()}
+        if node.type == "transform":
+            return self._transform(node, latest)
+        if node.type == "merge":
+            return self._merge(node, inputs, latest)
+        if node.type == "condition":
+            return self._evaluate(str(node.data.get("expression", "")), run, latest)
+        if node.type == "switch":
+            cases = node.data.get("cases", [])
+            if not isinstance(cases, list):
+                raise RuntimeError("分支节点的 cases 必须是数组")
+            for case in cases:
+                if isinstance(case, dict) and self._evaluate(str(case.get("expression", "")), run, latest):
+                    return str(case.get("value", ""))
+            return str(node.data.get("default_case", "default"))
+        if node.type == "parallel":
+            return inputs if len(inputs) > 1 else latest
+        if node.type in {"iteration", "loop"}:
+            count = max(1, min(int(node.data.get("iterations", 1)), 100))
+            template = str(node.data.get("template") or "{{latest}}")
+            return [self._render(template.replace("{{index}}", str(index)), run, latest) for index in range(count)]
+        if node.type == "approval":
+            return self._wait_for_approval(run, node, latest)
+        if node.type == "subworkflow":
+            return self._run_subworkflow(run, project, node, latest)
+        if node.type == "delay":
+            seconds = max(0.0, min(float(node.data.get("seconds", 1)), 300.0))
+            if run.cancel_event.wait(seconds):
+                raise RunCancelled()
+            return latest
+        if node.type == "output":
+            template = str(node.data.get("template", ""))
+            return self._render(template, run, latest) if template else latest
+        raise RuntimeError(f"不支持的节点类型：{node.type}")
+
+    def _retrieve_knowledge(self, run: WorkflowRun, node: WorkflowNode, latest: Any) -> dict[str, Any]:
+        documents = node.data.get("documents", [])
+        if not isinstance(documents, list):
+            raise RuntimeError("知识检索节点的 documents 必须是数组")
+        query = self._render(str(node.data.get("query") or "{{latest}}"), run, latest)
+        terms = set(re.findall(r"[\w\u4e00-\u9fff]+", query.lower()))
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for index, item in enumerate(documents):
+            document = item if isinstance(item, dict) else {"id": str(index), "content": str(item)}
+            content = str(document.get("content", ""))
+            words = set(re.findall(r"[\w\u4e00-\u9fff]+", content.lower()))
+            scored.append((len(terms & words), {**document, "score": len(terms & words)}))
+        top_k = max(1, min(int(node.data.get("top_k", 3)), 20))
+        matches = [item for score, item in sorted(scored, key=lambda pair: pair[0], reverse=True) if score > 0][:top_k]
+        return {"query": query, "matches": matches}
+
+    def _http_request(self, run: WorkflowRun, node: WorkflowNode, latest: Any) -> dict[str, Any]:
+        url = self._render(str(node.data.get("url", "")), run, latest)
+        self._validate_http_url(url, bool(node.data.get("allow_private", False)))
+        method = str(node.data.get("method", "GET")).upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise RuntimeError(f"不支持的 HTTP 方法：{method}")
+        headers = node.data.get("headers", {})
+        if not isinstance(headers, dict):
+            raise RuntimeError("HTTP headers 必须是对象")
+        rendered_headers = {str(key): self._render(str(value), run, latest) for key, value in headers.items()}
+        body = node.data.get("body")
+        if isinstance(body, str):
+            rendered = self._render(body, run, latest)
+            try:
+                body = json.loads(rendered)
+            except json.JSONDecodeError:
+                body = rendered
+        timeout = max(1.0, min(float(node.data.get("timeout_seconds", 30)), 120.0))
+        try:
+            response = httpx.request(method, url, headers=rendered_headers, json=body if not isinstance(body, str) else None, content=body if isinstance(body, str) else None, timeout=timeout, follow_redirects=False)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"HTTP 请求失败：{exc}") from exc
+        content_type = response.headers.get("content-type", "")
+        try:
+            result: Any = response.json() if "json" in content_type else response.text
+        except ValueError:
+            result = response.text
+        payload = {"status": response.status_code, "headers": dict(response.headers), "body": result}
+        if bool(node.data.get("fail_on_error", True)) and response.status_code >= 400:
+            raise RuntimeError(f"HTTP 请求返回 {response.status_code}：{str(result)[:500]}")
+        return payload
+
+    @staticmethod
+    def _validate_http_url(url: str, allow_private: bool) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+            raise RuntimeError("HTTP 节点需要有效的 http/https URL")
+        if parsed.scheme != "https" and not allow_private:
+            raise RuntimeError("默认只允许 HTTPS；访问受信任的内网 HTTP 时请显式启用 allow_private")
+        if allow_private:
+            return
+        try:
+            addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise RuntimeError(f"无法解析 HTTP 主机：{parsed.hostname}") from exc
+        for address in addresses:
+            ip = ipaddress.ip_address(address[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise RuntimeError("HTTP 节点默认禁止访问私网、回环或保留地址")
+
+    @staticmethod
+    def _transform(node: WorkflowNode, latest: Any) -> Any:
+        operation = str(node.data.get("operation", "json_stringify"))
+        if operation == "json_parse":
+            return json.loads(latest if isinstance(latest, str) else str(latest))
+        if operation == "json_stringify":
+            return json.dumps(latest, ensure_ascii=False)
+        if operation == "extract":
+            return _lookup(latest, str(node.data.get("path", "")))
+        if operation == "pick":
+            fields = node.data.get("fields", [])
+            if not isinstance(latest, dict) or not isinstance(fields, list):
+                raise RuntimeError("pick 操作要求对象输入和 fields 数组")
+            return {str(key): latest.get(str(key)) for key in fields}
+        if operation == "flatten":
+            if not isinstance(latest, list):
+                raise RuntimeError("flatten 操作要求数组输入")
+            return [value for group in latest for value in (group if isinstance(group, list) else [group])]
+        raise RuntimeError(f"不支持的数据转换操作：{operation}")
+
+    @staticmethod
+    def _merge(node: WorkflowNode, inputs: list[Any], latest: Any) -> Any:
+        mode = str(node.data.get("mode", "array"))
+        values = inputs or [latest]
+        if mode == "array":
+            return values
+        if mode == "concat":
+            separator = str(node.data.get("separator", "\n"))
+            return separator.join(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False) for value in values)
+        if mode == "object":
+            result: dict[str, Any] = {}
+            for value in values:
+                if not isinstance(value, dict):
+                    raise RuntimeError("object 合并模式要求所有输入都是对象")
+                result.update(value)
+            return result
+        raise RuntimeError(f"不支持的合并模式：{mode}")
+
+    def _run_subworkflow(self, run: WorkflowRun, project: ProjectSpec, node: WorkflowNode, latest: Any) -> Any:
+        if run.depth >= 10:
+            raise RuntimeError("子工作流嵌套不能超过 10 层")
+        workflow_id = str(node.data.get("workflow_id", ""))
+        if not workflow_id or workflow_id == run.workflow_id:
+            raise RuntimeError("子工作流节点需要选择其他工作流")
+        template = str(node.data.get("input_template", ""))
+        child_input: Any = self._render(template, run, latest) if template else latest
+        child = self.start(project, workflow_id, {"input": child_input, "relative_path": run.relative_path, "_depth": run.depth + 1})
+        while child.status not in TERMINAL_RUN_STATES:
+            if run.cancel_event.wait(0.2):
+                self.cancel(child.id)
+                raise RunCancelled()
+        if child.status != "completed":
+            raise RuntimeError(f"子工作流 {workflow_id} 执行失败：{child.error or child.status}")
+        return child.outputs
+
+    def _agent_or_validator(self, run: WorkflowRun, project: ProjectSpec, node: WorkflowNode, latest: Any) -> Any:
+        agent_id = str(node.data.get("agent_id", ""))
+        if node.type == "validator" and not agent_id:
+            if isinstance(latest, dict) and latest.get("task", {}).get("status") == "completed":
+                return {"valid": True, "task": latest["task"], "logs": latest.get("logs", [])}
+            expression = str(node.data.get("expression", ""))
+            if expression and self._evaluate(expression, run, latest):
+                return {"valid": True, "value": latest}
+            raise RuntimeError("验证器需要已完成的 Harness 任务、agent_id 或可通过的 expression")
+        if not agent_id:
+            raise RuntimeError(f"节点 {node.id} 未选择智能体")
+        harness = next((item for item in project.harness if item.id == agent_id), None)
+        if harness is None:
+            raise RuntimeError(f"智能体 {agent_id} 没有 Harness 配置")
+        prompt = self._render(str(node.data.get("prompt") or node.data.get("description") or "{{input}}"), run, latest)
+        if harness.task is not None:
+            return self._run_harness_task(run, node, agent_id, prompt)
+        if harness.service is not None:
+            return self._call_harness_service(run, node, harness, prompt)
+        raise RuntimeError(f"Harness {agent_id} 未配置 task 或 service runtime")
+
+    def _run_harness_task(self, run: WorkflowRun, node: WorkflowNode, agent_id: str, prompt: str) -> dict[str, Any]:
+        task = self._request(
+            "POST",
+            "/api/tasks",
+            {"agent_id": agent_id, "title": node.data.get("title") or node.data.get("description") or node.id, "prompt": prompt, "relative_path": node.data.get("relative_path") or run.relative_path},
+            headers={"Idempotency-Key": f"openagent-{run.id}-{node.id}"},
+        )
+        task_id = str(task["id"])
+        run.active_task_ids.add(task_id)
+        self._emit(run, "node.harness_task", {"run_id": run.id, "node_id": node.id, "task": task})
+        try:
+            while task.get("status") not in TERMINAL_TASK_STATES:
+                self._check_cancelled(run)
+                time.sleep(self.poll_interval)
+                task = self._request("GET", f"/api/tasks/{task_id}")
+                self._emit(run, "node.progress", {"run_id": run.id, "node_id": node.id, "status": task.get("status"), "task_id": task_id})
+        except RunCancelled:
+            try:
+                self._request("POST", f"/api/tasks/{task_id}/cancel")
+            except RuntimeError:
+                pass
+            raise
+        finally:
+            run.active_task_ids.discard(task_id)
+        logs = self._request("GET", f"/api/tasks/{task_id}/logs?lines=500")
+        if task.get("status") != "completed":
+            reason = task.get("blocked_reason") or f"Harness 任务状态为 {task.get('status')}"
+            raise RuntimeError(str(reason))
+        return {"task": task, "logs": logs, "text": "\n".join(str(item.get("line", "")) for item in logs)}
+
+    def _call_harness_service(self, run: WorkflowRun, node: WorkflowNode, harness: HarnessSpec, prompt: str) -> Any:
+        if bool(node.data.get("auto_start", True)):
+            status = self._request("GET", f"/api/agents/{harness.id}")
+            if status.get("status") != "running":
+                if bool(node.data.get("auto_setup", True)):
+                    self._request("POST", f"/api/agents/{harness.id}/setup")
+                self._request("POST", f"/api/agents/{harness.id}/start")
+        path = str(node.data.get("service_path") or "echo").lstrip("/")
+        method = str(node.data.get("method") or "POST").upper()
+        body = node.data.get("body")
+        if not isinstance(body, dict):
+            body = {"message": prompt}
+        else:
+            body = {key: self._render(str(value), run, prompt) if isinstance(value, str) else value for key, value in body.items()}
+        return self._request(method, f"/api/agents/{harness.id}/service/{path}", body)
+
+    def _wait_for_approval(self, run: WorkflowRun, node: WorkflowNode, latest: Any) -> Any:
+        signal = threading.Event()
+        run.approval_signals[node.id] = signal
+        self._set_node_state(run, node.id, "waiting", input=latest)
+        self._emit(run, "node.approval_required", {"run_id": run.id, "node_id": node.id, "message": node.data.get("description") or "需要人工审批", "input": latest})
+        while not signal.wait(timeout=0.2):
+            self._check_cancelled(run)
+        self._check_cancelled(run)
+        decision = run.approval_decisions[node.id]
+        self._emit(run, "node.approval_resolved", {"run_id": run.id, "node_id": node.id, **decision})
+        if not decision["approved"]:
+            raise RuntimeError(decision["comment"] or f"审批节点 {node.id} 已拒绝")
+        return {"approved": True, "comment": decision["comment"], "value": latest}
+
+    def _set_node_state(self, run: WorkflowRun, node_id: str, status: str, **extra: Any) -> None:
+        with self._lock:
+            run.node_states[node_id] = {**run.node_states.get(node_id, {}), "status": status, **extra}
+        self._emit(run, "node.status", {"run_id": run.id, "node_id": node_id, "state": run.node_states[node_id]})
+
+    def _emit(self, run: WorkflowRun, event: str, data: dict[str, Any]) -> None:
+        item = {"event": event, "data": data, "created_at": time.time()}
+        with run.event_signal:
+            run.events.append(item)
+            run.event_signal.notify_all()
+
+    def _request(self, method: str, path: str, body: Any = None, headers: dict[str, str] | None = None) -> Any:
+        try:
+            response = httpx.request(method, self.base_url + path, json=body, headers=headers, timeout=30)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Harness 不可用：{exc}") from exc
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail", response.text)
+            except (ValueError, AttributeError):
+                detail = response.text
+            raise RuntimeError(f"Harness 请求失败（{response.status_code}）：{detail}")
+        try:
+            return response.json()
+        except ValueError:
+            return {"body": response.text}
+
+    @staticmethod
+    def _check_cancelled(run: WorkflowRun) -> None:
+        if run.cancel_event.is_set():
+            raise RunCancelled()
+
+    @staticmethod
+    def _render(template: str, run: WorkflowRun, latest: Any) -> str:
+        def replace(match: re.Match[str]) -> str:
+            key = match.group(1).strip()
+            if key in {"input", "latest"}:
+                value = latest if key == "latest" else run.input
+            elif key.startswith("nodes."):
+                value = _lookup(run.outputs, key[6:])
+            else:
+                value = _lookup({"input": run.input, "latest": latest, "nodes": run.outputs}, key)
+            return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", replace, template)
+
+    @staticmethod
+    def _evaluate(expression: str, run: WorkflowRun, latest: Any) -> bool:
+        expression = expression.strip()
+        if not expression:
+            return bool(latest)
+        lowered = expression.lower()
+        if lowered in {"true", "success", "passed"}:
+            return True
+        if lowered in {"false", "failure", "failed"}:
+            return False
+        match = re.fullmatch(r"(.+?)\s*(==|!=|contains)\s*(.+)", expression)
+        context = {"input": run.input, "latest": latest, "nodes": run.outputs}
+        if not match:
+            return bool(_lookup(context, expression))
+        left = _lookup(context, match.group(1).strip())
+        raw_right = match.group(3).strip()
+        try:
+            right = json.loads(raw_right)
+        except json.JSONDecodeError:
+            right = raw_right.strip("'\"")
+        if match.group(2) == "==":
+            return left == right
+        if match.group(2) == "!=":
+            return left != right
+        return str(right) in str(left)
+
+    def _edge_matches(self, edge: WorkflowEdge, output: Any, run: WorkflowRun) -> bool:
+        if not edge.condition:
+            return True
+        condition = edge.condition.strip().lower()
+        if condition in {"true", "yes", "success", "passed"}:
+            return bool(output)
+        if condition in {"false", "no", "failure", "failed"}:
+            return not bool(output)
+        if isinstance(output, (str, int, float)) and str(output).lower() == condition:
+            return True
+        return self._evaluate(edge.condition, run, output)
+
+
+def _lookup(value: Any, path: str) -> Any:
+    current = value
+    for part in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit():
+            current = current[int(part)]
+        else:
+            return None
+    return current
+
+
+def _cron_matches(expression: str, now: datetime) -> bool:
+    fields = expression.split()
+    if len(fields) != 5:
+        return False
+    values = [now.minute, now.hour, now.day, now.month, (now.weekday() + 1) % 7]
+    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
+    return all(_cron_field_matches(field, value, bounds) for field, value, bounds in zip(fields, values, ranges))
+
+
+def _cron_valid(expression: str) -> bool:
+    fields = expression.split()
+    if len(fields) != 5:
+        return False
+    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
+    return all(_cron_field_valid(field, bounds) for field, bounds in zip(fields, ranges))
+
+
+def _cron_field_valid(field: str, bounds: tuple[int, int]) -> bool:
+    for token in field.split(","):
+        if token == "*":
+            continue
+        if token.startswith("*/"):
+            step = token[2:]
+            if not step.isdigit() or not 1 <= int(step) <= bounds[1] - bounds[0] + 1:
+                return False
+            continue
+        if "-" in token:
+            start, separator, end = token.partition("-")
+            if not separator or not start.isdigit() or not end.isdigit():
+                return False
+            if not bounds[0] <= int(start) <= int(end) <= bounds[1]:
+                return False
+            continue
+        if not token.isdigit() or not bounds[0] <= int(token) <= bounds[1]:
+            return False
+    return bool(field)
+
+
+def _cron_field_matches(field: str, value: int, bounds: tuple[int, int]) -> bool:
+    for token in field.split(","):
+        token = token.strip()
+        if token == "*":
+            return True
+        if token.startswith("*/") and token[2:].isdigit() and int(token[2:]) > 0:
+            return value % int(token[2:]) == 0
+        if "-" in token:
+            start, _, end = token.partition("-")
+            if start.isdigit() and end.isdigit() and int(start) <= value <= int(end):
+                return True
+        if token.isdigit() and bounds[0] <= int(token) <= bounds[1] and int(token) == value:
+            return True
+    return False
+
+
+def validate_executable_workflow(project: ProjectSpec, workflow: WorkflowSpec, runtime: bool = False) -> list[str]:
+    errors: list[str] = []
+    nodes = {node.id: node for node in workflow.nodes}
+    if not nodes:
+        errors.append("工作流没有节点")
+        return errors
+    for edge in workflow.edges:
+        if edge.source not in nodes or edge.target not in nodes:
+            errors.append(f"连线引用了不存在的节点：{edge.source} → {edge.target}")
+        if edge.source == edge.target:
+            errors.append(f"节点不能连接到自身：{edge.source}")
+    agent_ids = {item.id for item in project.harness}
+    workflow_ids = {item.id for item in project.workflows}
+    inbound_ids = {edge.target for edge in workflow.edges}
+    webhook_paths: set[str] = set()
+    for node in workflow.nodes:
+        if runtime and node.type in {"llm", "agent", "tool", "code"} and node.data.get("agent_id") not in agent_ids:
+            errors.append(f"节点 {node.id} 未选择有效的 Harness 智能体")
+        if node.type in {"manual_trigger", "webhook", "schedule"} and node.id in inbound_ids:
+            errors.append(f"触发器节点 {node.id} 不能有入边")
+        if node.type == "schedule" and not str(node.data.get("cron", "")).strip():
+            errors.append(f"定时触发器 {node.id} 缺少 cron 表达式")
+        if node.type == "schedule" and str(node.data.get("cron", "")).strip() and not _cron_valid(str(node.data.get("cron"))):
+            errors.append(f"定时触发器 {node.id} 的 cron 表达式无效")
+        if node.type == "webhook":
+            path = str(node.data.get("path", "")).rstrip("/")
+            if not path.startswith("/hooks/"):
+                errors.append(f"Webhook 节点 {node.id} 的 path 必须以 /hooks/ 开头")
+            elif path in webhook_paths:
+                errors.append(f"Webhook 路径重复：{path}")
+            webhook_paths.add(path)
+        if node.type == "http_request" and not str(node.data.get("url", "")).strip():
+            errors.append(f"HTTP 节点 {node.id} 缺少 URL")
+        if node.type == "subworkflow" and node.data.get("workflow_id") not in workflow_ids:
+            errors.append(f"子工作流节点 {node.id} 未选择有效工作流")
+        if node.type in {"iteration", "loop"}:
+            try:
+                count = int(node.data.get("iterations", 1))
+                if not 1 <= count <= 100:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(f"循环节点 {node.id} 的次数必须是 1 到 100")
+    if not errors:
+        indegree = {node_id: 0 for node_id in nodes}
+        outgoing = {node_id: [] for node_id in nodes}
+        for edge in workflow.edges:
+            indegree[edge.target] += 1
+            outgoing[edge.source].append(edge.target)
+        queue = [node_id for node_id, degree in indegree.items() if degree == 0]
+        visited = 0
+        while queue:
+            node_id = queue.pop()
+            visited += 1
+            for target in outgoing[node_id]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    queue.append(target)
+        if visited != len(nodes):
+            errors.append("工作流包含图循环；请使用循环节点表达有限次数循环")
+    return errors

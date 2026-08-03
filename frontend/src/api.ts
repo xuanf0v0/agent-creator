@@ -1,4 +1,4 @@
-import type { ProjectSpec, Workflow } from './types'
+import type { ProjectSpec, Workflow, WorkflowRun } from './types'
 
 export async function loadSpec(): Promise<{ etag: string; spec: ProjectSpec }> {
   const response = await fetch('/api/spec')
@@ -30,6 +30,29 @@ export async function loadGeneratorMessages(workflowId: string) {
   return response.json() as Promise<Array<{ role: 'user' | 'assistant'; content: string }>>
 }
 
+export function loadGeneratorStatus() {
+  return jsonRequest<{ backend: 'opencode'; binary: string; model: string; ready: boolean; credential_env?: string }>('/api/generator/status')
+}
+
 export async function cancelGeneration(generationId: string) {
   await fetch(`/api/generator/generations/${generationId}/cancel`, { method: 'POST' })
+}
+
+async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, init)
+  const body = await response.json()
+  if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail || body))
+  return body as T
+}
+
+export function startWorkflowRun(workflowId: string, input: string) {
+  return jsonRequest<WorkflowRun>(`/api/workflows/${workflowId}/runs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ input }) })
+}
+
+export function cancelWorkflowRun(runId: string) {
+  return jsonRequest<WorkflowRun>(`/api/workflow-runs/${runId}/cancel`, { method: 'POST' })
+}
+
+export function resolveApproval(runId: string, nodeId: string, approved: boolean, comment = '') {
+  return jsonRequest<WorkflowRun>(`/api/workflow-runs/${runId}/nodes/${nodeId}/approval`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approved, comment }) })
 }

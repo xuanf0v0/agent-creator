@@ -1,0 +1,31 @@
+id: coding
+name: OpenCode 模型任务
+description: Agent Harness 治理下的真实 OpenCode CLI 任务
+cwd: /Users/ypc/openagent
+task:
+  command:
+  - /Users/ypc/openagent/.venv/bin/python
+  - -m
+  - openagent_studio.harness_opencode
+  - --model
+  - deepseek/deepseek-v4-flash
+  - --agent
+  - build
+  - --env-file
+  - /Users/ypc/agent-manager/agents/listing-optimization/.env
+  verification:
+  - name: 运行项目测试
+    command:
+    - /Users/ypc/openagent/.venv/bin/pytest
+    - -q
+    timeout_seconds: 120
+  tools:
+    allow:
+    - read
+    - write
+    ask:
+    - network
+    deny:
+    - destructive
+env_file: .env
+config: []
