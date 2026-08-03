@@ -251,3 +251,22 @@ workflows:
   - source: analysis-validator
     target: profit-evaluation
 description: 用于体验 OpenAgent Studio 中文配置界面的示例项目
+integrations:
+  feishu:
+  - id: main
+    name: 飞书选品机器人
+    workflow_id: product-selection
+    app_id_env: FEISHU_APP_ID
+    app_secret_env: FEISHU_APP_SECRET
+    verification_token_env: FEISHU_VERIFICATION_TOKEN
+    encrypt_key_env: FEISHU_ENCRYPT_KEY
+    env_file: .env
+    auto_reply: true
+  qq:
+  - id: main
+    name: QQ 选品机器人
+    workflow_id: product-selection
+    app_id_env: QQ_BOT_APP_ID
+    secret_env: QQ_BOT_SECRET
+    env_file: .env
+    auto_reply: true

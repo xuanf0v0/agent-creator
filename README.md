@@ -13,6 +13,7 @@
 - 接入 Agent Harness 的 Workflow 执行器，支持任务型和服务型 Agent；
 - 条件分支、并行调度、有限循环、人工审批、验证器、输出聚合和运行取消；
 - 基于 SSE 的实时节点状态、Harness 任务进度和运行事件面板。
+- 飞书与 QQ 官方机器人接口，支持验签、防重放、事件去重、工作流路由和自动回复。
 
 ## 启动
 
@@ -114,6 +115,47 @@ OpenCode 生成器使用本机 `opencode run --format json`。可通过
 Agent 节点会使用 `openagent-{run_id}-{node_id}` 作为 Harness 幂等键。取消工作流时，
 执行器会唤醒等待中的审批节点，并向所有活跃 Harness task 发送取消请求。
 
+## 飞书与 QQ 机器人
+
+`project.yaml` 的 `integrations.feishu[]` 和 `integrations.qq[]` 将平台应用映射到工作流。
+凭证字段保存的是环境变量名称，不保存实际密钥。默认示例从项目根目录 `.env` 读取：
+
+```dotenv
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+FEISHU_VERIFICATION_TOKEN=xxx
+FEISHU_ENCRYPT_KEY=xxx
+QQ_BOT_APP_ID=1024xxxx
+QQ_BOT_SECRET=xxx
+```
+
+飞书开放平台的事件订阅请求地址填写：
+
+```text
+https://你的域名/integrations/feishu/main/events
+```
+
+支持飞书 URL verification、verification token、`X-Lark-Signature` 和加密事件解密；
+`im.message.receive_v1` 等事件会转换为标准工作流输入。工作流完成后使用 tenant access token
+调用消息回复 API。应用需开通读取与发送消息的权限，并订阅消息事件。
+
+QQ 开放平台的回调地址填写：
+
+```text
+https://你的域名/integrations/qq/main/events
+```
+
+支持 QQ 官方 `op=13` 回调 URL 验证、Ed25519 请求验签、C2C 私聊、群聊 At 消息、频道 At 消息和
+频道私信事件。工作流完成后会根据事件场景调用 `/v2/users`、`/v2/groups` 或 `/v2/channels`
+消息接口回复。QQ 机器人需在开放平台配置对应事件订阅和消息权限。
+
+两个平台都采用 10 分钟事件 ID 去重，事件请求体限制为 1 MiB。回调会立即确认并在后台等待工作流，
+避免平台超时；自动回复失败不会把已成功接收的事件重新执行。`GET /api/integrations/status`
+只返回就绪状态和缺失的环境变量名称，不返回任何凭证值。
+
+本地 `127.0.0.1` 不能直接作为平台回调地址。正式开放需要 HTTPS 公网域名或受信任的反向代理，
+并应在代理层增加访问日志、速率限制和请求超时。不要在未启用平台验签的情况下把通用 `/hooks` 暴露公网。
+
 ## 前端开发
 
 前端源码位于 `frontend/`，生产构建由 FastAPI 直接托管：
@@ -139,6 +181,9 @@ npm run build
 - `GET /api/workflow-runs/{run_id}/events`：订阅 SSE 运行事件
 - `POST /api/workflow-runs/{run_id}/cancel`：取消运行及活跃 Harness task
 - `POST /api/workflow-runs/{run_id}/nodes/{node_id}/approval`：提交人工审批决定
+- `GET /api/integrations/status`：读取 QQ/飞书集成就绪状态，不返回凭证
+- `POST /integrations/feishu/{integration_id}/events`：飞书官方事件订阅回调
+- `POST /integrations/qq/{integration_id}/events`：QQ 官方机器人回调
 
 ## 安全边界
 

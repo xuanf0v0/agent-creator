@@ -16,6 +16,7 @@ from .models import ProjectSpec, WorkflowSpec
 from .store import SpecStore
 from .generator import GeneratorManager
 from .workflow_runner import TERMINAL_RUN_STATES, WorkflowManager, validate_executable_workflow
+from .platform_integrations import PlatformIntegrationManager
 
 
 class HarnessManager:
@@ -92,6 +93,7 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
     manager = HarnessManager(store.path.resolve().parent)
     generator = GeneratorManager(store)
     workflows = WorkflowManager(os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"))
+    platforms = PlatformIntegrationManager(workflows)
     enabled = auto_start_harness if auto_start_harness is not None else os.environ.get("OPENAGENT_START_HARNESS", "1") != "0"
 
     @asynccontextmanager
@@ -112,6 +114,7 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
     app.state.harness_manager = manager
     app.state.generator_manager = generator
     app.state.workflow_manager = workflows
+    app.state.platform_integration_manager = platforms
     static_dir = Path(__file__).parent / "static"
     assets_dir = static_dir / "assets"
     if assets_dir.is_dir():
@@ -222,6 +225,41 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
             body = raw.decode(errors="replace")
         run = workflows.start(project, workflow.id, {"input": {"trigger": "webhook", "node_id": node.id, "query": dict(request.query_params), "headers": dict(request.headers), "body": body}, "_trigger_node_id": node.id})
         return run.payload()
+
+    @app.get("/api/integrations/status")
+    def integration_status():
+        return platforms.status(store.load())
+
+    @app.post("/integrations/feishu/{integration_id}/events")
+    async def feishu_events(integration_id: str, request: Request):
+        raw = await _limited_body(request)
+        try:
+            config = platforms.require_feishu(store.load(), integration_id)
+            return platforms.handle_feishu(store.load(), config, raw, {key.lower(): value for key, value in request.headers.items()})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到飞书集成") from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="飞书事件不是有效 JSON") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post("/integrations/qq/{integration_id}/events")
+    async def qq_events(integration_id: str, request: Request):
+        raw = await _limited_body(request)
+        try:
+            project = store.load()
+            config = platforms.require_qq(project, integration_id)
+            return platforms.handle_qq(project, config, raw, {key.lower(): value for key, value in request.headers.items()})
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到 QQ 集成") from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="QQ 事件不是有效 JSON") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.get("/api/workflow-runs")
     def list_workflow_runs(workflow_id: str | None = None):
@@ -400,6 +438,20 @@ def _harness_request(method: str, path: str, json_body: dict | None = None):
         return response.json()
     except ValueError:
         return {"body": response.text}
+
+
+async def _limited_body(request: Request, limit: int = 1024 * 1024) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > limit:
+        raise HTTPException(status_code=413, detail="平台事件请求体不能超过 1 MiB")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(status_code=413, detail="平台事件请求体不能超过 1 MiB")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _run_harness_operation(manager: HarnessManager, key: str, agent_id: str, operation: str) -> None:

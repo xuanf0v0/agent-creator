@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 WORKFLOW_NODE_TYPES = {
@@ -85,6 +85,33 @@ class WorkflowSpec(BaseModel):
     edges: list[WorkflowEdge] = Field(default_factory=list)
 
 
+class FeishuIntegrationSpec(BaseModel):
+    id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    name: str = "飞书机器人"
+    workflow_id: str
+    app_id_env: str = "FEISHU_APP_ID"
+    app_secret_env: str = "FEISHU_APP_SECRET"
+    verification_token_env: str = "FEISHU_VERIFICATION_TOKEN"
+    encrypt_key_env: str | None = "FEISHU_ENCRYPT_KEY"
+    env_file: str | None = None
+    auto_reply: bool = True
+
+
+class QQIntegrationSpec(BaseModel):
+    id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    name: str = "QQ 机器人"
+    workflow_id: str
+    app_id_env: str = "QQ_BOT_APP_ID"
+    secret_env: str = "QQ_BOT_SECRET"
+    env_file: str | None = None
+    auto_reply: bool = True
+
+
+class IntegrationSpec(BaseModel):
+    feishu: list[FeishuIntegrationSpec] = Field(default_factory=list)
+    qq: list[QQIntegrationSpec] = Field(default_factory=list)
+
+
 class ProjectSpec(BaseModel):
     model_config = ConfigDict(extra="allow")
     version: Literal["1"] = "1"
@@ -94,6 +121,7 @@ class ProjectSpec(BaseModel):
     providers: list[ProviderSpec] = Field(default_factory=list)
     harness: list[HarnessSpec] = Field(default_factory=list)
     workflows: list[WorkflowSpec] = Field(default_factory=list)
+    integrations: IntegrationSpec = Field(default_factory=IntegrationSpec)
 
     @field_validator("agents", "providers", "harness", "workflows")
     @classmethod
@@ -102,3 +130,20 @@ class ProjectSpec(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("ids must be unique within each collection")
         return values
+
+    @field_validator("integrations")
+    @classmethod
+    def valid_integrations(cls, value: IntegrationSpec) -> IntegrationSpec:
+        for items in (value.feishu, value.qq):
+            ids = [item.id for item in items]
+            if len(ids) != len(set(ids)):
+                raise ValueError("integration ids must be unique within each platform")
+        return value
+
+    @model_validator(mode="after")
+    def integration_workflows_exist(self):
+        workflow_ids = {item.id for item in self.workflows}
+        invalid = [f"{platform}:{item.id}" for platform, items in (("feishu", self.integrations.feishu), ("qq", self.integrations.qq)) for item in items if item.workflow_id not in workflow_ids]
+        if invalid:
+            raise ValueError(f"integrations reference unknown workflows: {', '.join(invalid)}")
+        return self

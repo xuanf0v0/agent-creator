@@ -7,3 +7,5 @@ export type Harness = { id: string; name: string; description?: string; cwd: str
 export type ProjectSpec = { version: '1'; name: string; description?: string; project_dir: string; agents: Agent[]; providers: unknown[]; harness: Harness[]; workflows: Workflow[] }
 export type NodeRunState = { status: 'pending' | 'running' | 'waiting' | 'completed' | 'failed' | 'skipped'; output?: unknown; error?: string }
 export type WorkflowRun = { id: string; workflow_id: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'; input: unknown; node_states: Record<string, NodeRunState>; outputs: Record<string, unknown>; waiting_approvals: string[]; error: string }
+export type IntegrationStatus = { id: string; name: string; workflow_id: string; ready: boolean; missing_env: string[]; auto_reply: boolean }
+export type IntegrationsStatus = { feishu: IntegrationStatus[]; qq: IntegrationStatus[] }

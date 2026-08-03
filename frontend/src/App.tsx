@@ -4,8 +4,8 @@ import {
   addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
   type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange,
 } from '@xyflow/react'
-import { cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadSpec, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
-import type { NodeKind, ProjectSpec, Workflow, WorkflowRun } from './types'
+import { cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadSpec, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
+import type { IntegrationsStatus, NodeKind, ProjectSpec, Workflow, WorkflowRun } from './types'
 
 type CatalogItem = { type: NodeKind; category: string; label: string; icon: string; description: string }
 const nodeCatalog: CatalogItem[] = [
@@ -98,12 +98,12 @@ function StudioCanvas() {
   const [chatInput, setChatInput] = useState('')
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [generationId, setGenerationId] = useState<string | null>(null)
-  const [chatDialogOpen, setChatDialogOpen] = useState(true)
   const [generatorModel, setGeneratorModel] = useState('正在读取模型…')
   const [run, setRun] = useState<WorkflowRun | null>(null)
   const [runInput, setRunInput] = useState('')
   const [runEvents, setRunEvents] = useState<string[]>([])
   const [libraryQuery, setLibraryQuery] = useState('')
+  const [integrations, setIntegrations] = useState<IntegrationsStatus>({ feishu: [], qq: [] })
   const { screenToFlowPosition, fitView } = useReactFlow()
 
   const workflow = useMemo(() => spec?.workflows.find((item) => item.id === workflowId), [spec, workflowId])
@@ -134,6 +134,7 @@ function StudioCanvas() {
   }, [openWorkflow])
 
   useEffect(() => { loadGeneratorStatus().then((status) => setGeneratorModel(status.ready ? status.model : `${status.model}（缺少 ${status.credential_env}）`)).catch((error: Error) => setGeneratorModel(error.message)) }, [])
+  useEffect(() => { loadIntegrationsStatus().then(setIntegrations).catch(() => setIntegrations({ feishu: [], qq: [] })) }, [])
 
   const onNodesChange = useCallback((changes: NodeChange<CanvasNode>[]) => setNodes((items) => applyNodeChanges(changes, items)), [])
   const onEdgesChange = useCallback((changes: EdgeChange[]) => setEdges((items) => applyEdgeChanges(changes, items)), [])
@@ -274,20 +275,22 @@ function StudioCanvas() {
     <video className="workspace-video" autoPlay loop muted playsInline preload="metadata" aria-hidden="true">
       <source src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260315_073750_51473149-4350-4920-ae24-c8214286f323.mp4" type="video/mp4"/>
     </video>
-    <header className="topbar liquid-glass-strong">
+    <header className="topbar structural-glass">
       <div className="brand"><span className="logo">OA</span><div><strong>OpenAgent Studio</strong><small>{spec?.name ?? '智能体工作流'}</small></div></div>
       <div className="top-actions">
+        {integrations.feishu.map((item) => <span key={`feishu-${item.id}`} className={`integration-badge ${item.ready ? 'ready' : ''}`} title={item.ready ? `飞书 → ${item.workflow_id}` : `缺少 ${item.missing_env.join(', ')}`}>飞书 {item.ready ? '已连接' : '待配置'}</span>)}
+        {integrations.qq.map((item) => <span key={`qq-${item.id}`} className={`integration-badge ${item.ready ? 'ready' : ''}`} title={item.ready ? `QQ → ${item.workflow_id}` : `缺少 ${item.missing_env.join(', ')}`}>QQ {item.ready ? '已连接' : '待配置'}</span>)}
         <select value={workflowId} onChange={(event) => spec && openWorkflow(spec, event.target.value)}>
           {spec?.workflows.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
         </select>
         <button className="ghost" onClick={() => fitView({ padding: 0.22 })}>适应画布</button>
-        <button className="opencode-launch" onClick={() => { setChatDialogOpen(true); setRightTab('chat') }}>✦ OpenCode 创建</button>
+        <button className="opencode-launch" onClick={() => setRightTab('chat')}>✦ OpenCode 创建</button>
         <button className="primary" disabled={saving || !workflow} onClick={persist}>{saving ? '保存中…' : '保存工作流'}</button>
         {run && ['queued', 'running'].includes(run.status) ? <button className="stop-run" onClick={stopRun}>■ 停止</button> : <button className="run" disabled={!workflow} onClick={executeWorkflow}>▶ 运行</button>}
       </div>
     </header>
 
-    <aside className="node-library liquid-glass-strong">
+    <aside className="node-library structural-glass">
       <div className="panel-title"><strong>节点库</strong><span>拖入画布开始编排</span></div>
       <div className="library-search"><input value={libraryQuery} onChange={(event) => setLibraryQuery(event.target.value)} placeholder="搜索节点名称、类型或能力…" aria-label="搜索节点"/>{libraryQuery && <button onClick={() => setLibraryQuery('')} aria-label="清空节点搜索">×</button>}</div>
       <div className="library-list">{Array.from(new Set(visibleCatalog.map((item) => item.category))).map((category) => <details className="library-group" key={category} open><summary>{category}<span>{visibleCatalog.filter((item) => item.category === category).length}</span></summary>{visibleCatalog.filter((item) => item.category === category).map((item) => <div key={item.type} className="library-item liquid-glass" draggable onDragStart={(event) => { event.dataTransfer.setData('application/openagent-node', item.type); event.dataTransfer.effectAllowed = 'move' }}>
@@ -302,9 +305,19 @@ function StudioCanvas() {
       </ReactFlow>
     </main>
 
-    <aside className="inspector liquid-glass-strong">
-      <div className="inspector-tabs"><button className={rightTab === 'chat' ? 'active' : ''} onClick={() => { setRightTab('chat'); setChatDialogOpen(true) }}>AI 创建</button><button className={rightTab === 'node' || rightTab === 'edge' ? 'active' : ''} onClick={() => setRightTab(selectedEdge ? 'edge' : 'node')}>设置</button><button className={rightTab === 'run' ? 'active' : ''} onClick={() => setRightTab('run')}>运行</button></div>
-      {rightTab === 'chat' ? <div className="ai-launch-card"><span className="ai-orb">✦</span><strong>OpenCode 创作助手</strong><p>通过自然语言新增、更新和连接工作流节点。</p><button onClick={() => setChatDialogOpen(true)}>打开 OpenCode 对话框</button></div> : rightTab === 'run' ? <div className="run-panel">
+    <aside className={`inspector structural-glass ${rightTab === 'chat' ? 'chat-mode' : ''}`}>
+      <div className="inspector-tabs"><button className={rightTab === 'chat' ? 'active' : ''} onClick={() => setRightTab('chat')}>AI 创建</button><button className={rightTab === 'node' || rightTab === 'edge' ? 'active' : ''} onClick={() => setRightTab(selectedEdge ? 'edge' : 'node')}>设置</button><button className={rightTab === 'run' ? 'active' : ''} onClick={() => setRightTab('run')}>运行</button></div>
+      {rightTab === 'chat' ? <div className="chat-panel">
+        <div className="generator-title"><span className="ai-orb">✦</span><div><strong>OpenCode 创作助手</strong><small>真实模型：{generatorModel}</small></div></div>
+        <div className="chat-messages">
+          {chatMessages.length === 0 && <div className="chat-empty"><p>你可以这样说：</p><button onClick={() => setChatInput('创建一个代码审查流程，先分析代码，再人工审批，最后运行测试')}>创建代码审查流程</button><button onClick={() => setChatInput('在当前流程的验证前增加一个人工审批节点')}>增量修改当前流程</button></div>}
+          {chatMessages.map((item, index) => <div key={index} className={`chat-message ${item.role}`}><span>{item.role === 'user' ? '你' : item.role === 'assistant' ? 'AI' : '!'}</span><p>{item.content}</p></div>)}
+          {generationId && <div className="thinking"><i/><i/><i/><span>OpenCode 正在生成节点…</span></div>}
+        </div>
+        <div className="chat-composer"><textarea autoFocus value={chatInput} disabled={!!generationId} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); generateFromChat() } }} placeholder="例如：创建代码审查流程，分析代码后等待人工审批，最后运行测试…"/>
+          {generationId ? <button className="stop" onClick={stopGeneration}>停止生成</button> : <button className="send" onClick={generateFromChat} disabled={!chatInput.trim()}>发送并构建工作流</button>}
+        </div>
+      </div> : rightTab === 'run' ? <div className="run-panel">
         <div className="panel-title"><strong>Harness 工作流</strong><span>{run ? `运行 ${run.id.slice(0, 8)} · ${run.status}` : '输入任务后开始执行'}</span></div>
         <label>工作流输入<textarea value={runInput} onChange={(event) => setRunInput(event.target.value)} disabled={!!run && ['queued', 'running'].includes(run.status)} placeholder="输入要交给工作流处理的任务…"/></label>
         {!run || !['queued', 'running'].includes(run.status) ? <button className="run-wide" onClick={executeWorkflow}>▶ 开始运行</button> : <button className="stop-wide" onClick={stopRun}>■ 取消运行</button>}
@@ -350,20 +363,6 @@ function StudioCanvas() {
         </div> : <div className="empty-state"><span>◇</span><p>点击画布中的节点<br/>在这里编辑详细参数</p></div>}
       </>}
     </aside>
-
-    {chatDialogOpen && <section className="opencode-dialog liquid-glass-strong" role="dialog" aria-modal="false" aria-label="OpenCode 工作流创作助手">
-      <div className="chat-panel">
-        <div className="generator-title"><span className="ai-orb">✦</span><div><strong>OpenCode 创作助手</strong><small>真实模型：{generatorModel}</small></div><button className="dialog-close" onClick={() => setChatDialogOpen(false)} aria-label="关闭对话框">×</button></div>
-        <div className="chat-messages">
-          {chatMessages.length === 0 && <div className="chat-empty"><p>你可以这样说：</p><button onClick={() => setChatInput('创建一个代码审查流程，先分析代码，再人工审批，最后运行测试')}>创建代码审查流程</button><button onClick={() => setChatInput('在当前流程的验证前增加一个人工审批节点')}>增量修改当前流程</button></div>}
-          {chatMessages.map((item, index) => <div key={index} className={`chat-message ${item.role}`}><span>{item.role === 'user' ? '你' : item.role === 'assistant' ? 'AI' : '!'}</span><p>{item.content}</p></div>)}
-          {generationId && <div className="thinking"><i/><i/><i/><span>OpenCode 正在生成节点…</span></div>}
-        </div>
-        <div className="chat-composer"><textarea autoFocus value={chatInput} disabled={!!generationId} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); generateFromChat() } }} placeholder="例如：创建代码审查流程，分析代码后等待人工审批，最后运行测试…"/>
-          {generationId ? <button className="stop" onClick={stopGeneration}>停止生成</button> : <button className="send" onClick={generateFromChat} disabled={!chatInput.trim()}>发送并构建工作流</button>}
-        </div>
-      </div>
-    </section>}
 
     <footer className="console"><span className="status-dot"/><strong>运行控制台</strong><span>{message}</span><span className="console-meta">{nodes.length} 个节点 · {edges.length} 条连线</span></footer>
   </div>
