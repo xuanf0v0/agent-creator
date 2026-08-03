@@ -1,0 +1,130 @@
+version: '1'
+name: 我的第一个智能体项目
+project_dir: /Users/ypc/agent-harness/examples
+agents:
+- id: echo
+  name: 回声智能体
+  description: 原样返回用户发送的消息，用于测试服务是否正常运行
+  mode: primary
+  model: kax/grok-4.5
+  prompt: '你是一个简单的回声智能体。
+
+    请理解用户输入，并用简洁、友好的中文回应。
+
+    '
+  max_steps: 10
+  tools: {}
+  permission:
+    edit: deny
+    bash: deny
+    webfetch: deny
+- id: coding
+  name: 代码助手
+  description: 在示例项目中完成任务，并在结束前运行验证命令
+  mode: primary
+  model: kax/grok-4.5
+  prompt: '你是一名谨慎的代码助手。
+
+    开始工作前先阅读项目说明，完成任务后运行验证命令。
+
+    不要修改任务范围之外的文件。
+
+    '
+  max_steps: 30
+  tools: {}
+  permission:
+    edit: allow
+    bash: ask
+    webfetch: ask
+providers:
+- id: kax
+  name: KAX 模型服务
+  npm: '@ai-sdk/openai-compatible'
+  base_url: https://ai.kaxhub.com/v1
+  api_key_env: KAX_API_KEY
+  models:
+    grok-4.5:
+      name: Grok 4.5
+harness:
+- id: echo
+  name: 回声服务
+  description: Agent Harness 自带的最小 HTTP 服务示例
+  cwd: /Users/ypc/agent-harness/examples/echo_agent
+  service:
+    command:
+    - uv
+    - run
+    - uvicorn
+    - app:app
+    - --host
+    - 127.0.0.1
+    - --port
+    - '8766'
+    port: 8766
+    health:
+      path: /health
+      timeout_seconds: 15
+  env_file: .env
+  config:
+  - key: ECHO_PREFIX
+    label: 回声前缀
+    type: string
+    default: Echo
+- id: coding
+  name: 代码任务
+  description: Agent Harness 自带的受治理代码任务示例
+  cwd: /Users/ypc/agent-harness/examples/coding_agent
+  task:
+    command:
+    - uv
+    - run
+    - python
+    - worker.py
+    verification:
+    - name: 检查输出文件
+      command:
+      - uv
+      - run
+      - python
+      - verify.py
+      timeout_seconds: 30
+    tools:
+      allow:
+      - read
+      - write
+      ask:
+      - network
+      deny:
+      - destructive
+  env_file: .env
+  config: []
+workflows:
+- id: example-flow
+  name: 代码任务示例流程
+  nodes:
+  - id: 开始代码任务
+    type: agent
+    data:
+      agent_id: coding
+    position:
+      x: 80.0
+      y: 80.0
+  - id: 运行验证
+    type: validator
+    data:
+      description: 检查代码任务是否通过验证
+    position:
+      x: 320.0
+      y: 80.0
+  - id: 输出结果
+    type: output
+    data: {}
+    position:
+      x: 560.0
+      y: 80.0
+  edges:
+  - source: 开始代码任务
+    target: 运行验证
+  - source: 运行验证
+    target: 输出结果
+description: 用于体验 OpenAgent Studio 中文配置界面的示例项目
