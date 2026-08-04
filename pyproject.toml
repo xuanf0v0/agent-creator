@@ -25,5 +25,8 @@ openagent-studio = "openagent_studio.app:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.setuptools.packages.find]
+include = ["openagent_studio*"]
+
 [tool.setuptools.package-data]
 openagent_studio = ["static/**/*"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import subprocess
 import json
 import time
@@ -475,9 +476,95 @@ def _run_harness_operation(manager: HarnessManager, key: str, agent_id: str, ope
 app = create_app()
 
 
+def _windows_listener_pids(output: str, port: int) -> set[int]:
+    pids: set[int] = set()
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[0].upper() != "TCP" or fields[-2].upper() != "LISTENING":
+            continue
+        try:
+            local_port = int(fields[1].rsplit(":", 1)[1])
+            pid = int(fields[-1])
+        except (IndexError, ValueError):
+            continue
+        if local_port == port:
+            pids.add(pid)
+    return pids
+
+
+def _listener_pids(port: int) -> set[int]:
+    if os.name == "nt":
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"无法检查端口 {port}：{result.stderr.strip() or 'netstat 执行失败'}")
+        return _windows_listener_pids(result.stdout, port)
+
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return set()
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"无法检查端口 {port}：{result.stderr.strip() or 'lsof 执行失败'}")
+    return {int(line) for line in result.stdout.splitlines() if line.strip().isdigit()}
+
+
+def _port_is_available(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def _stop_port_listeners(host: str, port: int) -> set[int]:
+    if os.environ.get("OPENAGENT_KILL_PORT", "1") == "0":
+        return set()
+
+    pids = _listener_pids(port) - {os.getpid()}
+    for pid in sorted(pids):
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    if not pids:
+        return pids
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if _port_is_available(host, port):
+            print(f"已结束占用 {host}:{port} 的旧进程：{', '.join(map(str, sorted(pids)))}")
+            return pids
+        time.sleep(0.05)
+    raise RuntimeError(f"结束进程后端口 {host}:{port} 仍未释放")
+
+
 def main() -> None:
     import uvicorn
-    uvicorn.run("openagent_studio.app:app", host="127.0.0.1", port=8787, reload=False)
+
+    host = "127.0.0.1"
+    port = 8787
+    _stop_port_listeners(host, port)
+    uvicorn.run("openagent_studio.app:app", host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":

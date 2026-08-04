@@ -33,6 +33,10 @@ OPENAGENT_SPEC=project.yaml .venv/bin/openagent-studio
 已经安装依赖且不希望 `uv` 重新解析依赖时，也可以使用
 `uv run --no-sync openagent-studio`。
 
+`openagent-studio` 启动时会自动结束占用 `127.0.0.1:8787` 的旧监听进程，
+避免重复启动时报端口冲突。需要保留旧进程时，可设置 `OPENAGENT_KILL_PORT=0`
+关闭此行为。
+
 打开 <http://127.0.0.1:8787>。也可以直接运行：
 
 ```bash
