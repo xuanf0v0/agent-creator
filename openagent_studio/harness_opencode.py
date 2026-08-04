@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .process_utils import resolve_executable
+
 
 def build_prompt(payload: dict[str, Any]) -> str:
     task = payload.get("task", {})
@@ -53,8 +55,9 @@ def main() -> int:
             if key and not environment.get(key):
                 environment[key] = value
     try:
+        command[0] = resolve_executable(args.binary, environment)
         return subprocess.call(command, env=environment)
-    except OSError as exc:
+    except (OSError, FileNotFoundError) as exc:
         print(f"cannot start OpenCode: {exc}", file=sys.stderr, flush=True)
         return 127
 

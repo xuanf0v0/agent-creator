@@ -75,6 +75,7 @@ Harness 会限制 Agent 工作目录不能逃出 manifest 目录的父目录。�
 OpenCode 生成器使用本机 `opencode run --format json`。可通过
 `OPENCODE_BIN` 指定程序，使用 `OPENCODE_GENERATOR_MODEL` 指定生成模型；未设置时
 使用项目中的首个模型；如果两者都没有配置，生成请求会直接失败，不会降级到替身模型。
+Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整路径。
 当前项目的生成对话和 Harness 代码任务都明确使用 `deepseek/deepseek-v4-flash`。前者负责理解需求和
 生成工作流，后者通过 `openagent_studio.harness_opencode` 执行实际 Agent 任务。
 页面首次打开会显示 OpenCode 创作对话框；关闭后可通过顶部“OpenCode 创建”按钮或

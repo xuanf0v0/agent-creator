@@ -13,6 +13,7 @@ import uuid
 from typing import Any
 
 from .models import WORKFLOW_NODE_TYPES, WorkflowSpec
+from .process_utils import resolve_executable
 from .store import SpecStore
 
 
@@ -91,17 +92,27 @@ class GeneratorManager:
     def status(self, spec: Any | None = None) -> dict[str, Any]:
         project = spec or self.store.load()
         model = self.model(project)
+        binary = os.environ.get("OPENCODE_BIN", "opencode")
+        resolved_binary = None
+        binary_error = None
+        try:
+            resolved_binary = resolve_executable(binary, self._environment(project))
+        except FileNotFoundError as exc:
+            binary_error = str(exc)
         provider_id = model.split("/", 1)[0] if "/" in model else ""
         provider = next((item for item in project.providers if item.id == provider_id), None)
         credential_env = provider.api_key_env if provider else None
         credential_ready = not credential_env or bool(self._environment(project).get(credential_env))
         return {
-            "backend": "opencode", "binary": os.environ.get("OPENCODE_BIN", "opencode"),
-            "model": model, "ready": credential_ready, "credential_env": credential_env,
+            "backend": "opencode", "binary": resolved_binary or binary, "binary_ready": bool(resolved_binary),
+            "binary_error": binary_error, "model": model, "ready": credential_ready and bool(resolved_binary),
+            "credential_env": credential_env,
         }
 
     def ensure_ready(self, spec: Any | None = None) -> dict[str, Any]:
         status = self.status(spec)
+        if not status["binary_ready"]:
+            raise RuntimeError(status["binary_error"])
         if not status["ready"]:
             raise RuntimeError(f"真实模型 {status['model']} 缺少环境变量 {status['credential_env']}")
         return status
@@ -178,7 +189,8 @@ class GeneratorManager:
             for item in spec.harness
         ]
         prompt = f"{SYSTEM_PROMPT}\n可用 Harness 智能体：\n{json.dumps(catalog, ensure_ascii=False)}\n\n当前工作流：\n{json.dumps(generation.draft, ensure_ascii=False)}\n\n用户需求：{generation.prompt}"
-        command = [os.environ.get("OPENCODE_BIN", "opencode"), "run", "--format", "json", "--agent", "plan", "--title", f"OpenAgent生成-{generation.workflow_id}"]
+        environment = self._environment(spec)
+        command = [resolve_executable(os.environ.get("OPENCODE_BIN", "opencode"), environment), "run", "--format", "json", "--agent", "plan", "--title", f"OpenAgent生成-{generation.workflow_id}"]
         command += ["--model", model]
         if generation.session_id:
             command += ["--session", generation.session_id]
@@ -192,7 +204,7 @@ class GeneratorManager:
         try:
             generation.process = subprocess.Popen(
                 command, cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                bufsize=1, env=self._environment(spec),
+                bufsize=1, env=environment,
             )
             assert generation.process.stdout is not None
             for raw in generation.process.stdout:
