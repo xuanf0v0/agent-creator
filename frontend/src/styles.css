@@ -119,6 +119,9 @@ input:focus, select:focus, textarea:focus { outline: 0; border-color: hsl(var(--
 .react-flow__controls-button svg { fill: currentColor; }
 .react-flow__minimap { border: none; border-radius: 12px; background: hsl(var(--surface) / .72); box-shadow: 0 12px 30px rgb(0 0 0 / .36), inset 0 1px 1px hsl(var(--line) / .14); backdrop-filter: blur(20px); }
 .canvas-hint { padding: 7px 12px !important; border-radius: 999px; background: hsl(var(--line) / .035) !important; color: hsl(var(--text) / .55); font-size: 11px; }
+.selection-toolbar { display: flex; align-items: center; gap: 10px; padding: 7px 8px 7px 12px !important; border-radius: 999px; background: hsl(var(--surface) / .88) !important; box-shadow: 0 12px 30px rgb(0 0 0 / .42), inset 0 1px 1px hsl(var(--line) / .15); color: hsl(var(--text) / .72); font-size: 11px; }
+.selection-toolbar button { padding: 6px 10px; border: none; border-radius: 999px; background: hsl(var(--line) / .16); color: hsl(var(--text)); cursor: pointer; font-size: 11px; font-weight: 600; }
+.selection-toolbar button:hover { background: hsl(var(--line) / .24); }
 
 .form-stack { padding: 16px; }
 .form-stack label { display: flex; flex-direction: column; gap: 7px; margin-bottom: 15px; color: hsl(var(--text) / .68); font-size: 12px; font-weight: 500; }

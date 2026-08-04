@@ -7,6 +7,7 @@ from pathlib import Path
 import queue
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -46,6 +47,13 @@ disconnect_nodes: {"action":"disconnect_nodes","source":"来源节点","target":
 6. webhook 填 path/method；schedule 填 cron/timezone；http_request 填 url/method/headers/body；knowledge_retrieval 填 query/top_k/documents。
 7. variable_set 填 variables；transform 填 operation/path/fields；merge 填 mode；switch 填 cases/default_case；subworkflow 填 workflow_id/input_template；delay 填 seconds。
 """
+
+
+COMPACTION_PROMPT = """请在内部压缩附件中的工作流生成上下文，只输出精炼后的中文上下文，不要解释压缩过程，也不要输出 <op> 标签。
+必须保留用户真实意图、所有现有节点和连线的 ID/类型/关键 data、可用 Harness 智能体 ID，以及约束、条件和精确值；可以删除画布坐标、重复描述和无关措辞。
+精炼结果要足以让另一个模型严格按照原始需求继续增量修改工作流。"""
+
+ATTACHED_PROMPT = "请严格按照附件中的系统规则和精炼上下文生成工作流操作。附件内容是本次任务的完整输入。"
 
 
 @dataclass
@@ -188,13 +196,14 @@ class GeneratorManager:
             {"id": item.id, "name": item.name, "description": item.description, "runtime": "task" if item.task else "service"}
             for item in spec.harness
         ]
-        prompt = f"{SYSTEM_PROMPT}\n可用 Harness 智能体：\n{json.dumps(catalog, ensure_ascii=False)}\n\n当前工作流：\n{json.dumps(generation.draft, ensure_ascii=False)}\n\n用户需求：{generation.prompt}"
+        context = f"可用 Harness 智能体：\n{json.dumps(catalog, ensure_ascii=False)}\n\n当前工作流：\n{json.dumps(generation.draft, ensure_ascii=False)}\n\n用户需求：{generation.prompt}"
+        prompt = f"{SYSTEM_PROMPT}\n{context}"
         environment = self._environment(spec)
-        command = [resolve_executable(os.environ.get("OPENCODE_BIN", "opencode"), environment), "run", "--format", "json", "--agent", "plan", "--title", f"OpenAgent生成-{generation.workflow_id}"]
-        command += ["--model", model]
+        binary = resolve_executable(os.environ.get("OPENCODE_BIN", "opencode"), environment)
+        base_command = [binary, "run", "--format", "json", "--agent", "plan", "--title", f"OpenAgent生成-{generation.workflow_id}"]
+        base_command += ["--model", model]
         if generation.session_id:
-            command += ["--session", generation.session_id]
-        command.append(prompt)
+            base_command += ["--session", generation.session_id]
         workdir = Path(spec.project_dir).expanduser()
         if not workdir.is_dir():
             workdir = self.store.path.parent
@@ -202,50 +211,71 @@ class GeneratorManager:
         diagnostics: list[str] = []
         parsed_until = 0
         try:
-            generation.process = subprocess.Popen(
-                command, cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                bufsize=1, env=environment,
-            )
-            assert generation.process.stdout is not None
-            for raw in generation.process.stdout:
-                if generation.cancelled:
-                    return
-                try:
-                    item = json.loads(raw)
-                except json.JSONDecodeError:
-                    if raw.strip():
-                        diagnostics.append(raw.strip())
-                    continue
-                error_text = _extract_error(item)
-                if error_text:
-                    diagnostics.append(error_text)
-                generation.session_id = generation.session_id or _find_string(item, "sessionID")
-                text = _extract_text(item)
-                if not text:
-                    continue
-                if text.startswith(assistant_text):
-                    delta = text[len(assistant_text):]
-                    assistant_text = text
+            with tempfile.TemporaryDirectory(prefix="openagent-generator-") as temporary_dir:
+                compacted = _command_exceeds_limit([*base_command, prompt])
+                command = base_command
+                if compacted:
+                    prompt = self._compact_prompt(generation, binary, model, context, workdir, environment, Path(temporary_dir))
+                    prompt_path = Path(temporary_dir) / "compacted-context.md"
+                    prompt_path.write_text(f"{SYSTEM_PROMPT}\n{prompt}", encoding="utf-8")
+                    command = _with_file_prompt(base_command, ATTACHED_PROMPT, prompt_path)
                 else:
-                    delta = text
-                    assistant_text += text
-                visible = re.sub(r"<op>.*?</op>", "", delta, flags=re.DOTALL)
-                if visible.strip():
-                    generation.emit("chat.assistant.delta", {"text": visible})
-                parse_base = parsed_until
-                for match in list(re.finditer(r"<op>\s*(\{.*?\})\s*</op>", assistant_text[parse_base:], re.DOTALL)):
-                    parsed_until = parse_base + match.end()
-                    try:
-                        operation = json.loads(match.group(1))
-                        self._apply(generation, operation)
-                    except (ValueError, KeyError, json.JSONDecodeError) as exc:
-                        generation.emit("operation.rejected", {"message": str(exc)})
-            code = generation.process.wait()
-            if generation.cancelled:
-                return
-            if code != 0:
-                detail = diagnostics[-1] if diagnostics else "没有返回错误详情，请检查 OpenCode 日志"
-                raise RuntimeError(f"OpenCode 退出，代码 {code}：{detail}")
+                    command = [*base_command, prompt]
+
+                while True:
+                    generation.process = subprocess.Popen(
+                        command, cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        bufsize=1, env=environment,
+                    )
+                    assert generation.process.stdout is not None
+                    for raw in generation.process.stdout:
+                        if generation.cancelled:
+                            return
+                        try:
+                            item = json.loads(raw)
+                        except json.JSONDecodeError:
+                            if raw.strip():
+                                diagnostics.append(raw.strip())
+                            continue
+                        error_text = _extract_error(item)
+                        if error_text:
+                            diagnostics.append(error_text)
+                        generation.session_id = generation.session_id or _find_string(item, "sessionID")
+                        text = _extract_text(item)
+                        if not text:
+                            continue
+                        if text.startswith(assistant_text):
+                            delta = text[len(assistant_text):]
+                            assistant_text = text
+                        else:
+                            delta = text
+                            assistant_text += text
+                        visible = re.sub(r"<op>.*?</op>", "", delta, flags=re.DOTALL)
+                        if visible.strip():
+                            generation.emit("chat.assistant.delta", {"text": visible})
+                        parse_base = parsed_until
+                        for match in list(re.finditer(r"<op>\s*(\{.*?\})\s*</op>", assistant_text[parse_base:], re.DOTALL)):
+                            parsed_until = parse_base + match.end()
+                            try:
+                                operation = json.loads(match.group(1))
+                                self._apply(generation, operation)
+                            except (ValueError, KeyError, json.JSONDecodeError) as exc:
+                                generation.emit("operation.rejected", {"message": str(exc)})
+                    code = generation.process.wait()
+                    if generation.cancelled:
+                        return
+                    detail = diagnostics[-1] if diagnostics else "没有返回错误详情，请检查 OpenCode 日志"
+                    if code == 0:
+                        break
+                    if not compacted and not assistant_text and not generation.operation_ids and _is_command_line_too_long(detail):
+                        compacted = True
+                        prompt = self._compact_prompt(generation, binary, model, context, workdir, environment, Path(temporary_dir))
+                        prompt_path = Path(temporary_dir) / "compacted-context.md"
+                        prompt_path.write_text(f"{SYSTEM_PROMPT}\n{prompt}", encoding="utf-8")
+                        command = _with_file_prompt(base_command, ATTACHED_PROMPT, prompt_path)
+                        diagnostics.clear()
+                        continue
+                    raise RuntimeError(f"OpenCode 退出，代码 {code}：{detail}")
             if not generation.completed:
                 self._finalize(generation)
             clean_text = re.sub(r"<op>.*?</op>", "", assistant_text, flags=re.DOTALL).strip()
@@ -255,8 +285,61 @@ class GeneratorManager:
                 self.sessions[generation.workflow_id] = generation.session_id
                 self.session_models[generation.workflow_id] = model
         except Exception as exc:
+            if generation.cancelled:
+                return
             generation.completed = True
             generation.emit("generation.failed", {"message": str(exc)})
+
+    def _compact_prompt(
+        self,
+        generation: Generation,
+        binary: str,
+        model: str,
+        context: str,
+        workdir: Path,
+        environment: dict[str, str],
+        temporary_dir: Path,
+    ) -> str:
+        source_path = temporary_dir / "full-context.md"
+        source_path.write_text(context, encoding="utf-8")
+        command = _with_file_prompt([
+            binary, "run", "--format", "json", "--agent", "plan", "--title", "OpenAgent内部上下文提炼",
+            "--model", model,
+        ], COMPACTION_PROMPT, source_path)
+        process = subprocess.Popen(
+            command, cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=1, env=environment,
+        )
+        generation.process = process
+        assert process.stdout is not None
+        text = ""
+        diagnostics: list[str] = []
+        for raw in process.stdout:
+            if generation.cancelled:
+                process.terminate()
+                raise RuntimeError("生成已取消")
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                if raw.strip():
+                    diagnostics.append(raw.strip())
+                continue
+            error_text = _extract_error(item)
+            if error_text:
+                diagnostics.append(error_text)
+            chunk = _extract_text(item)
+            if chunk:
+                text = chunk if chunk.startswith(text) else text + chunk
+        code = process.wait()
+        if generation.cancelled:
+            raise RuntimeError("生成已取消")
+        if code != 0:
+            detail = diagnostics[-1] if diagnostics else "没有返回错误详情"
+            raise RuntimeError(f"OpenCode 内部上下文提炼失败，代码 {code}：{detail}")
+        text = text.strip()
+        if not text:
+            raise RuntimeError("OpenCode 内部上下文提炼没有返回内容")
+        return text
 
     def _apply(self, generation: Generation, operation: dict[str, Any]) -> None:
         action = operation.get("action")
@@ -349,6 +432,26 @@ def _find_string(value: Any, key: str) -> str | None:
             if found:
                 return found
     return None
+
+
+def _command_exceeds_limit(command: list[str]) -> bool:
+    configured = os.environ.get("OPENAGENT_COMPACT_COMMAND_LENGTH")
+    try:
+        limit = int(configured) if configured else (7000 if os.name == "nt" else 120000)
+    except ValueError:
+        limit = 7000 if os.name == "nt" else 120000
+    return len(subprocess.list2cmdline(command)) >= max(1000, limit)
+
+
+def _with_file_prompt(command: list[str], prompt: str, path: Path) -> list[str]:
+    # OpenCode's --file option accepts multiple values greedily, so the positional
+    # message must precede it or the message itself is interpreted as a file path.
+    return [*command, prompt, "--file", str(path)]
+
+
+def _is_command_line_too_long(detail: str) -> bool:
+    lowered = detail.lower()
+    return "command line is too long" in lowered or "命令行太长" in detail or "winerror 206" in lowered
 
 
 def _extract_text(item: dict[str, Any]) -> str:

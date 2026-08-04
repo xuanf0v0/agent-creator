@@ -1,7 +1,7 @@
 from pathlib import Path
 from fastapi.testclient import TestClient
 from openagent_studio.app import create_app
-from openagent_studio.generator import Generation, GeneratorManager
+from openagent_studio.generator import Generation, GeneratorManager, _command_exceeds_limit, _is_command_line_too_long, _with_file_prompt
 from openagent_studio.store import SpecStore
 from openagent_studio.models import ProjectSpec, QQIntegrationSpec
 from openagent_studio.workflow_runner import WorkflowManager
@@ -69,6 +69,24 @@ def test_generator_applies_incremental_operations(tmp_path: Path):
     assert generation.draft["nodes"][0]["data"]["prompt"] == "审查 {{latest}}"
     assert generation.draft["edges"] == [{"source": "review", "target": "done"}]
     assert [event["event"] for event in generation.events] == ["workflow.node.added", "workflow.node.added", "workflow.edge.added"]
+
+
+def test_generator_detects_long_commands_and_windows_error(monkeypatch):
+    monkeypatch.setenv("OPENAGENT_COMPACT_COMMAND_LENGTH", "1000")
+
+    assert _command_exceeds_limit(["opencode", "run", "x" * 1200]) is True
+    assert _command_exceeds_limit(["opencode", "run", "short"]) is False
+    assert _is_command_line_too_long("The command line is too long.") is True
+    assert _is_command_line_too_long("[WinError 206] filename too long") is True
+    assert _is_command_line_too_long("authentication failed") is False
+
+
+def test_generator_places_prompt_before_greedy_file_option(tmp_path: Path):
+    path = tmp_path / "context.md"
+
+    assert _with_file_prompt(["opencode", "run"], "compress this", path) == [
+        "opencode", "run", "compress this", "--file", str(path),
+    ]
 
 
 def _wait_for(predicate, timeout=2):

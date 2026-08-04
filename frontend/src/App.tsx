@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Background, BaseEdge, Controls, EdgeLabelRenderer, MiniMap, Panel, ReactFlow, ReactFlowProvider,
-  addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
+  SelectionMode, addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
   type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange,
 } from '@xyflow/react'
 import { cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadSpec, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
@@ -110,6 +110,9 @@ function StudioCanvas() {
   const selectedNode = nodes.find((item) => item.id === selected)
   const selectedHarness = spec?.harness.find((item) => item.id === selectedNode?.data.agent_id)
   const currentEdge = edges.find((item) => item.id === selectedEdge)
+  const selectedNodeCount = nodes.filter((item) => item.selected).length
+  const selectedEdgeCount = edges.filter((item) => item.selected).length
+  const selectionCount = selectedNodeCount + selectedEdgeCount
   const visibleCatalog = useMemo(() => {
     const query = libraryQuery.trim().toLowerCase()
     if (!query) return nodeCatalog
@@ -139,6 +142,30 @@ function StudioCanvas() {
   const onNodesChange = useCallback((changes: NodeChange<CanvasNode>[]) => setNodes((items) => applyNodeChanges(changes, items)), [])
   const onEdgesChange = useCallback((changes: EdgeChange[]) => setEdges((items) => applyEdgeChanges(changes, items)), [])
   const onConnect = useCallback((connection: Connection) => setEdges((items) => addEdge({ ...connection, type: 'water' }, items)), [])
+  const onNodesDelete = useCallback((deletedNodes: CanvasNode[]) => {
+    const deletedIds = new Set(deletedNodes.map((node) => node.id))
+    setEdges((items) => items.filter((edge) => !deletedIds.has(edge.source) && !deletedIds.has(edge.target)))
+    setSelected((current) => current && deletedIds.has(current) ? null : current)
+    setSelectedEdge(null)
+  }, [])
+  const onEdgesDelete = useCallback((deletedEdges: Edge[]) => {
+    const deletedIds = new Set(deletedEdges.map((edge) => edge.id))
+    setSelectedEdge((current) => current && deletedIds.has(current) ? null : current)
+  }, [])
+  const onSelectionChange = useCallback(({ nodes: selectedNodes, edges: selectedEdges }: { nodes: CanvasNode[]; edges: Edge[] }) => {
+    setSelected(selectedNodes.length === 1 ? selectedNodes[0].id : null)
+    setSelectedEdge(selectedNodes.length === 0 && selectedEdges.length === 1 ? selectedEdges[0].id : null)
+  }, [])
+
+  function deleteSelection() {
+    const deletedNodeIds = new Set(nodes.filter((node) => node.selected).map((node) => node.id))
+    const deletedEdgeIds = new Set(edges.filter((edge) => edge.selected).map((edge) => edge.id))
+    setNodes((items) => items.filter((node) => !deletedNodeIds.has(node.id)))
+    setEdges((items) => items.filter((edge) => !deletedEdgeIds.has(edge.id) && !deletedNodeIds.has(edge.source) && !deletedNodeIds.has(edge.target)))
+    setSelected(null)
+    setSelectedEdge(null)
+    setMessage(`已删除 ${deletedNodeIds.size} 个节点和 ${deletedEdgeIds.size} 条连线`)
+  }
 
   function onDrop(event: React.DragEvent) {
     event.preventDefault()
@@ -299,9 +326,10 @@ function StudioCanvas() {
     </aside>
 
     <main className="canvas-area" onDrop={onDrop} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }}>
-      <ReactFlow nodes={nodes} edges={edges} edgeTypes={edgeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeClick={(_, node) => { setSelected(node.id); setSelectedEdge(null); setRightTab('node') }} onEdgeClick={(_, edge) => { setSelectedEdge(edge.id); setSelected(null); setRightTab('edge') }} onPaneClick={() => { setSelected(null); setSelectedEdge(null) }} fitView>
+      <ReactFlow nodes={nodes} edges={edges} edgeTypes={edgeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onNodesDelete={onNodesDelete} onEdgesDelete={onEdgesDelete} onSelectionChange={onSelectionChange} onConnect={onConnect} onNodeClick={(_, node) => { setSelected(node.id); setSelectedEdge(null); setRightTab('node') }} onEdgeClick={(_, edge) => { setSelectedEdge(edge.id); setSelected(null); setRightTab('edge') }} onPaneClick={() => { setSelected(null); setSelectedEdge(null) }} selectionOnDrag selectionMode={SelectionMode.Partial} panOnDrag={[1, 2]} deleteKeyCode={['Backspace', 'Delete']} fitView>
         <Background color="#3f3f3f" gap={22} size={1}/><Controls/><MiniMap pannable zoomable nodeColor="#bdbdbd" maskColor="#090909b8"/>
-        <Panel position="top-left" className="canvas-hint liquid-glass">拖拽节点并连接端点，构建智能体执行流程</Panel>
+        <Panel position="top-left" className="canvas-hint liquid-glass">拖拽节点并连接端点 · 空白处框选 · Delete 删除 · 中/右键平移</Panel>
+        {selectionCount > 0 && <Panel position="top-center" className="selection-toolbar liquid-glass nodrag nopan"><span>已选 {selectedNodeCount} 个节点{selectedEdgeCount > 0 ? `、${selectedEdgeCount} 条连线` : ''}</span><button type="button" onClick={deleteSelection} aria-label="删除选中元素">删除所选</button></Panel>}
       </ReactFlow>
     </main>
 
