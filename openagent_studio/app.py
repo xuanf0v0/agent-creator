@@ -5,9 +5,11 @@ import signal
 import socket
 import subprocess
 import json
+import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -22,10 +24,16 @@ from .platform_integrations import PlatformIntegrationManager
 
 class HarnessManager:
     def __init__(self, project_root: Path | None = None) -> None:
-        root = Path(os.environ.get("AGENT_HARNESS_ROOT", Path.home() / "agent-harness"))
-        self.command = Path(os.environ.get("AGENT_HARNESS_BIN", root / ".venv/bin/agent-harness"))
-        self.manifests = Path(os.environ.get("AGENT_HARNESS_MANIFESTS", (project_root or Path.cwd()) / ".openagent-agents"))
-        self.root = root
+        self.project_root = (project_root or Path.cwd()).resolve()
+        self.root = Path(os.environ.get("AGENT_HARNESS_ROOT", self.project_root / "vendor/agent-harness")).resolve()
+        configured_bin = os.environ.get("AGENT_HARNESS_BIN")
+        self.binary = Path(configured_bin).resolve() if configured_bin else None
+        self.command = [str(self.binary)] if self.binary else [sys.executable, "-m", "agent_harness"]
+        self.source = self.root / "src"
+        self.manifests = Path(os.environ.get("AGENT_HARNESS_MANIFESTS", self.project_root / ".openagent-agents"))
+        self.home = Path(os.environ.get("AGENT_HARNESS_HOME", self.project_root / ".harness/agent-harness"))
+        self.base_url = os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765").rstrip("/")
+        self.external_url_configured = "AGENT_HARNESS_URL" in os.environ
         self.process: subprocess.Popen | None = None
         self.error = ""
         self.operations: dict[str, dict[str, str]] = {}
@@ -48,20 +56,48 @@ class HarnessManager:
 
     def reachable(self) -> bool:
         try:
-            return httpx.get(os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765") + "/health", timeout=0.5).status_code == 200
-        except httpx.HTTPError:
+            response = httpx.get(self.base_url + "/ready", timeout=0.5)
+            if response.status_code != 200:
+                return False
+            if self.external_url_configured:
+                return True
+            database = response.json().get("database", {})
+            state_path = database.get("path") if isinstance(database, dict) else None
+            return bool(state_path) and Path(str(state_path)).resolve() == (self.home / "state.db").resolve()
+        except (httpx.HTTPError, ValueError, OSError):
             return False
 
     def start(self) -> None:
         if self.reachable():
             return
-        if not self.command.is_file():
-            self.error = f"找不到 Harness 启动程序：{self.command}"
+        if not self.external_url_configured:
+            try:
+                occupied = httpx.get(self.base_url + "/health", timeout=0.5).status_code == 200
+            except httpx.HTTPError:
+                occupied = False
+            if occupied:
+                self.error = f"{self.base_url} 已被非本项目 Harness 占用；请停止它或显式设置 AGENT_HARNESS_URL"
+                return
+        if self.binary is not None and not self.binary.is_file():
+            self.error = f"找不到 Harness 启动程序：{self.binary}"
+            return
+        if self.binary is None and not (self.source / "agent_harness/__main__.py").is_file():
+            self.error = f"找不到项目内 Harness 源码：{self.source}"
             return
         try:
+            endpoint = urlparse(self.base_url)
+            if endpoint.scheme != "http" or endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                self.error = f"自动启动仅支持本机 HTTP Harness 地址：{self.base_url}"
+                return
+            environment = os.environ.copy()
+            if self.binary is None:
+                current_pythonpath = environment.get("PYTHONPATH", "")
+                environment["PYTHONPATH"] = str(self.source) + (os.pathsep + current_pythonpath if current_pythonpath else "")
+            environment.setdefault("AGENT_HARNESS_HOME", str(self.home))
             self.process = subprocess.Popen(
-                [str(self.command), "serve", "--manifests", str(self.manifests)],
+                [*self.command, "serve", "--manifests", str(self.manifests), "--host", endpoint.hostname, "--port", str(endpoint.port or 80)],
                 cwd=self.root,
+                env=environment,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -76,7 +112,7 @@ class HarnessManager:
                     return
                 time.sleep(0.1)
             self.error = "Harness 启动超时，请检查 manifest 和 Harness 日志"
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             self.error = f"Harness 启动失败：{exc}"
 
     def stop(self) -> None:
@@ -336,6 +372,16 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
             raise HTTPException(status_code=404, detail="找不到工作流") from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"generation_id": generation.id, "workflow_id": workflow_id}
+
+    @app.post("/api/generator/workflows/{workflow_id}/optimize", status_code=202)
+    def optimize_workflow(workflow_id: str):
+        try:
+            generation = generator.optimize(workflow_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到工作流") from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"generation_id": generation.id, "workflow_id": workflow_id}

@@ -13,6 +13,9 @@ task:
   - build
   - --env-file
   - /Users/ypc/agent-manager/agents/listing-optimization/.env
+  protocol:
+    kind: stdin_json
+    options: {}
   verification:
   - name: 运行项目测试
     command:
@@ -23,9 +26,23 @@ task:
     allow:
     - read
     - write
-    ask:
     - network
+    ask: []
     deny:
     - destructive
+  sandbox:
+    enabled: true
+    backend: auto
+    backend_options: {}
+    enforcement: required
+    network: allow
+    workspace_write: true
+environment:
+  setup_command:
+  - /Users/ypc/openagent/.venv/bin/python
+  - -m
+  - openagent_studio.harness_setup
+  setup_timeout_seconds: 1800
+  auto_setup_on_drift: true
 env_file: .env
 config: []

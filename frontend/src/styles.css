@@ -69,11 +69,15 @@ input:focus, select:focus, textarea:focus { outline: 0; border-color: hsl(var(--
 .ghost { color: hsl(var(--text) / .66) !important; }
 .stop-run, .stop-wide { background: hsl(var(--line) / .16) !important; color: hsl(var(--text)) !important; }
 .opencode-launch { background: hsl(var(--line) / .1) !important; color: hsl(var(--text)) !important; }
+.danger-action { background: hsl(var(--line) / .16) !important; color: hsl(var(--text) / .9) !important; }
+.danger-action:hover { background: hsl(var(--line) / .25) !important; }
 
 .node-library, .inspector { min-height: 0; overflow-x: hidden; overflow-y: auto; border-radius: 0; background: hsl(var(--surface) / .54); }
 .node-library { border-right: 1px solid hsl(var(--line) / .1); box-shadow: inset -1px 0 0 hsl(var(--background) / .25), inset 0 1px 1px hsl(var(--line) / .08); }
 .inspector { border-left: 1px solid hsl(var(--line) / .1); box-shadow: inset 1px 0 0 hsl(var(--background) / .25), inset 0 1px 1px hsl(var(--line) / .08); }
-.inspector-tabs { grid-template-columns: repeat(3, 1fr); }
+.inspector-tabs { grid-template-columns: repeat(4, 1fr); }
+
+.evaluation-panel { overflow-y: auto; }
 .panel-title { display: flex; flex-direction: column; padding: 16px 17px; border-bottom: 1px solid hsl(var(--line) / .09); }
 .panel-title strong { font-size: 13px; font-weight: 500; letter-spacing: -.01em; }
 .library-search { position: relative; padding: 12px 11px 3px; }

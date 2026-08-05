@@ -9,7 +9,7 @@
 - 编译为 OpenCode 配置和 Agent Harness manifest；
 - React + TypeScript + React Flow 正规前端；
 - 画布式节点拖放、连线、属性编辑、缩放和小地图；
-- OpenCode 驱动的 AI 对话生成器，逐节点增量生成并实时渲染画布；
+- OpenCode 驱动的 AI 对话生成器，生成多个隔离候选并只采用真实运行通过的最佳工作流；
 - 接入 Agent Harness 的 Workflow 执行器，支持任务型和服务型 Agent；
 - 条件分支、并行调度、有限循环、人工审批、验证器、输出聚合和运行取消；
 - 基于 SSE 的实时节点状态、Harness 任务进度和运行事件面板。
@@ -51,22 +51,31 @@ uv run uvicorn openagent_studio.app:app --host 127.0.0.1 --port 8787
 可直接运行的选品决策工作流；不包含回声、固定响应或无模型 worker。选品流程中的需求整理、市场研究、
 竞品分析和利润评估节点都配置了独立的角色、目标、上下文、约束与输出格式提示词。
 
-Studio 启动时会自动检查并启动 `/Users/ypc/agent-harness`，无需另开终端。若 Harness
-已在 `AGENT_HARNESS_URL` 运行，Studio 会直接复用它。工作流中的任务型 Agent 会通过
+仓库在 `vendor/agent-harness` 内置了一份 Harness 源码，Studio 默认直接用当前 Python 环境启动该副本，
+不读取或运行用户目录下的 `/Users/ypc/agent-harness`。运行状态写入项目内
+`.harness/agent-harness`（已忽略），manifest 写入 `.openagent-agents`。默认地址已有 Harness 时，
+Studio 会核对 `/ready` 中的状态库路径，只复用属于当前项目的实例；要连接外部实例必须显式设置
+`AGENT_HARNESS_URL`。工作流中的任务型 Agent 会通过
 Harness 的 `/api/tasks` 创建受治理任务、轮询终态并读取日志；服务型 Agent 会在需要时
 自动 setup/start，再通过 Harness 的 service proxy 调用。
 
+内置副本包含新版可扩展运行接口：任务可选择 `stdin_json`、`argv`、`http`、`mcp` 或
+`module:attribute` 协议插件；服务可选择本地进程、外部 endpoint 或部署插件；健康检查支持
+HTTP、TCP、命令、进程和插件；沙箱也支持 `backend` 与 `backend_options`。OpenAgent 会原样编译
+这些 Harness manifest 字段，当前 `coding` Agent 显式使用 `stdin_json` 与 `backend: auto`。
+
 相关环境变量：
 
-- `AGENT_HARNESS_ROOT`：Harness 安装目录，默认 `/Users/ypc/agent-harness`；
-- `AGENT_HARNESS_BIN`：`agent-harness` 可执行文件；
+- `AGENT_HARNESS_ROOT`：Harness 源码目录，默认 `<项目>/vendor/agent-harness`；
+- `AGENT_HARNESS_BIN`：可选的外部 `agent-harness` 可执行文件；未设置时运行项目内副本；
+- `AGENT_HARNESS_HOME`：Harness 状态目录，默认 `<项目>/.harness/agent-harness`；
 - `AGENT_HARNESS_MANIFESTS`：Studio 管理的 manifest 目录；
 - `AGENT_HARNESS_URL`：Harness API 地址，默认 `http://127.0.0.1:8765`；
 - `OPENAGENT_START_HARNESS=0`：不由 Studio 自动启动 Harness；
 - `OPENAGENT_SYNC_HARNESS=0`：不把项目中的 Harness 配置同步到 manifest 目录。
 
-Studio 保存完整项目配置时也会刷新这些文件；由于 Harness 启动时一次性加载 catalog，
-修改 `harness` 配置后需要重启 Studio/Harness 才会应用。仅编辑 Workflow 不需要重启。
+Studio 保存完整项目配置时也会刷新这些文件；内置 Harness 会监听 manifest 并自动热重载。
+运行中的 Agent 或任务占用相关配置时，重载会明确报告 `runtime_busy`，完成后再保存即可。
 
 Harness 会限制 Agent 工作目录不能逃出 manifest 目录的父目录。因此默认配置下，
 `harness[].cwd` 应位于当前项目内；自定义 `AGENT_HARNESS_MANIFESTS` 时，也要保证其
@@ -79,7 +88,16 @@ Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整
 当前项目的生成对话和 Harness 代码任务都明确使用 `deepseek/deepseek-v4-flash`。前者负责理解需求和
 生成工作流，后者通过 `openagent_studio.harness_opencode` 执行实际 Agent 任务。
 页面首次打开会显示 OpenCode 创作对话框；关闭后可通过顶部“OpenCode 创建”按钮或
-右侧“AI 创建”页签重新打开。对话中的节点变更会通过 SSE 实时反映到画布并保存。
+右侧“AI 创建”页签重新打开。每次 AI 创建或修改都会先生成验收用例和三套隔离候选。候选不会边生成
+边污染当前画布；Studio 会沿正式 `WorkflowManager → Harness` 路径逐个真实执行，任务型 Agent、
+服务型 Agent、工具、HTTP 与子工作流均使用正式运行语义。只有运行到 `completed`、输出检查通过，
+并由独立 OpenCode 验证会话明确返回 `passed=true` 且评分不低于 80 的候选才能进入排序和保存。
+失败证据会交给 OpenCode 进行有限轮修复并重新完整执行；仍未通过、取消或发生 ETag 冲突时保留原工作流。
+验收运行不写入普通运行历史。
+
+右侧“验收标准”可编辑真实运行输入、输出检查、语义目标、审批决策和单用例超时。确定性断言只负责在
+真实运行完成后检查输出字段、值、类型或格式，不能代替真实执行。审批节点在无人值守验收时使用用例中的
+决策；其他节点不使用 Mock。`OPENCODE_OPTIMIZATION_REPAIR_ROUNDS` 可设置自动修复轮数，默认 2，最大 5。
 生成器会把可用 Harness Agent 清单交给模型，并要求每个节点同时生成执行参数：Agent
 必须包含 `agent_id` 和完整 `prompt`，提示词/循环/输出节点包含 `template`，条件节点包含
 `expression` 与分支条件。后端会拒绝不存在的 Agent，并为遗漏的可选参数补充可执行默认值。
@@ -119,6 +137,19 @@ Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整
 
 Agent 节点会使用 `openagent-{run_id}-{node_id}` 作为 Harness 幂等键。取消工作流时，
 执行器会唤醒等待中的审批节点，并向所有活跃 Harness task 发送取消请求。
+OpenAgent 已对接 Harness 的结构化环境协议：优先读取任务的 `error_code=setup_required` / `setup_required`，
+并兼容旧版 `environment drift; run setup` 文本。仓库中的 `coding` manifest 启用
+`environment.auto_setup_on_drift: true`，通常由 Harness 在任务执行前完成恢复；若仍收到阻塞任务，
+执行器只会发起一次带幂等键的异步 setup，轮询 `/api/setup-operations/{id}` 到 `ready` 后再用新幂等键重试。
+setup 超时或结构化失败原因会写入运行错误，不会无限重试或掩盖其他任务失败。
+Harness 允许省略 `environment.setup_command` 并把它视为内部 no-op；需要可复现依赖准备的任务应显式配置。
+仓库中的 `coding` Agent 使用项目虚拟环境执行
+`python -m openagent_studio.harness_setup`。该模块兼容 uv 创建的无 pip 虚拟环境，会先通过
+`ensurepip` 自举，再执行 editable install。setup 成功后 Harness 会记录依赖文件指纹。修改 `pyproject.toml`、锁文件或
+其他环境指纹文件后，下一次任务会自动重新 setup 一次。
+
+Harness 新版沙箱默认拒绝网络。OpenCode 需要访问 DeepSeek API，因此 `coding.task.sandbox.network`
+显式设为 `allow`，并在 `tools.allow` 中声明 `network`；其他 Agent 若不需要联网，应继续保持默认 `deny`。
 
 ## 飞书与 QQ 机器人
 

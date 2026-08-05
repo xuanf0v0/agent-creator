@@ -24,6 +24,13 @@ export async function sendGeneratorMessage(workflowId: string, message: string) 
   return body as { generation_id: string; workflow_id: string }
 }
 
+export async function optimizeWorkflow(workflowId: string) {
+  const response = await fetch(`/api/generator/workflows/${workflowId}/optimize`, { method: 'POST' })
+  const body = await response.json()
+  if (!response.ok) throw new Error(body.detail || '无法启动工作流优化')
+  return body as { generation_id: string; workflow_id: string }
+}
+
 export async function loadGeneratorMessages(workflowId: string) {
   const response = await fetch(`/api/generator/workflows/${workflowId}/messages`)
   if (!response.ok) return []

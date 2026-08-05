@@ -9,7 +9,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -25,6 +25,18 @@ TERMINAL_RUN_STATES = {"completed", "failed", "cancelled"}
 
 class RunCancelled(Exception):
     pass
+
+
+class HarnessRequestError(RuntimeError):
+    def __init__(self, status_code: int, detail: Any, code: str = "") -> None:
+        self.status_code = status_code
+        self.detail = detail
+        self.code = code
+        if isinstance(detail, dict):
+            message = detail.get("message") or detail.get("error_message") or json.dumps(detail, ensure_ascii=False)
+        else:
+            message = str(detail)
+        super().__init__(f"Harness 请求失败（{status_code}）：{message}")
 
 
 @dataclass
@@ -48,6 +60,7 @@ class WorkflowRun:
     event_signal: threading.Condition = field(default_factory=threading.Condition, repr=False)
     approval_signals: dict[str, threading.Event] = field(default_factory=dict, repr=False)
     approval_decisions: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    policy: "EvaluationPolicy | None" = field(default=None, repr=False)
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -63,6 +76,14 @@ class WorkflowRun:
             "error": self.error,
             "waiting_approvals": [node_id for node_id, state in self.node_states.items() if state.get("status") == "waiting"],
         }
+
+
+@dataclass
+class EvaluationPolicy:
+    mocks: dict[str, Any] = field(default_factory=dict)
+    approvals: dict[str, bool] = field(default_factory=dict)
+    model_inference: Callable[[str, Any], Any] | None = None
+    live_execution: bool = False
 
 
 class WorkflowManager:
@@ -110,7 +131,7 @@ class WorkflowManager:
             except Exception:
                 continue
 
-    def start(self, project: ProjectSpec, workflow_id: str, body: dict[str, Any] | None = None) -> WorkflowRun:
+    def start(self, project: ProjectSpec, workflow_id: str, body: dict[str, Any] | None = None, *, policy: EvaluationPolicy | None = None, record: bool = True) -> WorkflowRun:
         workflow = next((item for item in project.workflows if item.id == workflow_id), None)
         if workflow is None:
             raise KeyError(workflow_id)
@@ -126,9 +147,11 @@ class WorkflowManager:
             depth=int(body.get("_depth", 0)),
             trigger_node_id=str(body["_trigger_node_id"]) if body.get("_trigger_node_id") else None,
             node_states={node.id: {"status": "pending"} for node in workflow.nodes},
+            policy=policy,
         )
-        with self._lock:
-            self.runs[run.id] = run
+        if record:
+            with self._lock:
+                self.runs[run.id] = run
         self._emit(run, "run.queued", {"run": run.payload()})
         threading.Thread(target=self._execute, args=(run, project, workflow), daemon=True).start()
         return run
@@ -288,10 +311,23 @@ class WorkflowManager:
         if node.type == "prompt":
             return self._render(str(node.data.get("template") or node.data.get("prompt") or node.data.get("description") or "{{input}}"), run, latest)
         if node.type in {"llm", "agent", "tool", "code", "validator"}:
+            if run.policy and not run.policy.live_execution:
+                if node.type in {"tool", "code"}:
+                    return self._evaluation_mock(run, node)
+                agent_id = str(node.data.get("agent_id", ""))
+                harness = next((item for item in project.harness if item.id == agent_id), None)
+                if harness is not None and harness.service is not None:
+                    return self._evaluation_mock(run, node)
+                if run.policy.model_inference is None:
+                    raise RuntimeError("评估模式未配置模型推理器")
+                prompt = self._render(str(node.data.get("prompt") or node.data.get("description") or "{{latest}}"), run, latest)
+                return run.policy.model_inference(prompt, latest)
             return self._agent_or_validator(run, project, node, latest)
         if node.type == "knowledge_retrieval":
             return self._retrieve_knowledge(run, node, latest)
         if node.type == "http_request":
+            if run.policy and not run.policy.live_execution:
+                return self._evaluation_mock(run, node)
             return self._http_request(run, node, latest)
         if node.type == "variable_set":
             values = node.data.get("variables", {})
@@ -319,10 +355,17 @@ class WorkflowManager:
             template = str(node.data.get("template") or "{{latest}}")
             return [self._render(template.replace("{{index}}", str(index)), run, latest) for index in range(count)]
         if node.type == "approval":
+            if run.policy:
+                approved = run.policy.approvals.get(node.id, True)
+                if not approved:
+                    raise RuntimeError(f"验收夹具拒绝了审批节点 {node.id}")
+                return {"approved": True, "comment": "evaluation fixture", "value": latest}
             return self._wait_for_approval(run, node, latest)
         if node.type == "subworkflow":
             return self._run_subworkflow(run, project, node, latest)
         if node.type == "delay":
+            if run.policy and not run.policy.live_execution:
+                return latest
             seconds = max(0.0, min(float(node.data.get("seconds", 1)), 300.0))
             if run.cancel_event.wait(seconds):
                 raise RunCancelled()
@@ -331,6 +374,13 @@ class WorkflowManager:
             template = str(node.data.get("template", ""))
             return self._render(template, run, latest) if template else latest
         raise RuntimeError(f"不支持的节点类型：{node.type}")
+
+    @staticmethod
+    def _evaluation_mock(run: WorkflowRun, node: WorkflowNode) -> Any:
+        assert run.policy is not None
+        if node.id not in run.policy.mocks:
+            raise RuntimeError(f"评估模式禁止真实副作用，节点 {node.id} 缺少 mock")
+        return run.policy.mocks[node.id]
 
     def _retrieve_knowledge(self, run: WorkflowRun, node: WorkflowNode, latest: Any) -> dict[str, Any]:
         documents = node.data.get("documents", [])
@@ -444,7 +494,11 @@ class WorkflowManager:
             raise RuntimeError("子工作流节点需要选择其他工作流")
         template = str(node.data.get("input_template", ""))
         child_input: Any = self._render(template, run, latest) if template else latest
-        child = self.start(project, workflow_id, {"input": child_input, "relative_path": run.relative_path, "_depth": run.depth + 1})
+        child = self.start(
+            project, workflow_id,
+            {"input": child_input, "relative_path": run.relative_path, "_depth": run.depth + 1},
+            policy=run.policy, record=run.policy is None,
+        )
         while child.status not in TERMINAL_RUN_STATES:
             if run.cancel_event.wait(0.2):
                 self.cancel(child.id)
@@ -474,12 +528,12 @@ class WorkflowManager:
             return self._call_harness_service(run, node, harness, prompt)
         raise RuntimeError(f"Harness {agent_id} 未配置 task 或 service runtime")
 
-    def _run_harness_task(self, run: WorkflowRun, node: WorkflowNode, agent_id: str, prompt: str) -> dict[str, Any]:
+    def _run_harness_task(self, run: WorkflowRun, node: WorkflowNode, agent_id: str, prompt: str, recovery_attempted: bool = False) -> dict[str, Any]:
         task = self._request(
             "POST",
             "/api/tasks",
             {"agent_id": agent_id, "title": node.data.get("title") or node.data.get("description") or node.id, "prompt": prompt, "relative_path": node.data.get("relative_path") or run.relative_path},
-            headers={"Idempotency-Key": f"openagent-{run.id}-{node.id}"},
+            headers={"Idempotency-Key": f"openagent-{run.id}-{node.id}{'-recovery' if recovery_attempted else ''}"},
         )
         task_id = str(task["id"])
         run.active_task_ids.add(task_id)
@@ -498,18 +552,61 @@ class WorkflowManager:
             raise
         finally:
             run.active_task_ids.discard(task_id)
-        logs = self._request("GET", f"/api/tasks/{task_id}/logs?lines=500")
         if task.get("status") != "completed":
             reason = task.get("blocked_reason") or f"Harness 任务状态为 {task.get('status')}"
+            setup_required = bool(task.get("setup_required")) or task.get("error_code") == "setup_required" or "environment drift" in str(reason).lower()
+            if not recovery_attempted and bool(node.data.get("auto_setup", True)) and setup_required:
+                self._emit(run, "node.environment_setup", {"run_id": run.id, "node_id": node.id, "agent_id": agent_id, "message": "Harness 检测到环境漂移，正在自动 setup 后重试"})
+                self._setup_harness_environment(run, node, agent_id)
+                return self._run_harness_task(run, node, agent_id, prompt, recovery_attempted=True)
             raise RuntimeError(str(reason))
+        logs = self._request("GET", f"/api/tasks/{task_id}/logs?lines=500")
         return {"task": task, "logs": logs, "text": "\n".join(str(item.get("line", "")) for item in logs)}
+
+    def _setup_harness_environment(self, run: WorkflowRun, node: WorkflowNode, agent_id: str) -> None:
+        try:
+            setup = self._request(
+                "POST",
+                f"/api/agents/{agent_id}/setup",
+                headers={"Idempotency-Key": f"openagent-setup-{run.id}-{node.id}-{agent_id}", "Prefer": "respond-async"},
+            )
+        except HarnessRequestError as exc:
+            if exc.code == "setup_command_missing" or "no setup_command" in str(exc):
+                raise RuntimeError(f"Harness Agent {agent_id} 未配置 environment.setup_command；请同步 manifest 并重启 Harness") from exc
+            raise
+
+        operation = setup.get("setup_operation") if isinstance(setup, dict) else None
+        if not isinstance(operation, dict):
+            operation = setup if isinstance(setup, dict) else {}
+        operation_id = str(operation.get("id", ""))
+        deadline = time.monotonic() + 1800
+        while time.monotonic() < deadline:
+            self._check_cancelled(run)
+            state = str(operation.get("status", "")).lower()
+            if state in {"completed", "ready"}:
+                return
+            if state in {"failed", "error", "blocked"}:
+                message = operation.get("error_message") or operation.get("message") or operation.get("error_code") or state
+                raise RuntimeError(f"Harness setup 失败：{message}")
+            time.sleep(min(max(self.poll_interval, 0.2), 2.0))
+            if operation_id:
+                operation = self._request("GET", f"/api/setup-operations/{operation_id}")
+                continue
+            environment = self._request("GET", f"/api/agents/{agent_id}/environment")
+            if not bool(environment.get("setup_required")) and str(environment.get("state", "")).lower() == "ready":
+                return
+            latest = environment.get("latest_setup")
+            if isinstance(latest, dict):
+                operation = latest
+                operation_id = str(latest.get("id", ""))
+        raise RuntimeError("Harness setup 超时（超过 30 分钟）")
 
     def _call_harness_service(self, run: WorkflowRun, node: WorkflowNode, harness: HarnessSpec, prompt: str) -> Any:
         if bool(node.data.get("auto_start", True)):
             status = self._request("GET", f"/api/agents/{harness.id}")
             if status.get("status") != "running":
-                if bool(node.data.get("auto_setup", True)):
-                    self._request("POST", f"/api/agents/{harness.id}/setup")
+                if bool(node.data.get("auto_setup", True)) and bool(status.get("setup_required")):
+                    self._setup_harness_environment(run, node, harness.id)
                 self._request("POST", f"/api/agents/{harness.id}/start")
         path = str(node.data.get("service_path") or "echo").lstrip("/")
         method = str(node.data.get("method") or "POST").upper()
@@ -555,7 +652,8 @@ class WorkflowManager:
                 detail = response.json().get("detail", response.text)
             except (ValueError, AttributeError):
                 detail = response.text
-            raise RuntimeError(f"Harness 请求失败（{response.status_code}）：{detail}")
+            code = str(detail.get("code", "")) if isinstance(detail, dict) else ""
+            raise HarnessRequestError(response.status_code, detail, code)
         try:
             return response.json()
         except ValueError:

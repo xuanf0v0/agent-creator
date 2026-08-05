@@ -54,9 +54,9 @@ class HarnessSpec(BaseModel):
     cwd: str
     service: dict[str, Any] | None = None
     task: dict[str, Any] | None = None
+    environment: dict[str, Any] = Field(default_factory=dict)
     env_file: str = ".env"
     config: list[dict[str, Any]] = Field(default_factory=list)
-
 
 class WorkflowNode(BaseModel):
     id: str
@@ -78,11 +78,39 @@ class WorkflowEdge(BaseModel):
     condition: str | None = None
 
 
+class EvaluationAssertion(BaseModel):
+    path: str = "output"
+    operator: Literal["exists", "equals", "contains", "matches", "type"] = "exists"
+    expected: Any = None
+
+
+class EvaluationMock(BaseModel):
+    node_id: str
+    response: Any = None
+
+
+class EvaluationCase(BaseModel):
+    id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    name: str
+    enabled: bool = True
+    input: Any = ""
+    assertions: list[EvaluationAssertion] = Field(default_factory=list)
+    semantic_criteria: list[str] = Field(default_factory=list)
+    approvals: dict[str, bool] = Field(default_factory=dict)
+    mocks: list[EvaluationMock] = Field(default_factory=list)
+    timeout_seconds: int = Field(default=300, ge=1, le=1800)
+
+
+class WorkflowEvaluation(BaseModel):
+    cases: list[EvaluationCase] = Field(default_factory=list)
+
+
 class WorkflowSpec(BaseModel):
     id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
     name: str
     nodes: list[WorkflowNode] = Field(default_factory=list)
     edges: list[WorkflowEdge] = Field(default_factory=list)
+    evaluation: WorkflowEvaluation = Field(default_factory=WorkflowEvaluation)
 
 
 class FeishuIntegrationSpec(BaseModel):

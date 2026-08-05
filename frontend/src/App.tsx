@@ -4,8 +4,8 @@ import {
   SelectionMode, addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
   type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange,
 } from '@xyflow/react'
-import { cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadSpec, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
-import type { IntegrationsStatus, NodeKind, ProjectSpec, Workflow, WorkflowRun } from './types'
+import { cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadSpec, optimizeWorkflow, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
+import type { EvaluationCase, IntegrationsStatus, NodeKind, ProjectSpec, Workflow, WorkflowRun } from './types'
 
 type CatalogItem = { type: NodeKind; category: string; label: string; icon: string; description: string }
 const nodeCatalog: CatalogItem[] = [
@@ -94,7 +94,7 @@ function StudioCanvas() {
   const [selectedEdge, setSelectedEdge] = useState<string | null>(null)
   const [message, setMessage] = useState('正在载入项目…')
   const [saving, setSaving] = useState(false)
-  const [rightTab, setRightTab] = useState<'chat' | 'node' | 'edge' | 'run'>('chat')
+  const [rightTab, setRightTab] = useState<'chat' | 'node' | 'edge' | 'evaluation' | 'run'>('chat')
   const [chatInput, setChatInput] = useState('')
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [generationId, setGenerationId] = useState<string | null>(null)
@@ -214,48 +214,63 @@ function StudioCanvas() {
     finally { setSaving(false) }
   }
 
+  function updateEvaluationCases(cases: EvaluationCase[]) {
+    if (!spec || !workflow) return
+    setSpec({ ...spec, workflows: spec.workflows.map((item) => item.id === workflow.id ? { ...item, evaluation: { cases } } : item) })
+  }
+
+  function applyCompletedWorkflow(completed: Workflow, tag: string) {
+    const view = toCanvas(completed)
+    setNodes(view.nodes); setEdges(view.edges); setEtag(tag)
+    setSpec((project) => project ? { ...project, workflows: project.workflows.map((item) => item.id === completed.id ? completed : item) } : project)
+    setTimeout(() => fitView({ padding: 0.22 }), 40)
+  }
+
+  function followGeneration(started: { generation_id: string }, successMessage: string) {
+    setGenerationId(started.generation_id)
+    const source = new EventSource(`/api/generator/generations/${started.generation_id}/events`)
+    const listen = (name: string, handler: (data: any) => void) => source.addEventListener(name, (event) => handler(JSON.parse((event as MessageEvent).data)))
+    const stages: Record<string, string> = { preparing_cases: '正在准备验收用例…', generating: '正在生成 3 个独立候选…', validating: '正在校验候选结构…', evaluating: '正在真实试运行验收用例…', verifying: '独立 OpenCode 正在确认每项标准通过…', selecting: '正在选择最短且最清晰的通过方案…', repairing: '候选未通过，OpenCode 正在根据验证结果修复…', saving: '正在原子保存已验证通过的工作流…' }
+    listen('generation.stage', ({ stage, round }) => setMessage(`${stages[stage] || '正在优化工作流…'}${round ? `（第 ${round} 轮）` : ''}`))
+    listen('chat.assistant.delta', ({ text }) => setChatMessages((items) => {
+      const last = items[items.length - 1]
+      if (last?.role === 'assistant') return [...items.slice(0, -1), { ...last, content: last.content + text }]
+      return [...items, { role: 'assistant', content: text }]
+    }))
+    listen('generation.completed', ({ workflow: completed, etag: tag }) => {
+      applyCompletedWorkflow(completed, tag); setGenerationId(null); setMessage(successMessage); source.close()
+    })
+    const finishError = (text: string) => { setGenerationId(null); setMessage(text); setChatMessages((items) => [...items, { role: 'system', content: text }]); source.close() }
+    listen('generation.failed', ({ message: text }) => finishError(`优化失败：${text}`))
+    listen('generation.conflict', ({ message: text }) => finishError(text))
+    listen('generation.cancelled', () => finishError('已停止本轮优化，原工作流未改变'))
+    source.onerror = () => { if (source.readyState === EventSource.CLOSED) setGenerationId(null) }
+  }
+
   async function generateFromChat() {
     const text = chatInput.trim()
     if (!text || !workflowId || generationId) return
-    setChatInput('')
-    setChatMessages((items) => [...items, { role: 'user', content: text }])
-    setMessage('OpenCode 正在理解需求…')
     try {
+      setMessage('正在同步完整画布给 OpenCode…')
+      if (!await persist()) return
+      setChatInput('')
+      setChatMessages((items) => [...items, { role: 'user', content: text }])
+      setMessage(`OpenCode 正在读取 ${nodes.length} 个节点和 ${edges.length} 条连线…`)
       const started = await sendGeneratorMessage(workflowId, text)
-      setGenerationId(started.generation_id)
-      const source = new EventSource(`/api/generator/generations/${started.generation_id}/events`)
-      const listen = (name: string, handler: (data: any) => void) => source.addEventListener(name, (event) => handler(JSON.parse((event as MessageEvent).data)))
-      listen('chat.assistant.delta', (data) => setChatMessages((items) => {
-        const last = items[items.length - 1]
-        if (last?.role === 'assistant') return [...items.slice(0, -1), { ...last, content: last.content + data.text }]
-        return [...items, { role: 'assistant', content: data.text }]
-      }))
-      listen('workflow.node.added', ({ node }) => {
-        setNodes((items) => items.some((item) => item.id === node.id) ? items : [...items, {
-          id: node.id, type: 'default', position: node.position,
-          data: { ...node.data, kind: node.type, label: node.data.description || nodeLabel(node.type), description: node.data.description || '' },
-          style: { ...nodeStyle, background: 'rgba(255,255,255,.1)', boxShadow: '0 12px 32px rgba(0,0,0,.42), inset 0 1px 1px rgba(255,255,255,.2)' },
-        }])
-        setMessage(`已生成节点：${node.data.description || node.id}`)
-      })
-      listen('workflow.node.updated', ({ node }) => setNodes((items) => items.map((item) => item.id === node.id ? { ...item, data: { ...item.data, ...node.data, label: node.data.description || item.data.label } } : item)))
-      listen('workflow.node.deleted', ({ node_id }) => { setNodes((items) => items.filter((item) => item.id !== node_id)); setEdges((items) => items.filter((edge) => edge.source !== node_id && edge.target !== node_id)) })
-      listen('workflow.edge.added', ({ edge }) => setEdges((items) => items.some((item) => item.source === edge.source && item.target === edge.target) ? items : addEdge({ ...edge, id: `ai-${crypto.randomUUID()}`, type: 'water' }, items)))
-      listen('workflow.edge.deleted', ({ source: from, target }) => setEdges((items) => items.filter((edge) => !(edge.source === from && edge.target === target))))
-      listen('operation.rejected', ({ message: text }) => setChatMessages((items) => [...items, { role: 'system', content: `操作未应用：${text}` }]))
-      listen('generation.completed', ({ workflow: completed, etag: tag }) => {
-        setEtag(tag); setGenerationId(null); setMessage('工作流已由 OpenCode 生成并保存'); source.close()
-        setSpec((project) => project ? { ...project, workflows: project.workflows.map((item) => item.id === completed.id ? completed : item) } : project)
-      })
-      const finishError = (text: string) => { setGenerationId(null); setMessage(text); setChatMessages((items) => [...items, { role: 'system', content: text }]); source.close() }
-      listen('generation.failed', ({ message: text }) => finishError(`生成失败：${text}`))
-      listen('generation.conflict', ({ message: text }) => finishError(text))
-      listen('generation.cancelled', () => finishError('已停止本轮生成'))
-      source.onerror = () => { if (source.readyState === EventSource.CLOSED) setGenerationId(null) }
+      followGeneration(started, '工作流已通过验收并自动采用最佳方案')
     } catch (error) {
       const text = error instanceof Error ? error.message : '无法启动生成器'
       setMessage(text); setChatMessages((items) => [...items, { role: 'system', content: text }])
     }
+  }
+
+  async function optimizeCurrent() {
+    if (!workflowId || generationId) return
+    try {
+      if (!await persist()) return
+      setRightTab('chat'); setMessage('正在启动最佳工作流选择…')
+      followGeneration(await optimizeWorkflow(workflowId), '已采用通过验收的最佳工作流')
+    } catch (error) { setMessage(error instanceof Error ? error.message : '无法启动优化') }
   }
 
   async function stopGeneration() {
@@ -311,6 +326,7 @@ function StudioCanvas() {
           {spec?.workflows.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
         </select>
         <button className="ghost" onClick={() => fitView({ padding: 0.22 })}>适应画布</button>
+        <button className="ghost" disabled={!!generationId || !workflow} onClick={optimizeCurrent}>优化当前工作流</button>
         <button className="opencode-launch" onClick={() => setRightTab('chat')}>✦ OpenCode 创建</button>
         <button className="primary" disabled={saving || !workflow} onClick={persist}>{saving ? '保存中…' : '保存工作流'}</button>
         {run && ['queued', 'running'].includes(run.status) ? <button className="stop-run" onClick={stopRun}>■ 停止</button> : <button className="run" disabled={!workflow} onClick={executeWorkflow}>▶ 运行</button>}
@@ -334,7 +350,7 @@ function StudioCanvas() {
     </main>
 
     <aside className={`inspector structural-glass ${rightTab === 'chat' ? 'chat-mode' : ''}`}>
-      <div className="inspector-tabs"><button className={rightTab === 'chat' ? 'active' : ''} onClick={() => setRightTab('chat')}>AI 创建</button><button className={rightTab === 'node' || rightTab === 'edge' ? 'active' : ''} onClick={() => setRightTab(selectedEdge ? 'edge' : 'node')}>设置</button><button className={rightTab === 'run' ? 'active' : ''} onClick={() => setRightTab('run')}>运行</button></div>
+      <div className="inspector-tabs"><button className={rightTab === 'chat' ? 'active' : ''} onClick={() => setRightTab('chat')}>AI 创建</button><button className={rightTab === 'node' || rightTab === 'edge' ? 'active' : ''} onClick={() => setRightTab(selectedEdge ? 'edge' : 'node')}>设置</button><button className={rightTab === 'evaluation' ? 'active' : ''} onClick={() => setRightTab('evaluation')}>验收标准</button><button className={rightTab === 'run' ? 'active' : ''} onClick={() => setRightTab('run')}>运行</button></div>
       {rightTab === 'chat' ? <div className="chat-panel">
         <div className="generator-title"><span className="ai-orb">✦</span><div><strong>OpenCode 创作助手</strong><small>真实模型：{generatorModel}</small></div></div>
         <div className="chat-messages">
@@ -345,6 +361,20 @@ function StudioCanvas() {
         <div className="chat-composer"><textarea autoFocus value={chatInput} disabled={!!generationId} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); generateFromChat() } }} placeholder="例如：创建代码审查流程，分析代码后等待人工审批，最后运行测试…"/>
           {generationId ? <button className="stop" onClick={stopGeneration}>停止生成</button> : <button className="send" onClick={generateFromChat} disabled={!chatInput.trim()}>发送并构建工作流</button>}
         </div>
+      </div> : rightTab === 'evaluation' ? <div className="run-panel evaluation-panel">
+        <div className="panel-title"><strong>验收标准</strong><span>OpenCode 会保留旧用例，并为改动追加最多 3 个</span></div>
+        {(workflow?.evaluation?.cases || []).map((item, index) => <fieldset className="advanced-fields" key={item.id}>
+          <legend>{item.name || item.id}</legend>
+          <label className="check-row"><input type="checkbox" checked={item.enabled} onChange={(event) => updateEvaluationCases((workflow?.evaluation?.cases || []).map((value, i) => i === index ? { ...value, enabled: event.target.checked } : value))}/>启用</label>
+          <label>名称<input value={item.name} onChange={(event) => updateEvaluationCases((workflow?.evaluation?.cases || []).map((value, i) => i === index ? { ...value, name: event.target.value } : value))}/></label>
+          <label>输入 JSON<textarea defaultValue={JSON.stringify(item.input, null, 2)} onBlur={(event) => { try { const input = JSON.parse(event.target.value); updateEvaluationCases((workflow?.evaluation?.cases || []).map((value, i) => i === index ? { ...value, input } : value)) } catch { setMessage('验收输入不是有效 JSON') } }}/></label>
+          <label>确定性断言 JSON<textarea defaultValue={JSON.stringify(item.assertions, null, 2)} onBlur={(event) => { try { const assertions = JSON.parse(event.target.value); updateEvaluationCases((workflow?.evaluation?.cases || []).map((value, i) => i === index ? { ...value, assertions } : value)) } catch { setMessage('断言不是有效 JSON') } }}/></label>
+          <label>语义标准（每行一条）<textarea value={item.semantic_criteria.join('\n')} onChange={(event) => updateEvaluationCases((workflow?.evaluation?.cases || []).map((value, i) => i === index ? { ...value, semantic_criteria: event.target.value.split('\n').filter(Boolean) } : value))}/></label>
+          <label>审批决策 JSON<textarea defaultValue={JSON.stringify(item.approvals, null, 2)} onBlur={(event) => { try { const approvals = JSON.parse(event.target.value); updateEvaluationCases((workflow?.evaluation?.cases || []).map((value, i) => i === index ? { ...value, approvals } : value)) } catch { setMessage('审批决策不是有效 JSON') } }}/></label>
+          <label>单用例超时（秒）<input type="number" min="1" max="1800" value={item.timeout_seconds} onChange={(event) => updateEvaluationCases((workflow?.evaluation?.cases || []).map((value, i) => i === index ? { ...value, timeout_seconds: Number(event.target.value) } : value))}/></label>
+        </fieldset>)}
+        {!workflow?.evaluation?.cases?.length && <div className="empty-state"><p>首次使用 AI 创建或优化时<br/>会自动生成 3 个验收用例</p></div>}
+        <button className="run-wide" disabled={!!generationId} onClick={optimizeCurrent}>优化当前工作流</button>
       </div> : rightTab === 'run' ? <div className="run-panel">
         <div className="panel-title"><strong>Harness 工作流</strong><span>{run ? `运行 ${run.id.slice(0, 8)} · ${run.status}` : '输入任务后开始执行'}</span></div>
         <label>工作流输入<textarea value={runInput} onChange={(event) => setRunInput(event.target.value)} disabled={!!run && ['queued', 'running'].includes(run.status)} placeholder="输入要交给工作流处理的任务…"/></label>

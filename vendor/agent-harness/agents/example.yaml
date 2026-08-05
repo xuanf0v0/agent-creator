@@ -1,0 +1,19 @@
+id: echo
+name: Echo Agent
+description: Minimal local agent used to verify the harness lifecycle and proxy.
+icon: 🔊
+cwd: ../examples/echo_agent
+environment:
+  setup_command: [uv, sync]
+service:
+  command: [uv, run, uvicorn, app:app, --host, 127.0.0.1, --port, "8766"]
+  port: 8766
+  health:
+    path: /health
+    timeout_seconds: 15
+env_file: .env
+config:
+  - key: ECHO_PREFIX
+    label: Echo prefix
+    type: string
+    default: Echo

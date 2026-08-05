@@ -13,7 +13,8 @@ import time
 import uuid
 from typing import Any
 
-from .models import WORKFLOW_NODE_TYPES, WorkflowSpec
+from .evaluation import CandidateResult, SemanticVerdict, WorkflowEvaluator
+from .models import WORKFLOW_NODE_TYPES, EvaluationCase, WorkflowEvaluation, WorkflowSpec
 from .process_utils import resolve_executable
 from .store import SpecStore
 
@@ -29,6 +30,9 @@ NODE_DATA_FIELDS = {
 
 SYSTEM_PROMPT = """你是 OpenAgent Studio 的工作流生成核心。你的唯一职责是把用户需求转换为可直接执行的智能体工作流。
 不要修改文件、不要运行命令、不要调用外部工具。请用中文简短说明你的设计，并逐个输出操作。
+“当前工作流”字段是用户画板在本轮请求开始时的完整快照，包含所有既有节点、节点参数和连线；你必须先读取完整快照，再决定如何修改。
+不要只关注当前会话曾经创建的节点。即使某个节点来自用户手动拖拽或更早的会话，也必须把它视为当前画板的一部分。
+若历史会话记忆与“当前工作流”不一致，始终以本轮提供的完整快照为准。除非用户明确要求，不得删除、重复创建或断开无关的既有节点。
 每个操作必须独占一行，格式为 <op>{JSON}</op>。支持：
 add_node: {"action":"add_node","id":"英文小写编号","type":"下方支持的节点类型","data":{"description":"中文说明","agent_id":"AI节点必填","prompt":"任务提示词","template":"模板","expression":"表达式"}}
 update_node: {"action":"update_node","id":"节点编号","data":{"description":"中文说明","prompt":"完整任务提示词等"}}
@@ -47,6 +51,21 @@ disconnect_nodes: {"action":"disconnect_nodes","source":"来源节点","target":
 6. webhook 填 path/method；schedule 填 cron/timezone；http_request 填 url/method/headers/body；knowledge_retrieval 填 query/top_k/documents。
 7. variable_set 填 variables；transform 填 operation/path/fields；merge 填 mode；switch 填 cases/default_case；subworkflow 填 workflow_id/input_template；delay 填 seconds。
 """
+
+CASE_PROMPT = """你是工作流验收设计师。根据用户目标和当前工作流生成可编辑的验收用例。
+只输出 <result>{JSON}</result>，JSON 必须符合 {"cases":[...]}。每个 case 包含 id、name、enabled、input、assertions、semantic_criteria、approvals、mocks、timeout_seconds。
+assertions 的 operator 只能是 exists、equals、contains、matches、type，path 从最终输出开始。
+首次创建必须恰好生成 3 个覆盖正常、边界和失败风险的用例。已有用例时必须逐字保留其所有字段，不得删除、禁用或弱化，只能追加最多 3 个与本轮改动直接相关的新用例。
+候选会沿正式运行路径真实调用 Harness、模型、工具、HTTP 和子工作流；输入必须适合在当前环境真实执行。不要输出解释。"""
+
+CANDIDATE_PROMPT = """你是 OpenAgent Studio 的工作流架构师。请根据用户目标优化完整工作流。
+只输出 <result>{{JSON}}</result>，JSON 必须是完整 WorkflowSpec，包含 id、name、nodes、edges、evaluation；不得输出操作列表或解释。
+保留无关既有能力，所有节点必须可执行，图必须无环。evaluation 将由系统覆盖，不要尝试改变验收标准。
+策略：{strategy}。可用 Harness 智能体：{catalog}\n当前工作流：{workflow}\n用户目标：{request}"""
+
+REPAIR_PROMPT = """你是 OpenAgent Studio 的工作流修复工程师。下面候选已经真实试运行并被独立 OpenCode 验证判定不通过。
+必须根据失败证据修复完整工作流，不得删改或弱化验收标准。只输出 <result>{{JSON}}</result>，JSON 必须是完整 WorkflowSpec。
+修复轮次：{round_number}\n修复策略：{strategy}\n失败候选：{workflow}\n验证失败证据：{feedback}\n固定验收标准：{evaluation}\n可用 Harness 智能体：{catalog}\n用户目标：{request}"""
 
 
 COMPACTION_PROMPT = """请在内部压缩附件中的工作流生成上下文，只输出精炼后的中文上下文，不要解释压缩过程，也不要输出 <op> 标签。
@@ -73,6 +92,7 @@ class Generation:
     operation_ids: set[str] = field(default_factory=set)
     harness_agent_ids: set[str] = field(default_factory=set)
     model: str = ""
+    optimize_only: bool = False
 
     def emit(self, event: str, data: dict[str, Any]) -> None:
         item = {"event": event, "data": data, "sequence": len(self.events), "timestamp": time.time()}
@@ -144,7 +164,7 @@ class GeneratorManager:
                         environment[key] = value
         return environment
 
-    def start(self, workflow_id: str, message: str) -> Generation:
+    def start(self, workflow_id: str, message: str, *, optimize_only: bool = False) -> Generation:
         message = message.strip()
         if not message:
             raise ValueError("请输入你想创建的智能体或工作流需求")
@@ -167,12 +187,16 @@ class GeneratorManager:
                 session_id=self.sessions.get(workflow_id) if self.session_models.get(workflow_id) == model else None,
                 harness_agent_ids={item.id for item in spec.harness},
                 model=model,
+                optimize_only=optimize_only,
             )
             self.generations[generation.id] = generation
             self.active[workflow_id] = generation.id
             self.history.setdefault(workflow_id, []).append({"role": "user", "content": message})
         threading.Thread(target=self._run, args=(generation, spec), daemon=True).start()
         return generation
+
+    def optimize(self, workflow_id: str) -> Generation:
+        return self.start(workflow_id, "在不改变目标效果和验收标准的前提下，选出最短、最清晰、效果最好的工作流。", optimize_only=True)
 
     def cancel(self, generation_id: str) -> Generation:
         generation = self.require(generation_id)
@@ -191,99 +215,76 @@ class GeneratorManager:
 
     def _run(self, generation: Generation, spec: Any) -> None:
         generation.emit("generation.started", {"generation_id": generation.id, "workflow_id": generation.workflow_id})
-        model = generation.model or self.ensure_ready(spec)["model"]
         catalog = [
             {"id": item.id, "name": item.name, "description": item.description, "runtime": "task" if item.task else "service"}
             for item in spec.harness
         ]
-        context = f"可用 Harness 智能体：\n{json.dumps(catalog, ensure_ascii=False)}\n\n当前工作流：\n{json.dumps(generation.draft, ensure_ascii=False)}\n\n用户需求：{generation.prompt}"
-        prompt = f"{SYSTEM_PROMPT}\n{context}"
+        catalog_json = json.dumps(catalog, ensure_ascii=False)
+        original = WorkflowSpec.model_validate(generation.draft)
         environment = self._environment(spec)
         binary = resolve_executable(os.environ.get("OPENCODE_BIN", "opencode"), environment)
-        base_command = [binary, "run", "--format", "json", "--agent", "plan", "--title", f"OpenAgent生成-{generation.workflow_id}"]
-        base_command += ["--model", model]
-        if generation.session_id:
-            base_command += ["--session", generation.session_id]
+        command = [binary, "run", "--format", "json", "--agent", "plan", "--title", f"OpenAgent生成-{generation.workflow_id}"]
         workdir = Path(spec.project_dir).expanduser()
         if not workdir.is_dir():
             workdir = self.store.path.parent
-        assistant_text = ""
-        diagnostics: list[str] = []
-        parsed_until = 0
         try:
-            with tempfile.TemporaryDirectory(prefix="openagent-generator-") as temporary_dir:
-                compacted = _command_exceeds_limit([*base_command, prompt])
-                command = base_command
-                if compacted:
-                    prompt = self._compact_prompt(generation, binary, model, context, workdir, environment, Path(temporary_dir))
-                    prompt_path = Path(temporary_dir) / "compacted-context.md"
-                    prompt_path.write_text(f"{SYSTEM_PROMPT}\n{prompt}", encoding="utf-8")
-                    command = _with_file_prompt(base_command, ATTACHED_PROMPT, prompt_path)
-                else:
-                    command = [*base_command, prompt]
-
-                while True:
-                    generation.process = subprocess.Popen(
-                        command, cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        bufsize=1, env=environment,
+            generation.emit("generation.stage", {"stage": "preparing_cases"})
+            case_prompt = (
+                f"{CASE_PROMPT}\n已有验收用例：{json.dumps(original.evaluation.model_dump(mode='json'), ensure_ascii=False)}"
+                f"\n当前工作流：{json.dumps(original.model_dump(mode='json'), ensure_ascii=False)}\n本轮目标：{generation.prompt}"
+            )
+            evaluation = WorkflowEvaluation.model_validate(_parse_result(self._invoke(generation, spec, command, workdir, case_prompt)))
+            self._validate_case_update(original.evaluation, evaluation)
+            generation.emit("generation.stage", {"stage": "generating"})
+            candidates: list[WorkflowSpec] = []
+            for strategy in ("minimal：删除冗余，只保留达成目标所需的最少节点", "balanced：兼顾简洁、可读性和必要容错", "robust：强调边界处理与稳定性，但避免无效堆叠"):
+                prompt = CANDIDATE_PROMPT.format(
+                    strategy=strategy, catalog=catalog_json,
+                    workflow=json.dumps(original.model_dump(mode="json"), ensure_ascii=False), request=generation.prompt,
+                )
+                candidate = WorkflowSpec.model_validate(_parse_result(self._invoke(generation, spec, command, workdir, prompt)))
+                if candidate.id != original.id:
+                    raise RuntimeError("候选工作流修改了 workflow id")
+                candidate.evaluation = evaluation.model_copy(deep=True)
+                candidates.append(candidate)
+            evaluator = WorkflowEvaluator(
+                lambda prompt, value: self._model_inference(generation, spec, command, workdir, prompt, value),
+                lambda workflow, case, output: self._semantic_verdict(generation, spec, command, workdir, workflow, case, output),
+                live_execution=True,
+                harness_base_url=os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"),
+            )
+            results = self._evaluate_candidates(generation, spec, candidates, evaluator)
+            passing = [item for item in results if item.passed]
+            max_repairs = max(0, min(int(os.environ.get("OPENCODE_OPTIMIZATION_REPAIR_ROUNDS", "2")), 5))
+            for repair_round in range(1, max_repairs + 1):
+                if passing:
+                    break
+                generation.emit("generation.stage", {"stage": "repairing", "round": repair_round})
+                repaired: list[WorkflowSpec] = []
+                for index, result in enumerate(results):
+                    strategy = ("最小修改并修复根因", "重新组织数据流并提高可验证性", "强化边界和失败处理但保持简洁")[index % 3]
+                    prompt = REPAIR_PROMPT.format(
+                        round_number=repair_round, strategy=strategy,
+                        workflow=json.dumps(result.workflow.model_dump(mode="json"), ensure_ascii=False),
+                        feedback=json.dumps(self._result_feedback(result), ensure_ascii=False),
+                        evaluation=json.dumps(evaluation.model_dump(mode="json"), ensure_ascii=False),
+                        catalog=catalog_json, request=generation.prompt,
                     )
-                    assert generation.process.stdout is not None
-                    for raw in generation.process.stdout:
-                        if generation.cancelled:
-                            return
-                        try:
-                            item = json.loads(raw)
-                        except json.JSONDecodeError:
-                            if raw.strip():
-                                diagnostics.append(raw.strip())
-                            continue
-                        error_text = _extract_error(item)
-                        if error_text:
-                            diagnostics.append(error_text)
-                        generation.session_id = generation.session_id or _find_string(item, "sessionID")
-                        text = _extract_text(item)
-                        if not text:
-                            continue
-                        if text.startswith(assistant_text):
-                            delta = text[len(assistant_text):]
-                            assistant_text = text
-                        else:
-                            delta = text
-                            assistant_text += text
-                        visible = re.sub(r"<op>.*?</op>", "", delta, flags=re.DOTALL)
-                        if visible.strip():
-                            generation.emit("chat.assistant.delta", {"text": visible})
-                        parse_base = parsed_until
-                        for match in list(re.finditer(r"<op>\s*(\{.*?\})\s*</op>", assistant_text[parse_base:], re.DOTALL)):
-                            parsed_until = parse_base + match.end()
-                            try:
-                                operation = json.loads(match.group(1))
-                                self._apply(generation, operation)
-                            except (ValueError, KeyError, json.JSONDecodeError) as exc:
-                                generation.emit("operation.rejected", {"message": str(exc)})
-                    code = generation.process.wait()
-                    if generation.cancelled:
-                        return
-                    detail = diagnostics[-1] if diagnostics else "没有返回错误详情，请检查 OpenCode 日志"
-                    if code == 0:
-                        break
-                    if not compacted and not assistant_text and not generation.operation_ids and _is_command_line_too_long(detail):
-                        compacted = True
-                        prompt = self._compact_prompt(generation, binary, model, context, workdir, environment, Path(temporary_dir))
-                        prompt_path = Path(temporary_dir) / "compacted-context.md"
-                        prompt_path.write_text(f"{SYSTEM_PROMPT}\n{prompt}", encoding="utf-8")
-                        command = _with_file_prompt(base_command, ATTACHED_PROMPT, prompt_path)
-                        diagnostics.clear()
-                        continue
-                    raise RuntimeError(f"OpenCode 退出，代码 {code}：{detail}")
-            if not generation.completed:
-                self._finalize(generation)
-            clean_text = re.sub(r"<op>.*?</op>", "", assistant_text, flags=re.DOTALL).strip()
-            if clean_text:
-                self.history[generation.workflow_id].append({"role": "assistant", "content": clean_text})
-            if generation.session_id:
-                self.sessions[generation.workflow_id] = generation.session_id
-                self.session_models[generation.workflow_id] = model
+                    candidate = WorkflowSpec.model_validate(_parse_result(self._invoke(generation, spec, command, workdir, prompt)))
+                    if candidate.id != original.id:
+                        raise RuntimeError("修复候选修改了 workflow id")
+                    candidate.evaluation = evaluation.model_copy(deep=True)
+                    repaired.append(candidate)
+                results = self._evaluate_candidates(generation, spec, repaired, evaluator)
+                passing = [item for item in results if item.passed]
+            if not passing:
+                raise RuntimeError(f"三个候选经过 {max_repairs} 轮修复后仍未通过 OpenCode 验证，原工作流和验收标准均已保留")
+            winner = min(passing, key=lambda item: item.metrics).workflow
+            generation.emit("generation.stage", {"stage": "saving"})
+            generation.draft = winner.model_dump(mode="json")
+            self._finalize(generation)
+            if generation.events[-1]["event"] == "generation.completed":
+                self.history.setdefault(generation.workflow_id, []).append({"role": "assistant", "content": "已自动验收并采用最短、最清晰且通过全部标准的工作流。"})
         except Exception as exc:
             if generation.cancelled:
                 return
@@ -340,6 +341,100 @@ class GeneratorManager:
         if not text:
             raise RuntimeError("OpenCode 内部上下文提炼没有返回内容")
         return text
+    def _invoke(self, generation: Generation, spec: Any, base_command: list[str], workdir: Path, prompt: str) -> str:
+        if generation.cancelled:
+            raise RuntimeError("生成已取消")
+        environment = self._environment(spec)
+        command_base = [*base_command, "--model", generation.model]
+        with tempfile.TemporaryDirectory(prefix="openagent-generator-") as temporary_dir:
+            attached = _command_exceeds_limit([*command_base, prompt])
+            prompt_path = Path(temporary_dir) / "generation-prompt.md"
+            if attached:
+                prompt_path.write_text(prompt, encoding="utf-8")
+            command = _with_file_prompt(command_base, "请严格按照附件中的完整要求执行。", prompt_path) if attached else [*command_base, prompt]
+            while True:
+                generation.process = subprocess.Popen(command, cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, env=environment)
+                assert generation.process.stdout is not None
+                assistant_text, diagnostics = "", []
+                for raw in generation.process.stdout:
+                    if generation.cancelled:
+                        return ""
+                    try:
+                        item = json.loads(raw)
+                    except json.JSONDecodeError:
+                        if raw.strip():
+                            diagnostics.append(raw.strip())
+                        continue
+                    if error := _extract_error(item):
+                        diagnostics.append(error)
+                    text = _extract_text(item)
+                    if text:
+                        assistant_text = text if text.startswith(assistant_text) else assistant_text + text
+                code = generation.process.wait()
+                if code == 0:
+                    return assistant_text
+                detail = diagnostics[-1] if diagnostics else "没有返回错误详情"
+                if not attached and not assistant_text and _is_command_line_too_long(detail):
+                    attached = True
+                    prompt_path.write_text(prompt, encoding="utf-8")
+                    command = _with_file_prompt(command_base, "请严格按照附件中的完整要求执行。", prompt_path)
+                    continue
+                raise RuntimeError(f"OpenCode 退出，代码 {code}：{detail}")
+
+    @staticmethod
+    def _validate_case_update(previous: WorkflowEvaluation, current: WorkflowEvaluation) -> None:
+        old = [item.model_dump(mode="json") for item in previous.cases]
+        new = [item.model_dump(mode="json") for item in current.cases]
+        if not old and len(new) != 3:
+            raise RuntimeError("首次生成必须创建恰好 3 个验收用例")
+        if old and (new[:len(old)] != old or len(new) > len(old) + 3):
+            raise RuntimeError("OpenCode 试图删除、修改或一次追加超过 3 个既有验收用例")
+        ids = [item.id for item in current.cases]
+        if len(ids) != len(set(ids)):
+            raise RuntimeError("验收用例 id 重复")
+        if any(not item.assertions or not item.semantic_criteria for item in current.cases):
+            raise RuntimeError("每个验收用例都必须同时包含确定性断言和语义质量标准")
+
+    def _model_inference(self, generation: Generation, spec: Any, command: list[str], workdir: Path, prompt: str, value: Any) -> Any:
+        text = self._invoke(generation, spec, command, workdir, f"执行以下工作流 AI 节点。只输出 <result>{{JSON}}</result>。不得修改文件、运行命令、调用工具或访问非模型网络。\n任务：{prompt}\n输入：{json.dumps(value, ensure_ascii=False)}")
+        return _parse_result(text)
+
+    def _semantic_verdict(self, generation: Generation, spec: Any, command: list[str], workdir: Path, workflow: WorkflowSpec, case: EvaluationCase, output: Any) -> SemanticVerdict:
+        prompt = (
+            "你是独立 OpenCode 验证智能体，不参与工作流生成。必须根据实际试运行输出逐条验证语义标准。"
+            "只输出 <result>{\"passed\":布尔值,\"score\":0到100的整数,\"issues\":[\"未通过原因\"]}</result>。"
+            "只有所有标准都满足时 passed 才能为 true；不确定一律判定 false。"
+            f"\n工作流：{json.dumps(workflow.model_dump(mode='json', exclude={'evaluation'}), ensure_ascii=False)}"
+            f"\n验收标准：{json.dumps(case.semantic_criteria, ensure_ascii=False)}\n实际试运行输出：{json.dumps(output, ensure_ascii=False)}"
+        )
+        result = _parse_result(self._invoke(generation, spec, command, workdir, prompt))
+        if not isinstance(result, dict):
+            return SemanticVerdict(False, 0, ["OpenCode 验证结果格式无效"])
+        score = max(0, min(int(result.get("score", 0)), 100))
+        issues = [str(item) for item in result.get("issues", [])] if isinstance(result.get("issues", []), list) else []
+        return SemanticVerdict(result.get("passed") is True, score, issues)
+
+    def _evaluate_candidates(self, generation: Generation, spec: Any, candidates: list[WorkflowSpec], evaluator: WorkflowEvaluator) -> list[CandidateResult]:
+        generation.emit("generation.stage", {"stage": "validating"})
+        generation.emit("generation.stage", {"stage": "evaluating"})
+        generation.emit("generation.stage", {"stage": "verifying"})
+        results: list[CandidateResult] = []
+        for index, candidate in enumerate(candidates):
+            project = spec.model_copy(deep=True)
+            project.workflows = [candidate if item.id == candidate.id else item for item in project.workflows]
+            results.append(evaluator.evaluate(project, candidate, index))
+        generation.emit("generation.stage", {"stage": "selecting"})
+        return results
+
+    @staticmethod
+    def _result_feedback(result: CandidateResult) -> dict[str, Any]:
+        return {
+            "validation_errors": result.errors,
+            "case_failures": [
+                {"case_id": case.case_id, "errors": case.errors, "semantic_score": case.semantic_score, "opencode_verified": case.opencode_verified}
+                for case in result.cases if not case.passed
+            ],
+        }
 
     def _apply(self, generation: Generation, operation: dict[str, Any]) -> None:
         action = operation.get("action")
@@ -452,6 +547,21 @@ def _with_file_prompt(command: list[str], prompt: str, path: Path) -> list[str]:
 def _is_command_line_too_long(detail: str) -> bool:
     lowered = detail.lower()
     return "command line is too long" in lowered or "命令行太长" in detail or "winerror 206" in lowered
+
+
+def _parse_result(text: str) -> Any:
+    match = re.search(r"<result>\s*(.*?)\s*</result>", text, re.DOTALL)
+    payload = match.group(1) if match else text.strip()
+    if payload.startswith("```json"):
+        payload = payload[7:]
+    if payload.startswith("```"):
+        payload = payload[3:]
+    if payload.endswith("```"):
+        payload = payload[:-3]
+    try:
+        return json.loads(payload.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("OpenCode 未返回有效的结构化 JSON 结果") from exc
 
 
 def _extract_text(item: dict[str, Any]) -> str:

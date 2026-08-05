@@ -1,7 +1,10 @@
 export type NodeKind = 'manual_trigger' | 'webhook' | 'schedule' | 'llm' | 'agent' | 'knowledge_retrieval' | 'tool' | 'http_request' | 'code' | 'prompt' | 'variable_set' | 'transform' | 'merge' | 'condition' | 'switch' | 'parallel' | 'iteration' | 'loop' | 'approval' | 'validator' | 'subworkflow' | 'delay' | 'output'
 export type WorkflowNode = { id: string; type: NodeKind; data: Record<string, unknown>; position: { x: number; y: number } }
 export type WorkflowEdge = { source: string; target: string; condition?: string | null }
-export type Workflow = { id: string; name: string; nodes: WorkflowNode[]; edges: WorkflowEdge[] }
+export type EvaluationAssertion = { path: string; operator: 'exists' | 'equals' | 'contains' | 'matches' | 'type'; expected?: unknown }
+export type EvaluationMock = { node_id: string; response?: unknown }
+export type EvaluationCase = { id: string; name: string; enabled: boolean; input: unknown; assertions: EvaluationAssertion[]; semantic_criteria: string[]; approvals: Record<string, boolean>; mocks: EvaluationMock[]; timeout_seconds: number }
+export type Workflow = { id: string; name: string; nodes: WorkflowNode[]; edges: WorkflowEdge[]; evaluation?: { cases: EvaluationCase[] } }
 export type Agent = { id: string; name: string; description?: string; model?: string }
 export type Harness = { id: string; name: string; description?: string; cwd: string; task?: Record<string, unknown>; service?: Record<string, unknown> }
 export type ProjectSpec = { version: '1'; name: string; description?: string; project_dir: string; agents: Agent[]; providers: unknown[]; harness: Harness[]; workflows: Workflow[] }
