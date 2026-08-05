@@ -165,7 +165,7 @@ def test_workflow_run_api_executes_non_agent_nodes(tmp_path: Path):
 def test_workflow_runner_calls_harness_task_and_waits_for_approval():
     project = ProjectSpec.model_validate({
         "version": "1", "name": "示例",
-        "harness": [{"id": "coding", "name": "Coding", "cwd": ".", "task": {"command": ["worker"], "verification": [{"name": "test", "command": ["test"]}]}}],
+        "harness": [{"id": "coding", "name": "Coding", "runtime": "task", "cwd": ".", "task": {"command": ["worker"], "verification": [{"name": "test", "command": ["test"]}]}}],
         "workflows": [{"id": "flow", "name": "测试流程", "nodes": [
             {"id": "agent", "type": "agent", "data": {"agent_id": "coding", "prompt": "{{input}}"}},
             {"id": "approval", "type": "approval", "data": {"description": "确认结果"}},
@@ -177,12 +177,14 @@ def test_workflow_runner_calls_harness_task_and_waits_for_approval():
 
     def scripted_request(method, path, body=None, headers=None):
         calls.append((method, path, body, headers))
-        if path == "/api/tasks":
+        if path == "/api/v1/tasks":
             return {"id": "task-1", "status": "queued"}
-        if path == "/api/tasks/task-1":
+        if path == "/api/v1/tasks/task-1":
             return {"id": "task-1", "status": "completed"}
-        if path.startswith("/api/tasks/task-1/logs"):
-            return [{"line": "done"}]
+        if path.startswith("/api/v1/tasks/task-1/logs"):
+            return {"items": [{"line": "done"}], "next_cursor": 1}
+        if path == "/api/v1/tasks/task-1/result":
+            return {"task_id": "task-1", "status": "completed", "output": {"type": "text", "text": "done"}, "logs": {}, "verification": {}, "artifacts": [], "error": None}
         raise AssertionError(path)
 
     manager._request = scripted_request
@@ -190,8 +192,9 @@ def test_workflow_runner_calls_harness_task_and_waits_for_approval():
     _wait_for(lambda: run.node_states["approval"]["status"] == "waiting")
     manager.approve(run.id, "approval", True, "可以发布")
     _wait_for(lambda: run.status == "completed")
-    assert calls[0][1] == "/api/tasks"
-    assert calls[0][2]["prompt"] == "完成任务"
+    assert calls[0][1] == "/api/v1/tasks"
+    assert calls[0][2]["input"]["prompt"] == "完成任务"
+    assert calls[0][2]["input"]["metadata"]["workflow_node_id"] == "agent"
     assert calls[0][3]["Idempotency-Key"].startswith("openagent-")
     assert run.outputs["output"]["approved"] is True
 

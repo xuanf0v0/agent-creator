@@ -216,7 +216,7 @@ class GeneratorManager:
     def _run(self, generation: Generation, spec: Any) -> None:
         generation.emit("generation.started", {"generation_id": generation.id, "workflow_id": generation.workflow_id})
         catalog = [
-            {"id": item.id, "name": item.name, "description": item.description, "runtime": "task" if item.task else "service"}
+            {"id": item.id, "name": item.name, "description": item.description, "runtime": item.runtime}
             for item in spec.harness
         ]
         catalog_json = json.dumps(catalog, ensure_ascii=False)

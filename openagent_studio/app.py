@@ -27,8 +27,14 @@ class HarnessManager:
         self.project_root = (project_root or Path.cwd()).resolve()
         self.root = Path(os.environ.get("AGENT_HARNESS_ROOT", self.project_root / "vendor/agent-harness")).resolve()
         configured_bin = os.environ.get("AGENT_HARNESS_BIN")
-        self.binary = Path(configured_bin).resolve() if configured_bin else None
-        self.command = [str(self.binary)] if self.binary else [sys.executable, "-m", "agent_harness"]
+        if configured_bin:
+            self.binary = Path(configured_bin).resolve()
+        elif "AGENT_HARNESS_ROOT" in os.environ:
+            entrypoint = ".venv/Scripts/agent-harness.exe" if os.name == "nt" else ".venv/bin/agent-harness"
+            self.binary = self.root / entrypoint
+        else:
+            self.binary = None
+        self.command = self.binary if self.binary else [sys.executable, "-m", "agent_harness"]
         self.source = self.root / "src"
         self.manifests = Path(os.environ.get("AGENT_HARNESS_MANIFESTS", self.project_root / ".openagent-agents"))
         self.home = Path(os.environ.get("AGENT_HARNESS_HOME", self.project_root / ".harness/agent-harness"))
@@ -39,7 +45,7 @@ class HarnessManager:
         self.operations: dict[str, dict[str, str]] = {}
 
     def sync(self, spec: ProjectSpec) -> None:
-        if not spec.harness or os.environ.get("OPENAGENT_SYNC_HARNESS", "1") == "0":
+        if not spec.harness or os.environ.get("OPENAGENT_SYNC_HARNESS", "0") != "1":
             return
         try:
             self.manifests.mkdir(parents=True, exist_ok=True)
@@ -94,8 +100,9 @@ class HarnessManager:
                 current_pythonpath = environment.get("PYTHONPATH", "")
                 environment["PYTHONPATH"] = str(self.source) + (os.pathsep + current_pythonpath if current_pythonpath else "")
             environment.setdefault("AGENT_HARNESS_HOME", str(self.home))
+            command = [str(self.command)] if isinstance(self.command, Path) else self.command
             self.process = subprocess.Popen(
-                [*self.command, "serve", "--manifests", str(self.manifests), "--host", endpoint.hostname, "--port", str(endpoint.port or 80)],
+                [*command, "serve", "--manifests", str(self.manifests), "--host", endpoint.hostname, "--port", str(endpoint.port or 80)],
                 cwd=self.root,
                 env=environment,
                 stdout=subprocess.DEVNULL,
@@ -118,6 +125,13 @@ class HarnessManager:
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
+        if os.name == "nt":
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            return
         try:
             os.killpg(self.process.pid, signal.SIGTERM)
             self.process.wait(timeout=5)
@@ -131,7 +145,7 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
     generator = GeneratorManager(store)
     workflows = WorkflowManager(os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"))
     platforms = PlatformIntegrationManager(workflows)
-    enabled = auto_start_harness if auto_start_harness is not None else os.environ.get("OPENAGENT_START_HARNESS", "1") != "0"
+    enabled = auto_start_harness if auto_start_harness is not None else os.environ.get("OPENAGENT_START_HARNESS", "0") == "1"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -434,7 +448,12 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
 
     @app.get("/api/runtime/status")
     def runtime_status():
-        return {"running": manager.reachable(), "managed": manager.process is not None, "error": manager.error, "operations": manager.operations}
+        status = {"running": manager.reachable(), "managed": manager.process is not None, "error": manager.error, "operations": manager.operations}
+        try:
+            capabilities = _harness_request("GET", "/api/v1/capabilities")
+        except HTTPException:
+            return {**status, "api_version": None, "capabilities": None}
+        return {**status, "running": True, "api_version": capabilities.get("api", {}).get("selected_version"), "capabilities": capabilities}
 
     @app.post("/api/runtime/agents/{agent_id}/{operation}", status_code=202)
     def runtime_operation(agent_id: str, operation: str, background_tasks: BackgroundTasks):
@@ -470,14 +489,20 @@ def create_app(spec_path: Path | None = None, auto_start_harness: bool | None = 
 
 def _harness_request(method: str, path: str, json_body: dict | None = None):
     base = os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765").rstrip("/")
+    headers = {"X-Harness-Supported-Versions": "1"}
+    token = os.environ.get("AGENT_HARNESS_MANAGEMENT_TOKEN") or os.environ.get("AGENT_HARNESS_TOKEN", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         with httpx.Client(timeout=15) as client:
-            response = client.request(method, base + path, json=json_body)
+            response = client.request(method, base + path, json=json_body, headers=headers)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail=f"harness unavailable: {exc}") from exc
     if response.status_code >= 400:
         try:
             detail = response.json()
+            if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
+                detail = detail["error"]
         except ValueError:
             detail = response.text
         raise HTTPException(status_code=response.status_code, detail=detail)

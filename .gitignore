@@ -1,6 +1,8 @@
 .venv/
 .DS_Store
 .pytest_cache/
+.cache/
+.harness/
 __pycache__/
 *.pyc
 *.egg-info/

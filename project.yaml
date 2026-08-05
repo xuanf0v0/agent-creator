@@ -1,6 +1,6 @@
 version: '1'
 name: 我的第一个智能体项目
-project_dir: /Users/ypc/openagent
+project_dir: .
 agents:
 - id: coding
   name: OpenCode 代码助手
@@ -26,7 +26,7 @@ providers:
   npm: '@ai-sdk/openai-compatible'
   base_url: https://api.deepseek.com
   api_key_env: OPENAI_API_KEY
-  env_file: /Users/ypc/agent-manager/agents/listing-optimization/.env
+  env_file: .env
   models:
     deepseek-v4-flash:
       name: DeepSeek V4 Flash
@@ -34,383 +34,106 @@ harness:
 - id: coding
   name: OpenCode 模型任务
   description: Agent Harness 治理下的真实 OpenCode CLI 任务
-  cwd: /Users/ypc/openagent
-  task:
-    command:
-    - /Users/ypc/openagent/.venv/bin/python
-    - -m
-    - openagent_studio.harness_opencode
-    - --model
-    - deepseek/deepseek-v4-flash
-    - --agent
-    - build
-    - --env-file
-    - /Users/ypc/agent-manager/agents/listing-optimization/.env
-    protocol:
-      kind: stdin_json
-      options: {}
-    verification:
-    - name: 运行项目测试
-      command:
-      - /Users/ypc/openagent/.venv/bin/pytest
-      - -q
-      timeout_seconds: 120
-    tools:
-      allow:
-      - read
-      - write
-      - network
-      ask: []
-      deny:
-      - destructive
-    sandbox:
-      enabled: true
-      backend: auto
-      backend_options: {}
-      enforcement: required
-      network: allow
-      workspace_write: true
-  environment:
-    setup_command:
-    - /Users/ypc/openagent/.venv/bin/python
-    - -m
-    - openagent_studio.harness_setup
-    setup_timeout_seconds: 1800
-    auto_setup_on_drift: true
-  env_file: .env
-  config: []
+  runtime: task
 workflows:
 - id: product-selection
   name: 智能选品决策流程
   nodes:
-  - id: listing-input
+  - id: start
     type: manual_trigger
     data:
-      description: 输入产品ASIN、产品资料、关键词资料、竞品资料及现有标题/五点/描述/Search Terms
+      description: 接收飞书/QQ 机器人转发的用户选品需求消息
     position:
-      x: 39.58020739208567
-      y: 68.02376515321058
-  - id: info-research
-    type: agent
+      x: 80.0
+      y: 80.0
+  - id: requirements
+    type: llm
     data:
-      description: 按ASIN调研产品资料、关键词数据与竞品信息
+      description: 需求整理：解析用户选品需求为结构化字段
       agent_id: coding
-      title: 产品资料调研与信息整理
-      prompt: '你是一名资深亚马逊美国站运营与调研专家，熟悉Amazon SEO、COSMO算法与Rufus购物问答逻辑。
+      prompt: '你是资深电商选品顾问。目标：把用户的选品需求整理成结构化清单。
 
-        目标：基于用户提供的ASIN和资料模板，调研并整理产品资料、关键词数据和竞品信息，形成结构化资料包。
+        输入：用户原始消息见 {{input.content}}；若为空，以 {{input}} 其余字段推断。
 
-        输入：{{input}}（含站点=美国站、品牌、产品名称、类目、ASIN、材质、尺寸、重量、数量、颜色、人群、年龄、场景、核心功能、核心卖点、包装清单、限制说明、现有标题/五点/描述/Search
-        Terms、关键词模板、竞品模板）。
+        约束：只输出一个 JSON 对象，字段固定为 category、target_market、budget、quantity、audience、constraints、summary；无法判断的字段填
+        null。
 
-        步骤：1) 缺失的产品字段优先基于ASIN调研并标注来源；无法查证的信息标注“待确认”，禁止编造；2) 整理核心/次核心/长尾/高流量/高转化关键词及属性、场景、人群、痛点词；3)
-        整理竞品ASIN、标题、五点、主要卖点与差评痛点；4) 给出我方相对优势与劣势；5) 资料与文案冲突时列出冲突项，不自行取舍；6) 识别不适用或禁用关键词。
-
-        约束：所有事实以用户提供资料为准，不确定一律“待确认”；不得虚构销量、排名或认证。
-
-        输出：中文Markdown结构化资料包，分为产品基础信息、关键词资料、竞品资料、优劣势对比、冲突与待确认清单。'
+        预期输出：{"category":"露营装备","target_market":"北美","budget":100000,"quantity":500,"audience":"中产户外人群","constraints":["轻量便携","颜色中性"],"summary":"一句话概括核心选品方向"}'
     position:
       x: 340.0
       y: 80.0
-  - id: positioning-analysis
+  - id: research
     type: agent
     data:
-      description: 判断产品核心定位、目标用户与购买决策因素
+      description: 市场研究：输出候选商品清单与市场评分
       agent_id: coding
-      title: 产品定位分析
-      prompt: '你是一名资深亚马逊美国站产品定位分析师。
+      prompt: '你是市场研究员。目标：根据整理后的选品需求开展市场研究，输出候选商品清单。
 
-        目标：判断该产品的核心定位、目标用户、主要使用场景、消费者核心需求和购买决策因素。
+        输入：需求整理结果见 {{nodes.requirements.text}}。
 
-        输入：产品资料包：{{nodes.info-research.text}}。
+        任务：判断目标品类与市场的热度、趋势、主流价格带与竞争格局，给出 3-5 个候选商品（商品名、核心卖点、市场热度评分1-5、趋势方向、竞争强度1-5）。
 
-        约束：以资料包为准，不得编造；不确定项标注“待确认”。
+        约束：候选必须与需求约束一致，每个候选给出独立理由；只输出 JSON，字段 candidates（数组，每项含 name、selling_point、market_heat、trend、competition、reason）。
 
-        输出：中文Markdown，依次给出核心定位一句话、目标用户画像、主要使用场景、消费者核心需求排序、购买决策因素清单。'
+        预期输出：{"candidates":[{"name":"...","selling_point":"...","market_heat":4,"trend":"上升","competition":3,"reason":"..."}]}'
     position:
       x: 600.0
-      y: 187.7861136211049
-  - id: copy-diagnosis
+      y: 80.0
+  - id: competition
     type: agent
     data:
-      description: 诊断现有标题与五点的具体问题
+      description: 竞品分析：评估候选商品进入难度与差异化空间
       agent_id: coding
-      title: 现有文案诊断
-      prompt: '你是一名亚马逊Listing文案审核专家。
+      prompt: '你是竞品分析师。目标：对候选商品逐一做竞品分析，评估进入难度与差异化机会。
 
-        目标：系统诊断现有标题和五点的问题。
+        输入：需求整理结果 {{nodes.requirements.text}}，候选商品清单 {{nodes.research.text}}。
 
-        输入：产品资料包：{{nodes.info-research.text}}（含现有标题、五点、描述、Search Terms）。
+        任务：对每个候选分析价格带分布、头部竞品及其销量/评分、可差异化切入点、主要风险。
 
-        诊断维度：关键词覆盖不足、关键词堆砌、卖点顺序不合理、产品属性表达不清、与目标用户需求不匹配、缺少场景化表达、缺少差异化卖点、英文表达不自然、存在合规风险、存在引发退货或投诉的歧义。
+        约束：只输出 JSON，字段 analysis（数组，每项含 name、price_range、competitors（数组，含名称、销量区间、评分）、differentiation、risks）；与候选一一对应。
 
-        约束：逐项给出问题、证据（引用原文）与影响；不得臆造原文没有的内容。
-
-        输出：中文Markdown，按上述维度列出问题清单，每条含问题位置、问题描述、影响与修改建议。'
-    position:
-      x: 85.98811742339473
-      y: 188.083178036237
-  - id: competitor-analysis
-    type: agent
-    data:
-      description: 对比竞品提炼差异化机会
-      agent_id: coding
-      title: 竞品差异化分析
-      prompt: '你是一名亚马逊美国站竞争情报与差异化策略专家。
-
-        目标：对比竞品文案，提炼差异化机会与需主动解释的限制。
-
-        输入：产品资料包：{{nodes.info-research.text}}（含竞品标题、五点、卖点、差评痛点与我方优劣势）。
-
-        要求：1) 提炼竞品共同强调的卖点；2) 找出竞品未充分覆盖的用户需求；3) 给出我方可重点放大的差异化优势；4) 列出我方需要主动解释的产品限制；5)
-        给出可用于降低退货率的关键信息。
-
-        约束：所有判断基于资料包，不得编造竞品数据；缺数据标注“待确认”。
-
-        输出：中文Markdown，按上述5点组织，每个差异化优势注明证据或来源。'
-    position:
-      x: 345.9881174233947
-      y: 201.5564422388751
-  - id: direction-approval
-    type: approval
-    data:
-      description: 人工确认产品定位、诊断结论与差异化方向后再生成文案
-      instructions: 请核对：1) 产品定位与目标用户是否准确；2) 现有文案诊断是否属实；3) 竞品差异化方向与需主动解释的限制是否认可；4)
-        缺失的“待确认”信息是否已补齐或已接受。确认后进入关键词分配与文案生成；需调整时先修正相关节点再继续。
-    position:
-      x: 305.0852168978101
-      y: 276.40791003130903
-  - id: keyword-allocation
-    type: agent
-    data:
-      description: 将关键词分配到标题、五点、描述、Search Terms
-      agent_id: coding
-      title: 关键词分配
-      prompt: '你是一名亚马逊SEO关键词策略专家。
-
-        目标：将调研获得的关键词分配到四个位置：标题核心关键词、五点关键词、产品描述关键词、Search Terms关键词。
-
-        输入：产品资料包：{{nodes.info-research.text}}；定位分析：{{nodes.positioning-analysis.text}}；竞品差异化：{{nodes.competitor-analysis.text}}。
-
-        要求：避免同一关键词无意义重复；不要为了埋词牺牲可读性；标题位置优先核心词、高转化词，Search Terms补充同义词、长尾词、场景词、拼写变体；排除禁用/侵权词。
-
-        输出：中文Markdown关键词分配表，列出每个位置的关键词及分配理由。'
-    position:
-      x: 312.03955015654526
-      y: 354.5505009505724
-  - id: copy-parallel
-    type: parallel
-    data:
-      description: 并行生成标题、五点、产品描述与Search Terms四份文案
-    position:
-      x: 328.0237651532106
-      y: 436.8871155222498
-  - id: title-optimization
-    type: agent
-    data:
-      description: 生成3个英文标题优化版本
-      agent_id: coding
-      title: 优化英文标题
-      prompt: '你是一名亚马逊美国站英文Listing文案专家，熟悉美国消费者阅读习惯与平台合规要求。
-
-        目标：输出3个英文标题版本。
-
-        输入：产品资料包：{{nodes.info-research.text}}（含产品事实与现有标题）；定位分析：{{nodes.positioning-analysis.text}}；关键词分配：{{nodes.keyword-allocation.text}}。
-
-        版本A：SEO与转化平衡版；版本B：突出核心差异化卖点版；版本C：简洁高可读性版。
-
-        要求：符合亚马逊美国站标题最新规范；核心关键词尽量靠前；优先表达产品类型、核心属性、数量、尺寸、主要功能和使用场景；不用促销词、夸张词、主观排名词或竞品品牌词；不添加产品不具备的功能；避免关键词重复；英文符合美式习惯；每个标题后标注字符数。
-
-        约束：事实以资料包为准，不确定标“待确认”；不得编造规格或认证。
-
-        输出：三个标题版本，每个附中英文说明与字符数。'
-    position:
-      x: 114.96248870502785
-      y: 520.7207594497759
-  - id: bullets-optimization
-    type: agent
-    data:
-      description: 生成5条英文Bullet Points
-      agent_id: coding
-      title: 优化五点描述
-      prompt: '你是一名亚马逊美国站英文Listing文案专家。
-
-        目标：输出5条英文Bullet Points。
-
-        输入：产品资料包：{{nodes.info-research.text}}；定位分析：{{nodes.positioning-analysis.text}}；竞品差异化：{{nodes.competitor-analysis.text}}；关键词分配：{{nodes.keyword-allocation.text}}。
-
-        顺序：第一点核心功能或最强差异化卖点；第二点材质、结构或性能优势；第三点解决的用户痛点；第四点使用场景、适用人群或兼容范围；第五点尺寸、包装内容、使用提醒或售后说明。
-
-        每条要求：先写简洁的大写或首字母大写卖点标题；后接自然英文利益说明；同时表达Feature、Benefit和具体使用场景；各条重点不同不重复；自然融入关键词；优先回答购买前最关心的问题；每条180–250个英文字符左右，后标字符数。
-
-        约束：不使用Best、No.1、100%、Guaranteed、Perfect等绝对化承诺；不虚构测试数据、认证、材质、功能、承重、尺寸或效果；不确定标“待确认”。
-
-        输出：5条英文Bullet，每条附中文要点与字符数。'
-    position:
-      x: 319.52469693578865
-      y: 538.982176135092
-  - id: description-optimization
-    type: agent
-    data:
-      description: 生成一版英文产品描述
-      agent_id: coding
-      title: 优化产品描述
-      prompt: '你是一名亚马逊美国站英文Listing文案专家。
-
-        目标：输出一版英文产品描述。
-
-        输入：产品资料包：{{nodes.info-research.text}}；定位分析：{{nodes.positioning-analysis.text}}；竞品差异化：{{nodes.competitor-analysis.text}}；关键词分配：{{nodes.keyword-allocation.text}}。
-
-        要求：先说明产品解决什么问题，再介绍主要功能和差异化优势，加入真实使用场景，明确适用范围和必要限制；语言自然避免重复五点；不使用HTML；控制在1200–1800个英文字符。
-
-        约束：事实以资料包为准，不确定标“待确认”；不得编造。
-
-        输出：英文产品描述全文，后标总字符数。'
-    position:
-      x: -76.17416092593285
-      y: 494.07129545963176
-  - id: search-terms
-    type: agent
-    data:
-      description: 生成亚马逊后台Search Terms
-      agent_id: coding
-      title: 优化Search Terms
-      prompt: '你是一名亚马逊美国站SEO专家。
-
-        目标：输出一版亚马逊后台Search Terms。
-
-        输入：产品资料包：{{nodes.info-research.text}}；关键词分配：{{nodes.keyword-allocation.text}}；标题与五点：{{nodes.title-optimization.text}}、{{nodes.bullets-optimization.text}}。
-
-        要求：小写英文；空格分隔；不加逗号和标点；不重复标题已高频覆盖的词；不用竞品品牌词、不相关流量词、夸张误导侵权违规词；优先补充同义词、长尾词、场景词、人群词和拼写变体；控制在亚马逊后台允许字节内；后标总字符数。
-
-        输出：Search Terms文本及总字符数。'
-    position:
-      x: 600.0
-      y: 530.0
-  - id: risk-check
-    type: agent
-    data:
-      description: 检查优化后文案的合规与退货风险
-      agent_id: coding
-      title: 合规与退货风险检查
-      prompt: '你是一名亚马逊Listing合规审核专家。
-
-        目标：检查最终文案中的风险。
-
-        输入：优化标题：{{nodes.title-optimization.text}}；优化五点：{{nodes.bullets-optimization.text}}；产品描述：{{nodes.description-optimization.text}}；Search
-        Terms：{{nodes.search-terms.text}}。
-
-        检查项：商标侵权；专利或竞品品牌；产品安全表达；医疗功效；儿童用品；认证和测试声明；绝对化和夸张宣传；尺寸、年龄、承重或兼容性表述；可能导致消费者误解或退货的描述。
-
-        约束：逐项给出风险等级、风险描述、涉及原文与修改建议；未发现风险也要明确说明。
-
-        输出：中文Markdown风险清单，按上述检查项组织。'
+        预期输出：{"analysis":[{"name":"...","price_range":"...","competitors":[{"name":"...","sales":"...","rating":4.5}],"differentiation":"...","risks":[...]}]}'
     position:
       x: 80.0
-      y: 680.0
-  - id: final-output
-    type: output
+      y: 230.0
+  - id: profit
+    type: code
     data:
-      description: 按十部分结构汇总输出完整优化方案
-      template: '# 亚马逊Listing分析与优化方案
+      description: 利润评估：测算毛利并输出最终推荐排序
+      agent_id: coding
+      prompt: '你是商品利润测算师。目标：估算每个候选商品的成本与利润，给出最终推荐排序。
 
+        输入：需求整理 {{nodes.requirements.text}}、市场研究 {{nodes.research.text}}、竞品分析 {{nodes.competition.text}}。
 
-        ## 一、产品定位
+        任务：为每个候选估算单价、单位成本（含采购/运费/平台佣金）、预计销量、毛利率与预估月利润；按月利润降序输出推荐列表。
 
-        {{nodes.positioning-analysis.text}}
+        约束：单价须落在需求预算与竞品价格带内；只输出 JSON，字段 overall_summary 与 recommendations（数组，每项含 name、price、unit_cost、profit_margin、est_monthly_profit、recommended、summary）。
 
-
-        ## 二、现有文案问题
-
-        {{nodes.copy-diagnosis.text}}
-
-
-        ## 三、竞品差异化机会
-
-        {{nodes.competitor-analysis.text}}
-
-
-        ## 四、关键词分配表
-
-        {{nodes.keyword-allocation.text}}
-
-
-        ## 五、优化标题
-
-        {{nodes.title-optimization.text}}
-
-
-        ## 六、优化五点
-
-        {{nodes.bullets-optimization.text}}
-
-
-        ## 七、产品描述
-
-        {{nodes.description-optimization.text}}
-
-
-        ## 八、Search Terms
-
-        {{nodes.search-terms.text}}
-
-
-        ## 九、合规与退货风险
-
-        {{nodes.risk-check.text}}
-
-
-        ## 十、优化逻辑说明
-
-        优化目标已由人工确认；所有产品事实以提供的资料为准，未确认信息一律标注“待确认”，未使用编造数据。后续如需调整定位、卖点或关键词，可修改对应节点后重新运行。'
+        预期输出：{"overall_summary":"...","recommendations":[{"name":"...","price":199,"unit_cost":120,"profit_margin":0.4,"est_monthly_profit":20000,"recommended":true,"summary":"..."}]}'
     position:
       x: 340.0
-      y: 680.0
+      y: 230.0
+  - id: result
+    type: output
+    data:
+      description: 汇总选品推荐结果作为机器人自动回复
+      template: '选品推荐结果：
+
+        {{nodes.profit.text}}'
+    position:
+      x: 600.0
+      y: 230.0
   edges:
-  - source: listing-input
-    target: info-research
-  - source: info-research
-    target: positioning-analysis
-  - source: info-research
-    target: copy-diagnosis
-  - source: info-research
-    target: competitor-analysis
-  - source: positioning-analysis
-    target: direction-approval
-  - source: copy-diagnosis
-    target: direction-approval
-  - source: competitor-analysis
-    target: direction-approval
-  - source: direction-approval
-    target: keyword-allocation
-  - source: keyword-allocation
-    target: copy-parallel
-  - source: copy-parallel
-    target: title-optimization
-  - source: copy-parallel
-    target: bullets-optimization
-  - source: copy-parallel
-    target: description-optimization
-  - source: copy-parallel
-    target: search-terms
-  - source: title-optimization
-    target: risk-check
-  - source: bullets-optimization
-    target: risk-check
-  - source: description-optimization
-    target: risk-check
-  - source: search-terms
-    target: risk-check
-  - source: risk-check
-    target: final-output
-  - source: title-optimization
-    target: final-output
-  - source: bullets-optimization
-    target: final-output
-  - source: description-optimization
-    target: final-output
-  - source: search-terms
-    target: final-output
+  - source: start
+    target: requirements
+  - source: requirements
+    target: research
+  - source: research
+    target: competition
+  - source: competition
+    target: profit
+  - source: profit
+    target: result
 integrations:
   feishu:
   - id: main

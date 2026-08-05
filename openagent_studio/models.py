@@ -51,12 +51,19 @@ class HarnessSpec(BaseModel):
     id: str
     name: str
     description: str = ""
-    cwd: str
+    runtime: Literal["task", "service"] = "task"
+    cwd: str = "."
     service: dict[str, Any] | None = None
     task: dict[str, Any] | None = None
     environment: dict[str, Any] = Field(default_factory=dict)
     env_file: str = ".env"
     config: list[dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def infer_legacy_runtime(self):
+        if "runtime" not in self.model_fields_set and self.service is not None and self.task is None:
+            self.runtime = "service"
+        return self
 
 class WorkflowNode(BaseModel):
     id: str

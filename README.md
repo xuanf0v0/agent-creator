@@ -44,20 +44,15 @@ uv run uvicorn openagent_studio.app:app --host 127.0.0.1 --port 8787
 ```
 
 默认不会监听公网地址。`project.yaml` 是规范源文件；`/api/compile/*` 端点可以预览
-生成结果。Studio 启动时会把 Harness 配置原子同步到项目内的专用目录
-`.openagent-agents`，不会覆盖 Harness 自带的 `agents` 目录。
+生成结果。Studio 默认连接独立运行的 Harness，不会自动写 manifest 或启动进程。
 
 仓库中的 `project.yaml` 已配置真实的 `deepseek/deepseek-v4-flash` OpenCode 代码智能体，以及一套
 可直接运行的选品决策工作流；不包含回声、固定响应或无模型 worker。选品流程中的需求整理、市场研究、
 竞品分析和利润评估节点都配置了独立的角色、目标、上下文、约束与输出格式提示词。
 
-仓库在 `vendor/agent-harness` 内置了一份 Harness 源码，Studio 默认直接用当前 Python 环境启动该副本，
-不读取或运行用户目录下的 `/Users/ypc/agent-harness`。运行状态写入项目内
-`.harness/agent-harness`（已忽略），manifest 写入 `.openagent-agents`。默认地址已有 Harness 时，
-Studio 会核对 `/ready` 中的状态库路径，只复用属于当前项目的实例；要连接外部实例必须显式设置
-`AGENT_HARNESS_URL`。工作流中的任务型 Agent 会通过
-Harness 的 `/api/tasks` 创建受治理任务、轮询终态并读取日志；服务型 Agent 会在需要时
-自动 setup/start，再通过 Harness 的 service proxy 调用。
+Studio 支持两种 Harness 契约：显式声明 `runtime: task` 的逻辑 Agent 通过稳定的 `/api/v1`
+任务接口执行；包含完整 `task` / `service` manifest 的兼容配置使用仓库内置
+`vendor/agent-harness` 的旧接口。两种模式都不会回退到 Mock。
 
 内置副本包含新版可扩展运行接口：任务可选择 `stdin_json`、`argv`、`http`、`mcp` 或
 `module:attribute` 协议插件；服务可选择本地进程、外部 endpoint 或部署插件；健康检查支持
@@ -71,8 +66,10 @@ HTTP、TCP、命令、进程和插件；沙箱也支持 `backend` 与 `backend_o
 - `AGENT_HARNESS_HOME`：Harness 状态目录，默认 `<项目>/.harness/agent-harness`；
 - `AGENT_HARNESS_MANIFESTS`：Studio 管理的 manifest 目录；
 - `AGENT_HARNESS_URL`：Harness API 地址，默认 `http://127.0.0.1:8765`；
-- `OPENAGENT_START_HARNESS=0`：不由 Studio 自动启动 Harness；
-- `OPENAGENT_SYNC_HARNESS=0`：不把项目中的 Harness 配置同步到 manifest 目录。
+- `AGENT_HARNESS_TASK_TOKEN`：v1 任务提交、读取和取消使用的 Bearer Token；
+- `AGENT_HARNESS_MANAGEMENT_TOKEN`：v1 能力发现与管理请求使用的 Bearer Token；
+- `OPENAGENT_START_HARNESS=1`：启用内置 Harness 兼容模式，默认关闭；
+- `OPENAGENT_SYNC_HARNESS=1`：把完整 manifest 同步到 `.openagent-agents`，默认关闭。
 
 Studio 保存完整项目配置时也会刷新这些文件；内置 Harness 会监听 manifest 并自动热重载。
 运行中的 Agent 或任务占用相关配置时，重载会明确报告 `runtime_busy`，完成后再保存即可。
@@ -101,8 +98,7 @@ Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整
 生成器会把可用 Harness Agent 清单交给模型，并要求每个节点同时生成执行参数：Agent
 必须包含 `agent_id` 和完整 `prompt`，提示词/循环/输出节点包含 `template`，条件节点包含
 `expression` 与分支条件。后端会拒绝不存在的 Agent，并为遗漏的可选参数补充可执行默认值。
-右侧标题会显示实际模型和凭证状态。当前项目从服务端文件
-`/Users/ypc/agent-manager/agents/listing-optimization/.env` 读取 `OPENAI_API_KEY`，密钥不会
+右侧标题会显示实际模型和凭证状态。当前项目从项目根目录 `.env` 读取 `OPENAI_API_KEY`，密钥不会
 进入浏览器或项目 YAML；读取失败时请求会明确报错，不会切换到其他模型或演示响应。
 
 ## 工作流执行

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import ipaddress
+import os
 import re
 import socket
 import threading
@@ -56,6 +57,7 @@ class WorkflowRun:
     depth: int = 0
     trigger_node_id: str | None = None
     active_task_ids: set[str] = field(default_factory=set)
+    active_task_api: dict[str, str] = field(default_factory=dict, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     event_signal: threading.Condition = field(default_factory=threading.Condition, repr=False)
     approval_signals: dict[str, threading.Event] = field(default_factory=dict, repr=False)
@@ -89,6 +91,7 @@ class EvaluationPolicy:
 class WorkflowManager:
     def __init__(self, base_url: str | None = None, poll_interval: float = 0.5, max_workers: int = 8) -> None:
         self.base_url = (base_url or "http://127.0.0.1:8765").rstrip("/")
+        self.task_token = os.environ.get("AGENT_HARNESS_TASK_TOKEN") or os.environ.get("AGENT_HARNESS_TOKEN", "")
         self.poll_interval = poll_interval
         self.max_workers = max_workers
         self.runs: dict[str, WorkflowRun] = {}
@@ -172,7 +175,8 @@ class WorkflowManager:
             signal.set()
         for task_id in list(run.active_task_ids):
             try:
-                self._request("POST", f"/api/tasks/{task_id}/cancel")
+                prefix = run.active_task_api.get(task_id, "/api/tasks")
+                self._request("POST", f"{prefix}/{task_id}/cancel")
             except RuntimeError:
                 pass
         self._emit(run, "run.cancelling", {"run_id": run.id})
@@ -522,45 +526,66 @@ class WorkflowManager:
         if harness is None:
             raise RuntimeError(f"智能体 {agent_id} 没有 Harness 配置")
         prompt = self._render(str(node.data.get("prompt") or node.data.get("description") or "{{input}}"), run, latest)
-        if harness.task is not None:
-            return self._run_harness_task(run, node, agent_id, prompt)
+        # Explicit v1 runtime (or a runtime-only catalog entry) uses the
+        # versioned external contract; legacy manifests keep the bundled API.
+        use_v1 = "runtime" in harness.model_fields_set or harness.task is None
+        if harness.runtime == "task" or harness.task is not None:
+            return self._run_harness_task(run, node, agent_id, prompt, api_v1=use_v1)
         if harness.service is not None:
             return self._call_harness_service(run, node, harness, prompt)
         raise RuntimeError(f"Harness {agent_id} 未配置 task 或 service runtime")
 
-    def _run_harness_task(self, run: WorkflowRun, node: WorkflowNode, agent_id: str, prompt: str, recovery_attempted: bool = False) -> dict[str, Any]:
+    def _run_harness_task(self, run: WorkflowRun, node: WorkflowNode, agent_id: str, prompt: str, recovery_attempted: bool = False, api_v1: bool = False) -> dict[str, Any]:
+        prefix = "/api/v1/tasks" if api_v1 else "/api/tasks"
+        body = {"agent_id": agent_id, "title": node.data.get("title") or node.data.get("description") or node.id, "prompt": prompt, "relative_path": node.data.get("relative_path") or run.relative_path}
+        if api_v1:
+            body = {"agent_id": agent_id, "input": {"title": body["title"], "prompt": prompt, "relative_path": body["relative_path"], "metadata": {"workflow_run_id": run.id, "workflow_node_id": node.id}}}
         task = self._request(
             "POST",
-            "/api/tasks",
-            {"agent_id": agent_id, "title": node.data.get("title") or node.data.get("description") or node.id, "prompt": prompt, "relative_path": node.data.get("relative_path") or run.relative_path},
+            prefix,
+            body,
             headers={"Idempotency-Key": f"openagent-{run.id}-{node.id}{'-recovery' if recovery_attempted else ''}"},
         )
         task_id = str(task["id"])
         run.active_task_ids.add(task_id)
+        run.active_task_api[task_id] = prefix
         self._emit(run, "node.harness_task", {"run_id": run.id, "node_id": node.id, "task": task})
         try:
             while task.get("status") not in TERMINAL_TASK_STATES:
                 self._check_cancelled(run)
                 time.sleep(self.poll_interval)
-                task = self._request("GET", f"/api/tasks/{task_id}")
+                task = self._request("GET", f"{prefix}/{task_id}")
                 self._emit(run, "node.progress", {"run_id": run.id, "node_id": node.id, "status": task.get("status"), "task_id": task_id})
         except RunCancelled:
             try:
-                self._request("POST", f"/api/tasks/{task_id}/cancel")
+                self._request("POST", f"{prefix}/{task_id}/cancel")
             except RuntimeError:
                 pass
             raise
         finally:
             run.active_task_ids.discard(task_id)
+            run.active_task_api.pop(task_id, None)
         if task.get("status") != "completed":
-            reason = task.get("blocked_reason") or f"Harness 任务状态为 {task.get('status')}"
+            error = task.get("error") if isinstance(task.get("error"), dict) else {}
+            reason = error.get("message") or task.get("blocked_reason") or f"Harness 任务状态为 {task.get('status')}"
+            if api_v1:
+                raise RuntimeError(str(reason))
             setup_required = bool(task.get("setup_required")) or task.get("error_code") == "setup_required" or "environment drift" in str(reason).lower()
             if not recovery_attempted and bool(node.data.get("auto_setup", True)) and setup_required:
                 self._emit(run, "node.environment_setup", {"run_id": run.id, "node_id": node.id, "agent_id": agent_id, "message": "Harness 检测到环境漂移，正在自动 setup 后重试"})
                 self._setup_harness_environment(run, node, agent_id)
-                return self._run_harness_task(run, node, agent_id, prompt, recovery_attempted=True)
+                return self._run_harness_task(run, node, agent_id, prompt, recovery_attempted=True, api_v1=api_v1)
             raise RuntimeError(str(reason))
-        logs = self._request("GET", f"/api/tasks/{task_id}/logs?lines=500")
+        if api_v1:
+            logs_response = self._request("GET", f"{prefix}/{task_id}/logs?cursor=0&limit=500")
+            logs = logs_response.get("items", []) if isinstance(logs_response, dict) else []
+            result = self._request("GET", f"{prefix}/{task_id}/result")
+            output = result.get("output") if isinstance(result, dict) else None
+            text = output.get("text", "") if isinstance(output, dict) and output.get("type") == "text" else ""
+            if not text:
+                text = "\n".join(str(item.get("line", "")) for item in logs)
+            return {"task": task, "result": result, "logs": logs, "text": text}
+        logs = self._request("GET", f"{prefix}/{task_id}/logs?lines=500")
         return {"task": task, "logs": logs, "text": "\n".join(str(item.get("line", "")) for item in logs)}
 
     def _setup_harness_environment(self, run: WorkflowRun, node: WorkflowNode, agent_id: str) -> None:
@@ -643,13 +668,18 @@ class WorkflowManager:
             run.event_signal.notify_all()
 
     def _request(self, method: str, path: str, body: Any = None, headers: dict[str, str] | None = None) -> Any:
+        request_headers = {"X-Harness-Supported-Versions": "1", **(headers or {})}
+        if self.task_token:
+            request_headers["Authorization"] = f"Bearer {self.task_token}"
         try:
-            response = httpx.request(method, self.base_url + path, json=body, headers=headers, timeout=30)
+            response = httpx.request(method, self.base_url + path, json=body, headers=request_headers, timeout=30)
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Harness 不可用：{exc}") from exc
         if response.status_code >= 400:
             try:
-                detail = response.json().get("detail", response.text)
+                payload = response.json()
+                error = payload.get("error") if isinstance(payload, dict) else None
+                detail = error if isinstance(error, dict) else payload.get("detail", response.text)
             except (ValueError, AttributeError):
                 detail = response.text
             code = str(detail.get("code", "")) if isinstance(detail, dict) else ""
