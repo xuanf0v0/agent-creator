@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Local graphical control plane for OpenCode and Agent Harness"
 requires-python = ">=3.11"
 dependencies = [
+  "agent-harness-sdk @ https://github.com/xuanf0v0/my-harness/archive/bea70fb812e98f530d262eeccb5a889b51dc821d.zip#subdirectory=sdk/python",
   "cryptography>=43,<47",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",

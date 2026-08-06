@@ -7,6 +7,10 @@ import re
 import time
 from typing import Any, Callable
 
+import httpx
+from agent_harness_sdk import HarnessAPIError
+
+from .harness_client import DEFAULT_BACKEND_ID, create_harness_client
 from .models import EvaluationAssertion, EvaluationCase, ProjectSpec, WorkflowSpec
 from .workflow_runner import EvaluationPolicy, WorkflowManager, validate_executable_workflow
 
@@ -37,6 +41,19 @@ class SemanticVerdict:
     passed: bool
     score: int
     issues: list[str] = field(default_factory=list)
+
+
+class HarnessInfrastructureError(RuntimeError):
+    """The acceptance runtime is unavailable, so candidate repair cannot help."""
+
+
+def _uses_harness_runtime(project: ProjectSpec, workflow: WorkflowSpec) -> bool:
+    harness_ids = {item.id for item in project.harness}
+    return any(
+        node.type in {"llm", "agent", "tool", "code", "validator"}
+        and str(node.data.get("agent_id", "")) in harness_ids
+        for node in workflow.nodes
+    )
 
 
 def lookup(value: Any, path: str) -> tuple[bool, Any]:
@@ -119,10 +136,49 @@ class WorkflowEvaluator:
         self.live_execution = live_execution
         self.harness_base_url = harness_base_url or os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765")
 
+    def ensure_runtime_ready(self, project: ProjectSpec, workflow: WorkflowSpec) -> None:
+        if not self.live_execution or not _uses_harness_runtime(project, workflow):
+            return
+        logical_ids = {
+            str(node.data.get("agent_id", ""))
+            for node in workflow.nodes
+            if node.type in {"llm", "agent", "tool", "code", "validator"}
+        }
+        backend_ids = {item.backend_id for item in project.harness if item.id in logical_ids}
+        self.ensure_harness_ready(backend_ids)
+
+    def ensure_harness_ready(self, backend_ids: set[str] | None = None) -> None:
+        if not self.live_execution:
+            return
+        for backend_id in sorted(backend_ids or {DEFAULT_BACKEND_ID}):
+            client = None
+            try:
+                client = create_harness_client(
+                    backend_id,
+                    base_url=self.harness_base_url if backend_id == DEFAULT_BACKEND_ID else None,
+                    timeout=2,
+                )
+                capabilities = client.capabilities()
+                if str(capabilities.get("api", {}).get("selected_version", "1")) != "1":
+                    raise HarnessInfrastructureError(
+                        f"Harness 后端 {backend_id} 未协商到 API v1；候选工作流未进入无效修复。"
+                    )
+            except (httpx.HTTPError, HarnessAPIError, RuntimeError) as exc:
+                if isinstance(exc, HarnessInfrastructureError):
+                    raise
+                raise HarnessInfrastructureError(
+                    f"Harness 验收运行时不可用（backend={backend_id}）：{exc}。"
+                    "请启动独立 my-harness 并检查 Studio 的 URL/任务 Token；候选工作流未进入无效修复。"
+                ) from exc
+            finally:
+                if client is not None:
+                    client.close()
+
     def evaluate(self, project: ProjectSpec, workflow: WorkflowSpec, index: int) -> CandidateResult:
         validation = validate_executable_workflow(project, workflow, runtime=True)
         if validation:
             return CandidateResult(index, workflow, False, [], complexity_metrics(workflow, 0, index), validation)
+        self.ensure_runtime_ready(project, workflow)
         case_results: list[CaseResult] = []
         started = time.monotonic()
         cases = [case for case in workflow.evaluation.cases if case.enabled]
@@ -147,6 +203,17 @@ class WorkflowEvaluator:
                 run.cancel_event.set()
                 result = CaseResult(case.id, False, errors=["验收执行超时"])
             elif run.status != "completed":
+                if run.error.startswith((
+                    "Harness 不可用：",
+                    "Harness 基础设施错误：",
+                    "Harness 任务 API 契约不兼容：",
+                    "Harness 请求失败（502）",
+                    "Harness 请求失败（503）",
+                    "Harness 请求失败（504）",
+                )):
+                    raise HarnessInfrastructureError(
+                        f"Harness 验收基础设施失败：{run.error}。候选工作流未进入无效修复。"
+                    )
                 result = CaseResult(case.id, False, errors=[run.error or run.status])
             else:
                 final_ids = [node.id for node in workflow.nodes if node.type == "output" and node.id in run.outputs]

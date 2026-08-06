@@ -1,20 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from pathlib import Path
-
 import openagent_studio.app as studio_app
-
-
-def test_harness_manager_uses_platform_virtualenv_entrypoint(monkeypatch, tmp_path: Path):
-    root = tmp_path / "agent-harness"
-    monkeypatch.setenv("AGENT_HARNESS_ROOT", str(root))
-    monkeypatch.delenv("AGENT_HARNESS_BIN", raising=False)
-
-    manager = studio_app.HarnessManager(tmp_path)
-
-    expected = root / (".venv/Scripts/agent-harness.exe" if studio_app.os.name == "nt" else ".venv/bin/agent-harness")
-    assert manager.command == expected
 
 
 def test_windows_listener_pids_only_returns_matching_listeners():

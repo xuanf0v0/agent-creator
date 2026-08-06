@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import ipaddress
-import os
 import re
 import socket
 import threading
@@ -16,7 +15,9 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+from agent_harness_sdk import HarnessAPIError, HarnessClient
 
+from .harness_client import DEFAULT_BACKEND_ID, create_harness_client
 from .models import HarnessSpec, ProjectSpec, WorkflowEdge, WorkflowNode, WorkflowSpec
 
 
@@ -28,16 +29,8 @@ class RunCancelled(Exception):
     pass
 
 
-class HarnessRequestError(RuntimeError):
-    def __init__(self, status_code: int, detail: Any, code: str = "") -> None:
-        self.status_code = status_code
-        self.detail = detail
-        self.code = code
-        if isinstance(detail, dict):
-            message = detail.get("message") or detail.get("error_message") or json.dumps(detail, ensure_ascii=False)
-        else:
-            message = str(detail)
-        super().__init__(f"Harness 请求失败（{status_code}）：{message}")
+class HarnessContractError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -57,7 +50,7 @@ class WorkflowRun:
     depth: int = 0
     trigger_node_id: str | None = None
     active_task_ids: set[str] = field(default_factory=set)
-    active_task_api: dict[str, str] = field(default_factory=dict, repr=False)
+    active_task_backends: dict[str, str] = field(default_factory=dict, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     event_signal: threading.Condition = field(default_factory=threading.Condition, repr=False)
     approval_signals: dict[str, threading.Event] = field(default_factory=dict, repr=False)
@@ -89,9 +82,20 @@ class EvaluationPolicy:
 
 
 class WorkflowManager:
-    def __init__(self, base_url: str | None = None, poll_interval: float = 0.5, max_workers: int = 8) -> None:
-        self.base_url = (base_url or "http://127.0.0.1:8765").rstrip("/")
-        self.task_token = os.environ.get("AGENT_HARNESS_TASK_TOKEN") or os.environ.get("AGENT_HARNESS_TOKEN", "")
+    def __init__(
+        self,
+        base_url: str | None = None,
+        poll_interval: float = 0.5,
+        max_workers: int = 8,
+        client_factory: Callable[[str], HarnessClient] | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/") if base_url else None
+        self.client_factory = client_factory or (
+            lambda backend_id: create_harness_client(
+                backend_id,
+                base_url=self.base_url if backend_id == DEFAULT_BACKEND_ID else None,
+            )
+        )
         self.poll_interval = poll_interval
         self.max_workers = max_workers
         self.runs: dict[str, WorkflowRun] = {}
@@ -175,9 +179,13 @@ class WorkflowManager:
             signal.set()
         for task_id in list(run.active_task_ids):
             try:
-                prefix = run.active_task_api.get(task_id, "/api/tasks")
-                self._request("POST", f"{prefix}/{task_id}/cancel")
-            except RuntimeError:
+                backend_id = run.active_task_backends.get(task_id, DEFAULT_BACKEND_ID)
+                client = self.client_factory(backend_id)
+                try:
+                    client.cancel(task_id)
+                finally:
+                    client.close()
+            except (HarnessAPIError, httpx.HTTPError, RuntimeError):
                 pass
         self._emit(run, "run.cancelling", {"run_id": run.id})
         return run
@@ -317,10 +325,6 @@ class WorkflowManager:
         if node.type in {"llm", "agent", "tool", "code", "validator"}:
             if run.policy and not run.policy.live_execution:
                 if node.type in {"tool", "code"}:
-                    return self._evaluation_mock(run, node)
-                agent_id = str(node.data.get("agent_id", ""))
-                harness = next((item for item in project.harness if item.id == agent_id), None)
-                if harness is not None and harness.service is not None:
                     return self._evaluation_mock(run, node)
                 if run.policy.model_inference is None:
                     raise RuntimeError("评估模式未配置模型推理器")
@@ -526,121 +530,80 @@ class WorkflowManager:
         if harness is None:
             raise RuntimeError(f"智能体 {agent_id} 没有 Harness 配置")
         prompt = self._render(str(node.data.get("prompt") or node.data.get("description") or "{{input}}"), run, latest)
-        # Explicit v1 runtime (or a runtime-only catalog entry) uses the
-        # versioned external contract; legacy manifests keep the bundled API.
-        use_v1 = "runtime" in harness.model_fields_set or harness.task is None
-        if harness.runtime == "task" or harness.task is not None:
-            return self._run_harness_task(run, node, agent_id, prompt, api_v1=use_v1)
-        if harness.service is not None:
-            return self._call_harness_service(run, node, harness, prompt)
-        raise RuntimeError(f"Harness {agent_id} 未配置 task 或 service runtime")
+        return self._run_harness_task(run, node, harness, prompt)
 
-    def _run_harness_task(self, run: WorkflowRun, node: WorkflowNode, agent_id: str, prompt: str, recovery_attempted: bool = False, api_v1: bool = False) -> dict[str, Any]:
-        prefix = "/api/v1/tasks" if api_v1 else "/api/tasks"
-        body = {"agent_id": agent_id, "title": node.data.get("title") or node.data.get("description") or node.id, "prompt": prompt, "relative_path": node.data.get("relative_path") or run.relative_path}
-        if api_v1:
-            body = {"agent_id": agent_id, "input": {"title": body["title"], "prompt": prompt, "relative_path": body["relative_path"], "metadata": {"workflow_run_id": run.id, "workflow_node_id": node.id}}}
-        task = self._request(
-            "POST",
-            prefix,
-            body,
-            headers={"Idempotency-Key": f"openagent-{run.id}-{node.id}{'-recovery' if recovery_attempted else ''}"},
-        )
-        task_id = str(task["id"])
+    def _run_harness_task(self, run: WorkflowRun, node: WorkflowNode, harness: HarnessSpec, prompt: str) -> dict[str, Any]:
+        client = self.client_factory(harness.backend_id)
+        try:
+            task = client.submit(
+                harness.agent_id or harness.id,
+                str(node.data.get("title") or node.data.get("description") or node.id),
+                prompt,
+                relative_path=str(node.data.get("relative_path") or run.relative_path),
+                metadata={"workflow_run_id": run.id, "workflow_node_id": node.id},
+                idempotency_key=f"openagent-{run.id}-{node.id}",
+            )
+        except HarnessAPIError as exc:
+            client.close()
+            if exc.status_code in {404, 405} and exc.code == "invalid_error_response":
+                raise HarnessContractError(
+                    f"Harness 任务 API 契约不兼容：SDK 调用 /api/v1/tasks 返回 {exc.status_code}。"
+                    "请确认运行的是固定版本 my-harness；候选工作流无法修复此问题"
+                ) from exc
+            raise RuntimeError(f"Harness 基础设施错误：{exc}") from exc
+        except httpx.HTTPError as exc:
+            client.close()
+            raise RuntimeError(f"Harness 不可用：{exc}") from exc
+        try:
+            task_id = str(task["id"])
+        except (KeyError, TypeError) as exc:
+            client.close()
+            raise HarnessContractError("Harness v1 submit 响应缺少 task id") from exc
         run.active_task_ids.add(task_id)
-        run.active_task_api[task_id] = prefix
+        run.active_task_backends[task_id] = harness.backend_id
         self._emit(run, "node.harness_task", {"run_id": run.id, "node_id": node.id, "task": task})
         try:
             while task.get("status") not in TERMINAL_TASK_STATES:
                 self._check_cancelled(run)
                 time.sleep(self.poll_interval)
-                task = self._request("GET", f"{prefix}/{task_id}")
+                task = client.task(task_id)
                 self._emit(run, "node.progress", {"run_id": run.id, "node_id": node.id, "status": task.get("status"), "task_id": task_id})
         except RunCancelled:
             try:
-                self._request("POST", f"{prefix}/{task_id}/cancel")
-            except RuntimeError:
+                client.cancel(task_id)
+            except (HarnessAPIError, httpx.HTTPError):
                 pass
+            client.close()
             raise
+        except HarnessAPIError as exc:
+            client.close()
+            raise RuntimeError(f"Harness 基础设施错误：{exc}") from exc
+        except httpx.HTTPError as exc:
+            client.close()
+            raise RuntimeError(f"Harness 不可用：{exc}") from exc
         finally:
             run.active_task_ids.discard(task_id)
-            run.active_task_api.pop(task_id, None)
+            run.active_task_backends.pop(task_id, None)
         if task.get("status") != "completed":
             error = task.get("error") if isinstance(task.get("error"), dict) else {}
             reason = error.get("message") or task.get("blocked_reason") or f"Harness 任务状态为 {task.get('status')}"
-            if api_v1:
-                raise RuntimeError(str(reason))
-            setup_required = bool(task.get("setup_required")) or task.get("error_code") == "setup_required" or "environment drift" in str(reason).lower()
-            if not recovery_attempted and bool(node.data.get("auto_setup", True)) and setup_required:
-                self._emit(run, "node.environment_setup", {"run_id": run.id, "node_id": node.id, "agent_id": agent_id, "message": "Harness 检测到环境漂移，正在自动 setup 后重试"})
-                self._setup_harness_environment(run, node, agent_id)
-                return self._run_harness_task(run, node, agent_id, prompt, recovery_attempted=True, api_v1=api_v1)
+            client.close()
             raise RuntimeError(str(reason))
-        if api_v1:
-            logs_response = self._request("GET", f"{prefix}/{task_id}/logs?cursor=0&limit=500")
+        try:
+            logs_response = client.logs(task_id, cursor=0, limit=500)
             logs = logs_response.get("items", []) if isinstance(logs_response, dict) else []
-            result = self._request("GET", f"{prefix}/{task_id}/result")
+            result = client.result(task_id)
             output = result.get("output") if isinstance(result, dict) else None
             text = output.get("text", "") if isinstance(output, dict) and output.get("type") == "text" else ""
             if not text:
                 text = "\n".join(str(item.get("line", "")) for item in logs)
             return {"task": task, "result": result, "logs": logs, "text": text}
-        logs = self._request("GET", f"{prefix}/{task_id}/logs?lines=500")
-        return {"task": task, "logs": logs, "text": "\n".join(str(item.get("line", "")) for item in logs)}
-
-    def _setup_harness_environment(self, run: WorkflowRun, node: WorkflowNode, agent_id: str) -> None:
-        try:
-            setup = self._request(
-                "POST",
-                f"/api/agents/{agent_id}/setup",
-                headers={"Idempotency-Key": f"openagent-setup-{run.id}-{node.id}-{agent_id}", "Prefer": "respond-async"},
-            )
-        except HarnessRequestError as exc:
-            if exc.code == "setup_command_missing" or "no setup_command" in str(exc):
-                raise RuntimeError(f"Harness Agent {agent_id} 未配置 environment.setup_command；请同步 manifest 并重启 Harness") from exc
-            raise
-
-        operation = setup.get("setup_operation") if isinstance(setup, dict) else None
-        if not isinstance(operation, dict):
-            operation = setup if isinstance(setup, dict) else {}
-        operation_id = str(operation.get("id", ""))
-        deadline = time.monotonic() + 1800
-        while time.monotonic() < deadline:
-            self._check_cancelled(run)
-            state = str(operation.get("status", "")).lower()
-            if state in {"completed", "ready"}:
-                return
-            if state in {"failed", "error", "blocked"}:
-                message = operation.get("error_message") or operation.get("message") or operation.get("error_code") or state
-                raise RuntimeError(f"Harness setup 失败：{message}")
-            time.sleep(min(max(self.poll_interval, 0.2), 2.0))
-            if operation_id:
-                operation = self._request("GET", f"/api/setup-operations/{operation_id}")
-                continue
-            environment = self._request("GET", f"/api/agents/{agent_id}/environment")
-            if not bool(environment.get("setup_required")) and str(environment.get("state", "")).lower() == "ready":
-                return
-            latest = environment.get("latest_setup")
-            if isinstance(latest, dict):
-                operation = latest
-                operation_id = str(latest.get("id", ""))
-        raise RuntimeError("Harness setup 超时（超过 30 分钟）")
-
-    def _call_harness_service(self, run: WorkflowRun, node: WorkflowNode, harness: HarnessSpec, prompt: str) -> Any:
-        if bool(node.data.get("auto_start", True)):
-            status = self._request("GET", f"/api/agents/{harness.id}")
-            if status.get("status") != "running":
-                if bool(node.data.get("auto_setup", True)) and bool(status.get("setup_required")):
-                    self._setup_harness_environment(run, node, harness.id)
-                self._request("POST", f"/api/agents/{harness.id}/start")
-        path = str(node.data.get("service_path") or "echo").lstrip("/")
-        method = str(node.data.get("method") or "POST").upper()
-        body = node.data.get("body")
-        if not isinstance(body, dict):
-            body = {"message": prompt}
-        else:
-            body = {key: self._render(str(value), run, prompt) if isinstance(value, str) else value for key, value in body.items()}
-        return self._request(method, f"/api/agents/{harness.id}/service/{path}", body)
+        except HarnessAPIError as exc:
+            raise RuntimeError(f"Harness 基础设施错误：{exc}") from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Harness 不可用：{exc}") from exc
+        finally:
+            client.close()
 
     def _wait_for_approval(self, run: WorkflowRun, node: WorkflowNode, latest: Any) -> Any:
         signal = threading.Event()
@@ -666,28 +629,6 @@ class WorkflowManager:
         with run.event_signal:
             run.events.append(item)
             run.event_signal.notify_all()
-
-    def _request(self, method: str, path: str, body: Any = None, headers: dict[str, str] | None = None) -> Any:
-        request_headers = {"X-Harness-Supported-Versions": "1", **(headers or {})}
-        if self.task_token:
-            request_headers["Authorization"] = f"Bearer {self.task_token}"
-        try:
-            response = httpx.request(method, self.base_url + path, json=body, headers=request_headers, timeout=30)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"Harness 不可用：{exc}") from exc
-        if response.status_code >= 400:
-            try:
-                payload = response.json()
-                error = payload.get("error") if isinstance(payload, dict) else None
-                detail = error if isinstance(error, dict) else payload.get("detail", response.text)
-            except (ValueError, AttributeError):
-                detail = response.text
-            code = str(detail.get("code", "")) if isinstance(detail, dict) else ""
-            raise HarnessRequestError(response.status_code, detail, code)
-        try:
-            return response.json()
-        except ValueError:
-            return {"body": response.text}
 
     @staticmethod
     def _check_cancelled(run: WorkflowRun) -> None:

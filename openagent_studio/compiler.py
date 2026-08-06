@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-import yaml
 from .models import ProjectSpec
 
 
@@ -28,11 +27,3 @@ def compile_opencode(spec: ProjectSpec) -> dict[str, Any]:
         value.pop("env_file", None)
         providers[provider.id] = value
     return {"$schema": "https://opencode.ai/config.json", "agent": agents, "provider": providers}
-
-
-def compile_harness(spec: ProjectSpec, agent_id: str) -> str:
-    item = next((x for x in spec.harness if x.id == agent_id), None)
-    if item is None:
-        raise KeyError(agent_id)
-    data = item.model_dump(exclude_none=True)
-    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)

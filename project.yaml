@@ -33,107 +33,16 @@ providers:
 harness:
 - id: coding
   name: OpenCode 模型任务
-  description: Agent Harness 治理下的真实 OpenCode CLI 任务
-  runtime: task
+  description: 独立 my-harness 治理下的真实 OpenCode CLI 任务
+  backend_id: default
+  agent_id: coding
 workflows:
 - id: product-selection
   name: 智能选品决策流程
-  nodes:
-  - id: start
-    type: manual_trigger
-    data:
-      description: 接收飞书/QQ 机器人转发的用户选品需求消息
-    position:
-      x: 80.0
-      y: 80.0
-  - id: requirements
-    type: llm
-    data:
-      description: 需求整理：解析用户选品需求为结构化字段
-      agent_id: coding
-      prompt: '你是资深电商选品顾问。目标：把用户的选品需求整理成结构化清单。
-
-        输入：用户原始消息见 {{input.content}}；若为空，以 {{input}} 其余字段推断。
-
-        约束：只输出一个 JSON 对象，字段固定为 category、target_market、budget、quantity、audience、constraints、summary；无法判断的字段填
-        null。
-
-        预期输出：{"category":"露营装备","target_market":"北美","budget":100000,"quantity":500,"audience":"中产户外人群","constraints":["轻量便携","颜色中性"],"summary":"一句话概括核心选品方向"}'
-    position:
-      x: 340.0
-      y: 80.0
-  - id: research
-    type: agent
-    data:
-      description: 市场研究：输出候选商品清单与市场评分
-      agent_id: coding
-      prompt: '你是市场研究员。目标：根据整理后的选品需求开展市场研究，输出候选商品清单。
-
-        输入：需求整理结果见 {{nodes.requirements.text}}。
-
-        任务：判断目标品类与市场的热度、趋势、主流价格带与竞争格局，给出 3-5 个候选商品（商品名、核心卖点、市场热度评分1-5、趋势方向、竞争强度1-5）。
-
-        约束：候选必须与需求约束一致，每个候选给出独立理由；只输出 JSON，字段 candidates（数组，每项含 name、selling_point、market_heat、trend、competition、reason）。
-
-        预期输出：{"candidates":[{"name":"...","selling_point":"...","market_heat":4,"trend":"上升","competition":3,"reason":"..."}]}'
-    position:
-      x: 600.0
-      y: 80.0
-  - id: competition
-    type: agent
-    data:
-      description: 竞品分析：评估候选商品进入难度与差异化空间
-      agent_id: coding
-      prompt: '你是竞品分析师。目标：对候选商品逐一做竞品分析，评估进入难度与差异化机会。
-
-        输入：需求整理结果 {{nodes.requirements.text}}，候选商品清单 {{nodes.research.text}}。
-
-        任务：对每个候选分析价格带分布、头部竞品及其销量/评分、可差异化切入点、主要风险。
-
-        约束：只输出 JSON，字段 analysis（数组，每项含 name、price_range、competitors（数组，含名称、销量区间、评分）、differentiation、risks）；与候选一一对应。
-
-        预期输出：{"analysis":[{"name":"...","price_range":"...","competitors":[{"name":"...","sales":"...","rating":4.5}],"differentiation":"...","risks":[...]}]}'
-    position:
-      x: 80.0
-      y: 230.0
-  - id: profit
-    type: code
-    data:
-      description: 利润评估：测算毛利并输出最终推荐排序
-      agent_id: coding
-      prompt: '你是商品利润测算师。目标：估算每个候选商品的成本与利润，给出最终推荐排序。
-
-        输入：需求整理 {{nodes.requirements.text}}、市场研究 {{nodes.research.text}}、竞品分析 {{nodes.competition.text}}。
-
-        任务：为每个候选估算单价、单位成本（含采购/运费/平台佣金）、预计销量、毛利率与预估月利润；按月利润降序输出推荐列表。
-
-        约束：单价须落在需求预算与竞品价格带内；只输出 JSON，字段 overall_summary 与 recommendations（数组，每项含 name、price、unit_cost、profit_margin、est_monthly_profit、recommended、summary）。
-
-        预期输出：{"overall_summary":"...","recommendations":[{"name":"...","price":199,"unit_cost":120,"profit_margin":0.4,"est_monthly_profit":20000,"recommended":true,"summary":"..."}]}'
-    position:
-      x: 340.0
-      y: 230.0
-  - id: result
-    type: output
-    data:
-      description: 汇总选品推荐结果作为机器人自动回复
-      template: '选品推荐结果：
-
-        {{nodes.profit.text}}'
-    position:
-      x: 600.0
-      y: 230.0
-  edges:
-  - source: start
-    target: requirements
-  - source: requirements
-    target: research
-  - source: research
-    target: competition
-  - source: competition
-    target: profit
-  - source: profit
-    target: result
+  nodes: []
+  edges: []
+  evaluation:
+    cases: []
 integrations:
   feishu:
   - id: main

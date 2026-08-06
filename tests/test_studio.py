@@ -1,22 +1,50 @@
 from pathlib import Path
 from fastapi.testclient import TestClient
-from openagent_studio.app import HarnessManager, create_app
-from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _command_exceeds_limit, _is_command_line_too_long, _with_file_prompt
+from openagent_studio.app import create_app
+from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _with_file_prompt
 from openagent_studio.store import SpecStore
 from openagent_studio.models import EvaluationAssertion, ProjectSpec, QQIntegrationSpec, WorkflowEvaluation
 from openagent_studio.workflow_runner import EvaluationPolicy, WorkflowManager
-from openagent_studio.evaluation import SemanticVerdict, WorkflowEvaluator, check_assertion, complexity_metrics
+from openagent_studio.evaluation import CandidateResult, HarnessInfrastructureError, SemanticVerdict, WorkflowEvaluator, check_assertion, complexity_metrics
 from openagent_studio.workflow_runner import _cron_matches, _cron_valid
-from openagent_studio.harness_opencode import build_prompt
 from openagent_studio.platform_integrations import PlatformIntegrationManager
 import time
 from datetime import datetime
 import json
 import hashlib
+import httpx
+from agent_harness_sdk import HarnessAPIError
+
+
+class FakeHarnessClient:
+    def __init__(self, handler):
+        self.handler = handler
+        self.closed = False
+
+    def submit(self, agent_id, title, prompt, **kwargs):
+        return self.handler("submit", agent_id=agent_id, title=title, prompt=prompt, **kwargs)
+
+    def task(self, task_id):
+        return self.handler("task", task_id=task_id)
+
+    def logs(self, task_id, cursor=0, limit=500):
+        return self.handler("logs", task_id=task_id, cursor=cursor, limit=limit)
+
+    def result(self, task_id):
+        return self.handler("result", task_id=task_id)
+
+    def cancel(self, task_id):
+        return self.handler("cancel", task_id=task_id)
+
+    def capabilities(self):
+        return self.handler("capabilities")
+
+    def close(self):
+        self.closed = True
 
 
 def test_spec_round_trip_and_conflict(tmp_path: Path):
-    client = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False))
+    client = TestClient(create_app(tmp_path / "project.yaml"))
     response = client.get("/api/spec")
     assert response.status_code == 200
     etag = response.json()["etag"]
@@ -28,54 +56,26 @@ def test_spec_round_trip_and_conflict(tmp_path: Path):
 
 
 def test_compile_artifacts(tmp_path: Path):
-    client = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False))
-    payload = {"version":"1", "name":"Demo", "agents":[{"id":"builder","name":"Builder","model":"deepseek/deepseek-v4-flash","max_steps":12}], "providers":[], "harness":[{"id":"builder","name":"Builder","cwd":"."}]}
+    client = TestClient(create_app(tmp_path / "project.yaml"))
+    payload = {"version":"1", "name":"Demo", "agents":[{"id":"builder","name":"Builder","model":"deepseek/deepseek-v4-flash","max_steps":12}], "providers":[], "harness":[{"id":"builder","name":"Builder","backend_id":"default","agent_id":"builder"}]}
     assert client.put("/api/spec", json=payload).status_code == 200
     output = client.get("/api/compile/opencode").json()
     assert output["agent"]["builder"]["maxSteps"] == 12
-    assert client.get("/api/compile/harness/builder").status_code == 200
+    assert client.get("/api/compile/harness/builder").status_code == 404
 
 
-def test_compile_harness_preserves_setup_command(tmp_path: Path):
-    client = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False))
-    payload = {"version": "1", "name": "Setup", "harness": [{"id": "builder", "name": "Builder", "cwd": ".", "environment": {"setup_command": ["uv", "sync", "--frozen"], "auto_setup_on_drift": True}}]}
-    assert client.put("/api/spec", json=payload).status_code == 200
-    manifest = client.get("/api/compile/harness/builder").text
-    assert "setup_command:" in manifest
-    assert "- --frozen" in manifest
-    assert "auto_setup_on_drift: true" in manifest
-
-
-def test_harness_manager_uses_project_vendored_runtime(monkeypatch, tmp_path: Path):
-    for key in ("AGENT_HARNESS_ROOT", "AGENT_HARNESS_BIN", "AGENT_HARNESS_HOME", "AGENT_HARNESS_MANIFESTS"):
-        monkeypatch.delenv(key, raising=False)
-    manager = HarnessManager(tmp_path)
-    assert manager.root == tmp_path / "vendor/agent-harness"
-    assert manager.source == tmp_path / "vendor/agent-harness/src"
-    assert manager.command[1:] == ["-m", "agent_harness"]
-    assert manager.home == tmp_path / ".harness/agent-harness"
-    assert manager.manifests == tmp_path / ".openagent-agents"
-    assert manager.base_url == "http://127.0.0.1:8765"
-    assert manager.external_url_configured is False
-
-
-def test_harness_manager_rejects_unowned_default_runtime(monkeypatch, tmp_path: Path):
-    class Response:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return {"database": {"path": "/tmp/some-other-project/state.db"}}
-
-    monkeypatch.delenv("AGENT_HARNESS_URL", raising=False)
-    monkeypatch.setattr("openagent_studio.app.httpx.get", lambda *args, **kwargs: Response())
-    assert HarnessManager(tmp_path).reachable() is False
-    monkeypatch.setenv("AGENT_HARNESS_URL", "http://127.0.0.1:9999")
-    assert HarnessManager(tmp_path).reachable() is True
+def test_harness_spec_rejects_runtime_ownership_fields():
+    payload = {"version": "1", "name": "Detached", "harness": [{"id": "builder", "name": "Builder", "cwd": "."}]}
+    try:
+        ProjectSpec.model_validate(payload)
+    except ValueError as exc:
+        assert "cwd" in str(exc)
+    else:
+        raise AssertionError("Studio must not accept Harness runtime manifests")
 
 
 def test_ui_is_chinese(tmp_path: Path):
-    body = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False)).get("/").text
+    body = TestClient(create_app(tmp_path / "project.yaml")).get("/").text
     assert "智能体工作流画布" in body
     assert 'lang="zh-CN"' in body
     assert 'id="root"' in body
@@ -83,14 +83,14 @@ def test_ui_is_chinese(tmp_path: Path):
 
 
 def test_form_options_and_validation(tmp_path: Path):
-    client = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False))
+    client = TestClient(create_app(tmp_path / "project.yaml"))
     options = client.get("/api/form-options").json()
     assert any(item["label"] == "主智能体" for item in options["agent_modes"])
     assert client.post("/api/spec/validate", json={"version": "1", "name": "示例"}).json()["valid"] is True
 
 
 def test_workflow_canvas_api(tmp_path: Path):
-    client = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False))
+    client = TestClient(create_app(tmp_path / "project.yaml"))
     payload = {"version": "1", "name": "示例", "workflows": [{"id": "flow", "name": "测试流程", "nodes": [{"id": "a", "type": "agent", "data": {}, "position": {"x": 1, "y": 2}}], "edges": []}]}
     assert client.put("/api/spec", json=payload).status_code == 200
     assert client.get("/api/workflows").json()[0]["id"] == "flow"
@@ -134,6 +134,264 @@ def test_generator_prompt_treats_canvas_as_complete_snapshot():
     assert "以本轮提供的完整快照为准" in SYSTEM_PROMPT
 
 
+def test_generator_normalizes_generic_task_nodes_and_edges():
+    raw = {
+        "id": "flow", "name": "选品流程",
+        "nodes": [
+            {"id": "research", "type": "task", "name": "市场调研", "instructions": "调研市场需求"},
+            {"id": "result", "type": "output", "data": {"template": "{{latest}}"}},
+        ],
+        "edges": [{"from": "research", "to": "result"}],
+    }
+    normalized = _normalize_workflow_result(raw, {"coding"})
+    workflow = ProjectSpec.model_validate({"version": "1", "name": "x", "workflows": [normalized]}).workflows[0]
+    assert workflow.nodes[0].type == "agent"
+    assert workflow.nodes[0].data["agent_id"] == "coding"
+    assert workflow.nodes[0].data["prompt"] == "调研市场需求"
+    assert workflow.edges[0].source == "research"
+    assert workflow.edges[0].target == "result"
+
+
+def test_generator_normalizes_common_model_node_type_aliases():
+    raw = {
+        "id": "flow", "name": "选品流程",
+        "nodes": [
+            {"id": "ask", "type": "human", "name": "收集输入"},
+            {"id": "research", "type": "coding", "name": "调研", "prompt": "完成调研"},
+            {"id": "done", "type": "end", "name": "结束"},
+        ],
+        "edges": [{"source": "ask", "target": "research"}, {"source": "research", "target": "done"}],
+    }
+    normalized = _normalize_workflow_result(raw, {"coding"})
+    workflow = ProjectSpec.model_validate({"version": "1", "name": "x", "workflows": [normalized]}).workflows[0]
+    assert [node.type for node in workflow.nodes] == ["manual_trigger", "agent", "output"]
+    assert workflow.nodes[1].data["agent_id"] == "coding"
+
+
+def test_generator_normalizes_workflow_name_and_config_alias():
+    raw = {
+        "id": "flow",
+        "nodes": [{"id": "worker", "type": "agent", "config": {"agent_id": "coding"}}],
+        "edges": [],
+    }
+    normalized = _normalize_workflow_result(raw, {"coding"})
+    workflow = ProjectSpec.model_validate({"version": "1", "name": "x", "workflows": [normalized]}).workflows[0]
+    assert workflow.name == "flow"
+    assert workflow.nodes[0].data["agent_id"] == "coding"
+
+
+def test_parse_result_extracts_largest_json_from_prose_and_fence():
+    text = '示例：{"id":"short"}\n```json\n{"id":"flow","nodes":[],"edges":[]}\n```\n以上是结果。'
+    assert _parse_result(text) == {"id": "flow", "nodes": [], "edges": []}
+
+
+def test_generator_retries_invalid_structured_result_once(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    responses = iter(("这不是 JSON", '<result>{"ok":true}</result>'))
+    prompts = []
+
+    def fake_invoke(*args):
+        prompts.append(args[-1])
+        return next(responses)
+
+    manager._invoke = fake_invoke
+    generation = Generation(id="retry", workflow_id="flow", base_etag="etag", draft={}, prompt="x")
+    assert manager._invoke_result(generation, None, [], tmp_path, "生成结果", "候选工作流") == {"ok": True}
+    assert len(prompts) == 2
+    assert "上一次没有返回可解析" in prompts[1]
+
+
+def test_generator_normalizes_evaluation_collection_fields():
+    normalized = _normalize_evaluation_result({"cases": [{
+        "id": "normal", "name": "正常流程", "input": {},
+        "assertions": {"path": "output", "operator": "exists"},
+        "semantic_criteria": [
+            {"description": "输出必须完整"},
+            {"criterion": "关键数据注明来源"},
+            "不得生成最终 Listing",
+        ],
+        "approvals": [], "mocks": {"research": {"ok": True}},
+    }]})
+    evaluation = WorkflowEvaluation.model_validate(normalized)
+    assert evaluation.cases[0].semantic_criteria == ["输出必须完整", "关键数据注明来源", "不得生成最终 Listing"]
+    assert evaluation.cases[0].approvals == {}
+    assert evaluation.cases[0].assertions[0].path == "output"
+    assert evaluation.cases[0].mocks[0].node_id == "research"
+
+
+def test_generator_normalizes_evaluation_case_ids_to_slugs():
+    normalized = _normalize_evaluation_result({"cases": [
+        {"id": "pc_normal_full_flow", "name": "正常流程"},
+        {"id": "PC boundary title length", "name": "边界"},
+        {"id": "!!!", "name": "风险"},
+        {"id": "pc-normal-full-flow", "name": "重复"},
+    ]})
+    assert [case["id"] for case in normalized["cases"]] == [
+        "pc-normal-full-flow", "pc-boundary-title-length", "case-3", "pc-normal-full-flow-2",
+    ]
+
+
+def test_generator_normalizes_single_semantic_criterion_string():
+    normalized = _normalize_evaluation_result({"cases": [{
+        "id": "normal", "name": "正常流程", "input": {},
+        "assertions": [{"path": "output", "operator": "exists"}],
+        "semantic_criteria": "输出必须完整",
+    }]})
+    evaluation = WorkflowEvaluation.model_validate(normalized)
+    assert evaluation.cases[0].semantic_criteria == ["输出必须完整"]
+
+
+def test_generator_normalizes_evaluation_mock_target_and_timeout_bounds():
+    normalized = _normalize_evaluation_result({"cases": [{
+        "id": "failure-risk", "name": "失败风险", "input": {},
+        "assertions": [{"path": "output", "operator": "exists"}],
+        "semantic_criteria": ["输出必须完整"],
+        "mocks": [
+            {"target": "product-info", "response": {"material_ratio": "UNKNOWN"}},
+            {"target": "competitor-list", "response": {"claim": "patented structure"}},
+            {"target": "market-sizing", "response": {"note": "估算并说明依据"}},
+        ],
+        "timeout_seconds": 3600,
+    }]})
+    evaluation = WorkflowEvaluation.model_validate(normalized)
+    case = evaluation.cases[0]
+    assert case.timeout_seconds == 1800
+    assert [mock.node_id for mock in case.mocks] == ["product-info", "competitor-list", "market-sizing"]
+
+
+def test_generator_normalizes_string_evaluation_timeout_bounds():
+    normalized = _normalize_evaluation_result({"cases": [{
+        "id": "normal", "name": "正常流程", "input": {},
+        "assertions": [{"path": "output", "operator": "exists"}],
+        "semantic_criteria": ["输出必须完整"],
+        "timeout_seconds": "3600",
+    }]})
+    assert WorkflowEvaluation.model_validate(normalized).cases[0].timeout_seconds == 1800
+
+
+def test_generator_retries_evaluation_with_missing_assertions_and_criteria(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="evaluation-repair", workflow_id="flow", base_etag="etag", draft={}, prompt="优化")
+    invalid = {"cases": [
+        {"id": "normal", "name": "正常", "assertions": [], "semantic_criteria": ["输出有效"]},
+        {"id": "boundary", "name": "边界", "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": []},
+        {"id": "failure", "name": "失败", "assertions": [], "semantic_criteria": []},
+    ]}
+    valid = {"cases": [
+        {"id": case_id, "name": case_id, "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": ["输出有效"]}
+        for case_id in ("normal", "boundary", "failure")
+    ]}
+    responses = iter((invalid, valid))
+    prompts = []
+
+    def fake_invoke_result(*args):
+        prompts.append(args[-2])
+        return next(responses)
+
+    manager._invoke_result = fake_invoke_result
+    evaluation = manager._generate_evaluation(
+        generation, ProjectSpec(name="测试"), ["opencode", "run"], tmp_path,
+        "生成验收用例", WorkflowEvaluation(),
+    )
+    assert len(evaluation.cases) == 3
+    assert all(case.assertions and case.semantic_criteria for case in evaluation.cases)
+    assert len(prompts) == 2
+    assert "normal 缺少 assertions 确定性断言" in prompts[1]
+    assert "boundary 缺少 semantic_criteria 语义质量标准" in prompts[1]
+
+
+def test_generator_reports_case_ids_when_evaluation_requirements_are_missing():
+    evaluation = WorkflowEvaluation.model_validate({"cases": [
+        {"id": "missing-check", "name": "缺断言", "semantic_criteria": ["输出有效"]},
+        {"id": "missing-quality", "name": "缺标准", "assertions": [{"path": "output", "operator": "exists"}]},
+        {"id": "complete", "name": "完整", "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": ["输出有效"]},
+    ]})
+    try:
+        GeneratorManager._validate_case_update(WorkflowEvaluation(), evaluation)
+    except RuntimeError as exc:
+        assert "missing-check 缺少 assertions 确定性断言" in str(exc)
+        assert "missing-quality 缺少 semantic_criteria 语义质量标准" in str(exc)
+    else:
+        raise AssertionError("缺少验收要求的用例不应通过")
+
+
+def test_generator_call_timeout_is_bounded(monkeypatch):
+    monkeypatch.setenv("OPENCODE_GENERATOR_CALL_TIMEOUT", "5")
+    assert _invoke_timeout_seconds() == 30
+    monkeypatch.setenv("OPENCODE_GENERATOR_CALL_TIMEOUT", "9999")
+    assert _invoke_timeout_seconds() == 1800
+
+
+def test_generator_compaction_limits_are_bounded(monkeypatch):
+    monkeypatch.setenv("OPENCODE_COMPACTION_TIMEOUT", "5")
+    monkeypatch.setenv("OPENCODE_COMPACT_PROMPT_LENGTH", "10")
+    assert _compaction_timeout_seconds() == 30
+    assert _compact_prompt_length() == 4000
+
+
+def test_generator_prepares_long_prompt_with_real_compaction_path(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENCODE_COMPACT_PROMPT_LENGTH", "4000")
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="compact", workflow_id="flow", base_etag="etag", draft={}, prompt="x", model="provider/model")
+    calls = []
+
+    def fake_compact(*args):
+        calls.append(args[3])
+        return "保留重点后的提示词"
+
+    manager._compact_prompt = fake_compact
+    prompt = "原始上下文" * 1000
+    prepared = manager._prepare_prompt(generation, ProjectSpec(name="测试"), ["opencode", "run"], tmp_path, prompt)
+    assert prepared == "保留重点后的提示词"
+    assert calls == [prompt]
+    assert [item["event"] for item in generation.events] == ["generation.context_compacting", "generation.context_compacted"]
+    assert generation.events[-1]["data"] == {"before_chars": len(prompt), "after_chars": len(prepared), "used": True}
+
+
+def test_generator_surfaces_compaction_failure_without_fallback(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENCODE_COMPACT_PROMPT_LENGTH", "4000")
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="compact-failure", workflow_id="flow", base_etag="etag", draft={}, prompt="x", model="provider/model")
+    manager._compact_prompt = lambda *_args: (_ for _ in ()).throw(RuntimeError("提炼服务失败"))
+
+    try:
+        manager._prepare_prompt(generation, ProjectSpec(name="测试"), ["opencode", "run"], tmp_path, "长上下文" * 1000)
+    except RuntimeError as exc:
+        assert str(exc) == "提炼服务失败"
+    else:
+        raise AssertionError("上下文提炼错误不应被兜底吞掉")
+    assert [item["event"] for item in generation.events] == ["generation.context_compacting"]
+
+
+def test_generator_keeps_full_prompt_after_compaction_timeout(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENCODE_COMPACT_PROMPT_LENGTH", "4000")
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="compact-timeout", workflow_id="flow", base_etag="etag", draft={}, prompt="x", model="provider/model")
+    calls = []
+
+    def time_out(*args):
+        calls.append(args[3])
+        raise _CompactionTimeoutError("OpenCode 上下文提炼超时（30 秒）")
+
+    manager._compact_prompt = time_out
+    prompt = "必须原样保留的完整上下文" * 1000
+    assert manager._prepare_prompt(generation, ProjectSpec(name="测试"), ["opencode", "run"], tmp_path, prompt) == prompt
+    assert generation.compaction_disabled is True
+    assert calls == [prompt]
+    assert [item["event"] for item in generation.events] == [
+        "generation.context_compacting", "generation.context_compaction_failed",
+    ]
+    assert generation.events[-1]["data"] == {
+        "before_chars": len(prompt),
+        "message": "OpenCode 上下文提炼超时（30 秒）",
+        "fallback": "original",
+    }
+
+    second_prompt = prompt + "第二个候选"
+    assert manager._prepare_prompt(generation, ProjectSpec(name="测试"), ["opencode", "run"], tmp_path, second_prompt) == second_prompt
+    assert calls == [prompt]
+
+
 def _wait_for(predicate, timeout=2):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -144,7 +402,7 @@ def _wait_for(predicate, timeout=2):
 
 
 def test_workflow_run_api_executes_non_agent_nodes(tmp_path: Path):
-    app = create_app(tmp_path / "project.yaml", auto_start_harness=False)
+    app = create_app(tmp_path / "project.yaml")
     client = TestClient(app)
     payload = {
         "version": "1", "name": "示例",
@@ -165,79 +423,145 @@ def test_workflow_run_api_executes_non_agent_nodes(tmp_path: Path):
 def test_workflow_runner_calls_harness_task_and_waits_for_approval():
     project = ProjectSpec.model_validate({
         "version": "1", "name": "示例",
-        "harness": [{"id": "coding", "name": "Coding", "runtime": "task", "cwd": ".", "task": {"command": ["worker"], "verification": [{"name": "test", "command": ["test"]}]}}],
+        "harness": [{"id": "coding", "name": "Coding", "backend_id": "default", "agent_id": "coding"}],
         "workflows": [{"id": "flow", "name": "测试流程", "nodes": [
             {"id": "agent", "type": "agent", "data": {"agent_id": "coding", "prompt": "{{input}}"}},
             {"id": "approval", "type": "approval", "data": {"description": "确认结果"}},
             {"id": "output", "type": "output", "data": {}},
         ], "edges": [{"source": "agent", "target": "approval"}, {"source": "approval", "target": "output"}]}],
     })
-    manager = WorkflowManager(poll_interval=0.001)
     calls = []
 
-    def scripted_request(method, path, body=None, headers=None):
-        calls.append((method, path, body, headers))
-        if path == "/api/v1/tasks":
+    def handler(operation, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "submit":
             return {"id": "task-1", "status": "queued"}
-        if path == "/api/v1/tasks/task-1":
+        if operation == "task":
             return {"id": "task-1", "status": "completed"}
-        if path.startswith("/api/v1/tasks/task-1/logs"):
+        if operation == "logs":
             return {"items": [{"line": "done"}], "next_cursor": 1}
-        if path == "/api/v1/tasks/task-1/result":
+        if operation == "result":
             return {"task_id": "task-1", "status": "completed", "output": {"type": "text", "text": "done"}, "logs": {}, "verification": {}, "artifacts": [], "error": None}
-        raise AssertionError(path)
+        raise AssertionError(operation)
 
-    manager._request = scripted_request
+    manager = WorkflowManager(poll_interval=0.001, client_factory=lambda _backend_id: FakeHarnessClient(handler))
     run = manager.start(project, "flow", {"input": "完成任务"})
     _wait_for(lambda: run.node_states["approval"]["status"] == "waiting")
     manager.approve(run.id, "approval", True, "可以发布")
     _wait_for(lambda: run.status == "completed")
-    assert calls[0][1] == "/api/v1/tasks"
-    assert calls[0][2]["input"]["prompt"] == "完成任务"
-    assert calls[0][2]["input"]["metadata"]["workflow_node_id"] == "agent"
-    assert calls[0][3]["Idempotency-Key"].startswith("openagent-")
+    assert calls[0][0] == "submit"
+    assert calls[0][1]["prompt"] == "完成任务"
+    assert calls[0][1]["metadata"]["workflow_node_id"] == "agent"
+    assert calls[0][1]["idempotency_key"].startswith("openagent-")
     assert run.outputs["output"]["approved"] is True
 
 
-def test_harness_environment_drift_runs_setup_and_retries_once():
+def test_workflow_runner_uses_backend_and_catalog_agent_after_spec_round_trip(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
     project = ProjectSpec.model_validate({
-        "version": "1", "name": "环境恢复",
-        "harness": [{"id": "coding", "name": "Coding", "cwd": ".", "task": {"command": ["worker"]}}],
+        "version": "1", "name": "独立 Harness",
+        "harness": [{"id": "coding", "name": "Coding", "backend_id": "remote", "agent_id": "catalog-coding"}],
+        "workflows": [{"id": "flow", "name": "测试流程", "nodes": [
+            {"id": "agent", "type": "agent", "data": {"agent_id": "coding", "prompt": "{{input}}"}},
+            {"id": "output", "type": "output", "data": {}},
+        ], "edges": [{"source": "agent", "target": "output"}]}],
+    })
+    store.save(project)
+    reloaded = store.load()
+    calls = []
+    backends = []
+
+    def handler(operation, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "submit":
+            return {"id": "task-1", "status": "queued"}
+        if operation == "task":
+            return {"id": "task-1", "status": "completed"}
+        if operation == "logs":
+            return {"items": [{"line": "done"}], "next_cursor": 1}
+        if operation == "result":
+            return {"output": {"type": "text", "text": "done"}}
+        raise AssertionError(operation)
+
+    def client_factory(backend_id):
+        backends.append(backend_id)
+        return FakeHarnessClient(handler)
+
+    manager = WorkflowManager(poll_interval=0.001, client_factory=client_factory)
+    run = manager.start(reloaded, "flow", {"input": "完成任务"})
+    _wait_for(lambda: run.status == "completed")
+    assert backends == ["remote"]
+    assert calls[0][1]["agent_id"] == "catalog-coding"
+    assert calls[0][1]["prompt"] == "完成任务"
+    assert run.outputs["output"]["text"] == "done"
+
+
+def test_evaluator_stops_repairs_for_missing_harness_task_contract(monkeypatch):
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "外部 Harness",
+        "harness": [{"id": "coding", "name": "Coding", "backend_id": "default", "agent_id": "coding"}],
+        "workflows": [{
+            "id": "flow", "name": "测试流程",
+            "nodes": [
+                {"id": "agent", "type": "agent", "data": {"agent_id": "coding", "prompt": "{{input}}"}},
+                {"id": "output", "type": "output", "data": {}},
+            ],
+            "edges": [{"source": "agent", "target": "output"}],
+            "evaluation": {"cases": [{
+                "id": "normal", "name": "正常", "input": "x",
+                "assertions": [{"path": "output", "operator": "exists"}],
+                "semantic_criteria": ["输出有效"],
+            }]},
+        }],
+    })
+
+    def missing_v1_contract(operation, **_kwargs):
+        assert operation == "submit"
+        raise HarnessAPIError("invalid_error_response", "not found", True, None, 404)
+
+    monkeypatch.setattr(WorkflowEvaluator, "ensure_harness_ready", lambda self, *_args: None)
+    monkeypatch.setattr(
+        "openagent_studio.workflow_runner.create_harness_client",
+        lambda *_args, **_kwargs: FakeHarnessClient(missing_v1_contract),
+    )
+    evaluator = WorkflowEvaluator(
+        lambda prompt, value: value,
+        lambda workflow, case, output: SemanticVerdict(True, 100, []),
+        live_execution=True,
+    )
+    try:
+        evaluator.evaluate(project, project.workflows[0], 0)
+    except HarnessInfrastructureError as exc:
+        assert "Harness 任务 API 契约不兼容" in str(exc)
+        assert "候选工作流未进入无效修复" in str(exc)
+    else:
+        raise AssertionError("缺少任务 API 契约时不应进入候选修复")
+
+
+def test_harness_blocked_task_is_not_repaired_through_management_api():
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "环境归 Harness 管理",
+        "harness": [{"id": "coding", "name": "Coding", "backend_id": "default", "agent_id": "coding"}],
         "workflows": [{"id": "flow", "name": "恢复流程", "nodes": [
             {"id": "agent", "type": "agent", "data": {"agent_id": "coding", "prompt": "{{input}}"}},
             {"id": "output", "type": "output", "data": {}},
         ], "edges": [{"source": "agent", "target": "output"}]}],
     })
-    manager = WorkflowManager(poll_interval=0.001)
     calls = []
 
-    def scripted_request(method, path, body=None, headers=None):
-        calls.append((method, path, body, headers))
-        if path == "/api/tasks" and len([item for item in calls if item[1] == "/api/tasks"]) == 1:
+    def handler(operation, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "submit":
             return {"id": "drifted-task", "status": "queued"}
-        if path == "/api/tasks/drifted-task":
+        if operation == "task":
             return {"id": "drifted-task", "status": "blocked", "blocked_reason": "setup required", "error_code": "setup_required", "setup_required": True}
-        if path == "/api/agents/coding/setup":
-            assert headers["Prefer"] == "respond-async"
-            assert headers["Idempotency-Key"].startswith("openagent-setup-")
-            return {"accepted": True, "setup_operation": {"id": "setup-1", "status": "queued"}}
-        if path == "/api/setup-operations/setup-1":
-            return {"id": "setup-1", "status": "ready", "fingerprint": "prepared"}
-        if path == "/api/tasks" and len([item for item in calls if item[1] == "/api/tasks"]) == 2:
-            return {"id": "recovered-task", "status": "queued"}
-        if path == "/api/tasks/recovered-task":
-            return {"id": "recovered-task", "status": "completed"}
-        if path.startswith("/api/tasks/recovered-task/logs"):
-            return [{"line": "recovered"}]
-        raise AssertionError(path)
+        raise AssertionError(operation)
 
-    manager._request = scripted_request
+    manager = WorkflowManager(poll_interval=0.001, client_factory=lambda _backend_id: FakeHarnessClient(handler))
     run = manager.start(project, "flow", {"input": "执行"})
-    _wait_for(lambda: run.status == "completed")
-    assert run.outputs["output"]["text"] == "recovered"
-    assert any(path == "/api/agents/coding/setup" for _, path, _, _ in calls)
-    keys = [headers["Idempotency-Key"] for method, path, _, headers in calls if path == "/api/tasks"]
-    assert keys[1].endswith("-recovery")
+    _wait_for(lambda: run.status == "failed")
+    assert run.error == "setup required"
+    assert [operation for operation, _ in calls] == ["submit", "task"]
 
 
 def test_condition_edges_skip_inactive_branch():
@@ -257,11 +581,6 @@ def test_condition_edges_skip_inactive_branch():
     _wait_for(lambda: run.status == "completed")
     assert run.outputs["yes"] == "yes"
     assert run.node_states["no"]["status"] == "skipped"
-
-
-def test_real_harness_opencode_prompt_contains_governance_and_task():
-    prompt = build_prompt({"task": {"prompt": "修复测试"}, "instructions": "只能修改任务范围内的文件"})
-    assert prompt == "只能修改任务范围内的文件\n\n用户任务：\n修复测试"
 
 
 def test_dify_style_data_nodes_and_switch_routing():
@@ -285,7 +604,7 @@ def test_dify_style_data_nodes_and_switch_routing():
 
 
 def test_webhook_node_starts_workflow(tmp_path: Path):
-    app = create_app(tmp_path / "project.yaml", auto_start_harness=False)
+    app = create_app(tmp_path / "project.yaml")
     client = TestClient(app)
     payload = {"version": "1", "name": "Webhook", "workflows": [{"id": "hook-flow", "name": "Hook", "nodes": [
         {"id": "hook", "type": "webhook", "data": {"path": "/hooks/products/select", "method": "POST"}},
@@ -457,17 +776,17 @@ def test_complexity_ranking_prefers_shorter_clear_workflow():
     assert complexity_metrics(short, 1.0, 0) < complexity_metrics(long, 0.1, 1)
 
 
-def test_evaluation_mode_mocks_harness_service():
+def test_evaluation_mode_mocks_harness_tool():
     project = ProjectSpec.model_validate({
-        "version": "1", "name": "服务隔离",
-        "harness": [{"id": "service", "name": "Service", "cwd": ".", "service": {"command": ["serve"], "port": 9000}}],
+        "version": "1", "name": "工具隔离",
+        "harness": [{"id": "tool-agent", "name": "Tool", "backend_id": "default", "agent_id": "tool-agent"}],
         "workflows": [{"id": "flow", "name": "流程", "nodes": [
-            {"id": "agent", "type": "agent", "data": {"agent_id": "service", "prompt": "{{input}}"}},
+            {"id": "agent", "type": "tool", "data": {"agent_id": "tool-agent", "prompt": "{{input}}"}},
             {"id": "result", "type": "output", "data": {}},
         ], "edges": [{"source": "agent", "target": "result"}]}],
     })
     manager = WorkflowManager()
-    run = manager.start(project, "flow", {"input": "x"}, policy=EvaluationPolicy(mocks={"agent": {"safe": True}}, model_inference=lambda *_: (_ for _ in ()).throw(AssertionError("service must not run model"))), record=False)
+    run = manager.start(project, "flow", {"input": "x"}, policy=EvaluationPolicy(mocks={"agent": {"safe": True}}, model_inference=lambda *_: (_ for _ in ()).throw(AssertionError("tool must not run model"))), record=False)
     _wait_for(lambda: run.status == "completed")
     assert run.outputs["result"] == {"safe": True}
 
@@ -475,31 +794,32 @@ def test_evaluation_mode_mocks_harness_service():
 def test_live_acceptance_uses_formal_harness_execution_path():
     project = ProjectSpec.model_validate({
         "version": "1", "name": "真实验收",
-        "harness": [{"id": "worker", "name": "Worker", "cwd": ".", "task": {"command": ["worker"]}}],
+        "harness": [{"id": "worker", "name": "Worker", "backend_id": "default", "agent_id": "worker"}],
         "workflows": [{"id": "flow", "name": "流程", "nodes": [
             {"id": "agent", "type": "agent", "data": {"agent_id": "worker", "prompt": "真实执行 {{input}}"}},
             {"id": "result", "type": "output", "data": {}},
         ], "edges": [{"source": "agent", "target": "result"}]}],
     })
-    manager = WorkflowManager(poll_interval=0.001)
     calls = []
 
-    def scripted_request(method, path, body=None, headers=None):
-        calls.append((method, path, body, headers))
-        if path == "/api/tasks":
+    def handler(operation, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "submit":
             return {"id": "live-task", "status": "queued"}
-        if path == "/api/tasks/live-task":
+        if operation == "task":
             return {"id": "live-task", "status": "completed"}
-        if path.startswith("/api/tasks/live-task/logs"):
-            return [{"line": "real harness result"}]
-        raise AssertionError(path)
+        if operation == "logs":
+            return {"items": [{"line": "real harness result"}], "next_cursor": 1}
+        if operation == "result":
+            return {"output": {"type": "text", "text": "real harness result"}}
+        raise AssertionError(operation)
 
-    manager._request = scripted_request
+    manager = WorkflowManager(poll_interval=0.001, client_factory=lambda _backend_id: FakeHarnessClient(handler))
     policy = EvaluationPolicy(live_execution=True, model_inference=lambda *_: (_ for _ in ()).throw(AssertionError("live validation must not bypass Harness")))
     run = manager.start(project, "flow", {"input": "任务"}, policy=policy, record=False)
     _wait_for(lambda: run.status == "completed")
-    assert calls[0][1] == "/api/tasks"
-    assert calls[0][2]["prompt"] == "真实执行 任务"
+    assert calls[0][0] == "submit"
+    assert calls[0][1]["prompt"] == "真实执行 任务"
     assert run.outputs["result"]["text"] == "real harness result"
     assert run.id not in manager.runs
 
@@ -531,11 +851,43 @@ def test_generator_builds_three_isolated_candidates_and_saves_shortest(tmp_path:
     manager._invoke = fake_invoke
     manager._run(generation, project)
     assert len(candidate_prompts) == 3
+    assert all("WorkflowSpec 严格契约" in prompt for prompt in candidate_prompts)
+    assert all("只能填写为 agent/llm/tool/code/validator 节点的 data.agent_id" in prompt for prompt in candidate_prompts)
     assert [item["data"]["stage"] for item in generation.events if item["event"] == "generation.stage"] == ["preparing_cases", "generating", "validating", "evaluating", "verifying", "selecting", "saving"]
     assert generation.events[-1]["event"] == "generation.completed", generation.events[-1]
     saved = store.load().workflows[0]
     assert len(saved.nodes) == 1
     assert len(saved.evaluation.cases) == 3
+
+
+def test_generator_fails_before_model_calls_when_harness_is_unavailable(monkeypatch, tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "运行时预检", "project_dir": str(tmp_path),
+        "harness": [{"id": "coding", "name": "Coding", "backend_id": "default", "agent_id": "coding"}],
+        "workflows": [{"id": "flow", "name": "原流程", "nodes": []}],
+    })
+    store.save(project)
+    manager = GeneratorManager(store)
+    generation = Generation(
+        id="preflight", workflow_id="flow", base_etag=store.etag(),
+        draft=project.workflows[0].model_dump(mode="json"), prompt="创建节点", model="provider/model",
+    )
+    monkeypatch.setattr("openagent_studio.generator.resolve_executable", lambda *_: "opencode")
+    monkeypatch.setattr(
+        "openagent_studio.evaluation.create_harness_client",
+        lambda *_args, **_kwargs: FakeHarnessClient(
+            lambda operation, **_values: (_ for _ in ()).throw(httpx.ConnectError("connection refused"))
+        ),
+    )
+    manager._invoke = lambda *_args: (_ for _ in ()).throw(AssertionError("模型不应在 Harness 预检失败后被调用"))
+
+    manager._run(generation, project)
+
+    stages = [item["data"]["stage"] for item in generation.events if item["event"] == "generation.stage"]
+    assert stages == ["checking_runtime"]
+    assert generation.events[-1]["event"] == "generation.failed"
+    assert "Harness 验收运行时不可用" in generation.events[-1]["data"]["message"]
 
 
 def test_generator_all_failed_candidates_preserve_original(tmp_path: Path):
@@ -562,6 +914,39 @@ def test_generator_all_failed_candidates_preserve_original(tmp_path: Path):
     assert store.load().workflows[0].nodes[0].id == "original"
 
 
+def test_generator_skips_one_malformed_repair_candidate(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({"version": "1", "name": "修复容错", "project_dir": str(tmp_path), "workflows": [{"id": "flow", "name": "原流程", "nodes": [{"id": "original", "type": "output", "data": {"description": "旧结果"}}]}]})
+    store.save(project)
+    manager = GeneratorManager(store)
+    generation = Generation(id="repair", workflow_id="flow", base_etag=store.etag(), draft=project.workflows[0].model_dump(mode="json"), prompt="优化", model="provider/model")
+    repairs = 0
+
+    def fake_invoke(generation, spec, command, workdir, prompt):
+        nonlocal repairs
+        if "验收设计师" in prompt:
+            cases = [{"id": f"case-{i}", "name": "用例", "input": i, "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": ["有效"]} for i in range(3)]
+            return f"<result>{json.dumps({'cases': cases}, ensure_ascii=False)}</result>"
+        if "工作流架构师" in prompt:
+            return '<result>{"id":"flow","name":"候选","nodes":[{"id":"bad","type":"output","data":{}}],"edges":[]}</result>'
+        if "工作流修复工程师" in prompt:
+            repairs += 1
+            if repairs <= 2:
+                return "不是 JSON"
+            return '<result>{"id":"flow","name":"修复候选","nodes":[{"id":"good","type":"output","data":{}}],"edges":[]}</result>'
+        return '<result>{"passed":false,"score":10,"issues":["不通过"]}</result>'
+
+    manager._invoke = fake_invoke
+    manager._evaluate_candidates = lambda generation, spec, candidates, evaluator: [
+        CandidateResult(index=index, workflow=item, passed=item.nodes[0].id == "good", cases=[], metrics=(0, 0, 0, 0, 0, 0.0, 0), errors=[])
+        for index, item in enumerate(candidates)
+    ]
+    manager._finalize = lambda generation: setattr(generation, "completed", True) or generation.emit("generation.completed", {"workflow": generation.draft, "etag": "test"})
+    manager._run(generation, project)
+    assert generation.events[-1]["event"] == "generation.completed", generation.events[-1]
+    assert any(item["event"] == "generation.repair_candidate_failed" for item in generation.events)
+
+
 def _platform_project(env_file: Path) -> dict:
     return {
         "version": "1", "name": "平台机器人",
@@ -578,7 +963,7 @@ def _platform_project(env_file: Path) -> dict:
 def test_feishu_challenge_and_message_start_workflow(tmp_path: Path):
     env_file = tmp_path / "platform.env"
     env_file.write_text("FEISHU_APP_ID=app\nFEISHU_APP_SECRET=secret\nFEISHU_VERIFICATION_TOKEN=verify\n", encoding="utf-8")
-    client = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False))
+    client = TestClient(create_app(tmp_path / "project.yaml"))
     assert client.put("/api/spec", json=_platform_project(env_file)).status_code == 200
     challenge = client.post("/integrations/feishu/main/events", json={"type": "url_verification", "token": "verify", "challenge": "hello"})
     assert challenge.status_code == 200
@@ -601,7 +986,7 @@ def test_feishu_challenge_and_message_start_workflow(tmp_path: Path):
 def test_qq_validation_signature_and_message_start_workflow(tmp_path: Path):
     env_file = tmp_path / "platform.env"
     env_file.write_text("QQ_BOT_APP_ID=1024\nQQ_BOT_SECRET=qq-secret\n", encoding="utf-8")
-    client = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False))
+    client = TestClient(create_app(tmp_path / "project.yaml"))
     assert client.put("/api/spec", json=_platform_project(env_file)).status_code == 200
     validation = client.post("/integrations/qq/main/events", json={"op": 13, "d": {"plain_token": "plain", "event_ts": "123"}})
     assert validation.status_code == 200
@@ -623,7 +1008,7 @@ def test_qq_validation_signature_and_message_start_workflow(tmp_path: Path):
 def test_integration_status_never_returns_credentials(tmp_path: Path):
     env_file = tmp_path / "platform.env"
     env_file.write_text("FEISHU_APP_ID=app\nFEISHU_APP_SECRET=secret\nFEISHU_VERIFICATION_TOKEN=verify\nQQ_BOT_APP_ID=1024\nQQ_BOT_SECRET=qq-secret\n", encoding="utf-8")
-    client = TestClient(create_app(tmp_path / "project.yaml", auto_start_harness=False))
+    client = TestClient(create_app(tmp_path / "project.yaml"))
     client.put("/api/spec", json=_platform_project(env_file))
     body = client.get("/api/integrations/status").json()
     assert body["feishu"][0]["ready"] is True

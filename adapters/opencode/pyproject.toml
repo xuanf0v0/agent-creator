@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openagent-harness-opencode"
+version = "0.1.0"
+description = "Independent OpenCode stdin_json adapter for Agent Harness"
+requires-python = ">=3.11"
+
+[project.scripts]
+openagent-harness-opencode = "openagent_harness_opencode:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openagent_harness_opencode"]

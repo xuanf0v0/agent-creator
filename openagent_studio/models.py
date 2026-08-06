@@ -47,22 +47,17 @@ class ProviderSpec(BaseModel):
 
 
 class HarnessSpec(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    id: str
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
     name: str
     description: str = ""
-    runtime: Literal["task", "service"] = "task"
-    cwd: str = "."
-    service: dict[str, Any] | None = None
-    task: dict[str, Any] | None = None
-    environment: dict[str, Any] = Field(default_factory=dict)
-    env_file: str = ".env"
-    config: list[dict[str, Any]] = Field(default_factory=list)
+    backend_id: str = Field(default="default", pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    agent_id: str | None = Field(default=None, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
     @model_validator(mode="after")
-    def infer_legacy_runtime(self):
-        if "runtime" not in self.model_fields_set and self.service is not None and self.task is None:
-            self.runtime = "service"
+    def default_agent_id(self):
+        if self.agent_id is None:
+            self.agent_id = self.id
         return self
 
 class WorkflowNode(BaseModel):

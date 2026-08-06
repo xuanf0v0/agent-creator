@@ -6,11 +6,11 @@
 
 - 版本化的 `ProjectSpec`，统一描述 Agent、Provider、Harness 和 Workflow；
 - Pydantic 校验和基于 ETag 的并发写保护；
-- 编译为 OpenCode 配置和 Agent Harness manifest；
+- 编译 OpenCode 配置，并通过独立 `agent-harness-sdk` 调用稳定 `/api/v1`；
 - React + TypeScript + React Flow 正规前端；
 - 画布式节点拖放、连线、属性编辑、缩放和小地图；
 - OpenCode 驱动的 AI 对话生成器，生成多个隔离候选并只采用真实运行通过的最佳工作流；
-- 接入 Agent Harness 的 Workflow 执行器，支持任务型和服务型 Agent；
+- 接入独立 my-harness 的 Workflow 执行器，支持任务提交、状态、日志、结果和取消；
 - 条件分支、并行调度、有限循环、人工审批、验证器、输出聚合和运行取消；
 - 基于 SSE 的实时节点状态、Harness 任务进度和运行事件面板。
 - 飞书与 QQ 官方机器人接口，支持验签、防重放、事件去重、工作流路由和自动回复。
@@ -34,8 +34,8 @@ OPENAGENT_SPEC=project.yaml .venv/bin/openagent-studio
 `uv run --no-sync openagent-studio`。
 
 `openagent-studio` 启动时会自动结束占用 `127.0.0.1:8787` 的旧监听进程，
-避免重复启动时报端口冲突。需要保留旧进程时，可设置 `OPENAGENT_KILL_PORT=0`
-关闭此行为。
+避免重复启动时报端口冲突。需要保留旧进程时可设置 `OPENAGENT_KILL_PORT=0`。
+Studio 不安装、不启动、不监督 Harness，也不会写 Harness manifest 或 Catalog。
 
 打开 <http://127.0.0.1:8787>。也可以直接运行：
 
@@ -43,58 +43,70 @@ OPENAGENT_SPEC=project.yaml .venv/bin/openagent-studio
 uv run uvicorn openagent_studio.app:app --host 127.0.0.1 --port 8787
 ```
 
-默认不会监听公网地址。`project.yaml` 是规范源文件；`/api/compile/*` 端点可以预览
-生成结果。Studio 默认连接独立运行的 Harness，不会自动写 manifest 或启动进程。
+默认不会监听公网地址。`project.yaml` 是规范源文件；`/api/compile/opencode` 可以预览
+OpenCode 配置。Studio 始终连接独立运行的 Harness。
 
 仓库中的 `project.yaml` 已配置真实的 `deepseek/deepseek-v4-flash` OpenCode 代码智能体，以及一套
 可直接运行的选品决策工作流；不包含回声、固定响应或无模型 worker。选品流程中的需求整理、市场研究、
 竞品分析和利润评估节点都配置了独立的角色、目标、上下文、约束与输出格式提示词。
 
-Studio 支持两种 Harness 契约：显式声明 `runtime: task` 的逻辑 Agent 通过稳定的 `/api/v1`
-任务接口执行；包含完整 `task` / `service` manifest 的兼容配置使用仓库内置
-`vendor/agent-harness` 的旧接口。两种模式都不会回退到 Mock。
-
-内置副本包含新版可扩展运行接口：任务可选择 `stdin_json`、`argv`、`http`、`mcp` 或
-`module:attribute` 协议插件；服务可选择本地进程、外部 endpoint 或部署插件；健康检查支持
-HTTP、TCP、命令、进程和插件；沙箱也支持 `backend` 与 `backend_options`。OpenAgent 会原样编译
-这些 Harness manifest 字段，当前 `coding` Agent 显式使用 `stdin_json` 与 `backend: auto`。
+Studio 固定依赖 [xuanf0v0/my-harness](https://github.com/xuanf0v0/my-harness)
+提交 `bea70fb812e98f530d262eeccb5a889b51dc821d` 的独立 Python SDK。所有任务只走
+`/api/v1/tasks`、状态、日志、结果和取消接口，不再包含旧 `/api/tasks` 或服务代理兼容路径。
+`project.yaml` 的 Harness 项只保存逻辑 ID、`backend_id` 和 Harness Catalog 中的 `agent_id`。
 
 相关环境变量：
 
-- `AGENT_HARNESS_ROOT`：Harness 源码目录，默认 `<项目>/vendor/agent-harness`；
-- `AGENT_HARNESS_BIN`：可选的外部 `agent-harness` 可执行文件；未设置时运行项目内副本；
-- `AGENT_HARNESS_HOME`：Harness 状态目录，默认 `<项目>/.harness/agent-harness`；
-- `AGENT_HARNESS_MANIFESTS`：Studio 管理的 manifest 目录；
 - `AGENT_HARNESS_URL`：Harness API 地址，默认 `http://127.0.0.1:8765`；
 - `AGENT_HARNESS_TASK_TOKEN`：v1 任务提交、读取和取消使用的 Bearer Token；
-- `AGENT_HARNESS_MANAGEMENT_TOKEN`：v1 能力发现与管理请求使用的 Bearer Token；
-- `OPENAGENT_START_HARNESS=1`：启用内置 Harness 兼容模式，默认关闭；
-- `OPENAGENT_SYNC_HARNESS=1`：把完整 manifest 同步到 `.openagent-agents`，默认关闭。
+- 非默认后端使用 `AGENT_HARNESS_<BACKEND_ID>_URL` 和
+  `AGENT_HARNESS_<BACKEND_ID>_TASK_TOKEN`，其中 ID 转为大写下划线形式。
 
-Studio 保存完整项目配置时也会刷新这些文件；内置 Harness 会监听 manifest 并自动热重载。
-运行中的 Agent 或任务占用相关配置时，重载会明确报告 `runtime_busy`，完成后再保存即可。
+Studio 不读取 `AGENT_HARNESS_MANAGEMENT_TOKEN`。管理 Token 只应存在于 Harness 运维环境中，
+由运维脚本通过 `/api/v1/agents` 注册或更新 Catalog。AI 创建会在首次模型调用前通过 SDK 检查
+`/api/v1/capabilities`；运行时不可用会快速失败，不会把基础设施故障误当成候选缺陷反复修复。
 
-Harness 会限制 Agent 工作目录不能逃出 manifest 目录的父目录。因此默认配置下，
-`harness[].cwd` 应位于当前项目内；自定义 `AGENT_HARNESS_MANIFESTS` 时，也要保证其
-父目录能够合法包含 Agent 工作目录。
+### 安装并启动独立 Harness（Windows）
+
+```powershell
+.\scripts\install-harness.ps1
+.\scripts\start-harness.ps1
+# 在另一个 PowerShell 中
+.\scripts\register-harness-agent.ps1
+.\scripts\start-studio.ps1
+```
+
+默认安装目录是 `D:\Projects\my-harness`。它拥有独立虚拟环境、`state` 目录、空 bootstrap
+manifest 目录和 `.runtime.env`。`catalog.json` 由 Harness 管理；注册脚本只在运维侧读取管理
+Token。`start-studio.ps1` 只把任务 Token 注入 Studio 进程。OpenCode 适配器位于
+`adapters/opencode`，是独立可安装包，不导入 `openagent_studio`。
 
 OpenCode 生成器使用本机 `opencode run --format json`。可通过
 `OPENCODE_BIN` 指定程序，使用 `OPENCODE_GENERATOR_MODEL` 指定生成模型；未设置时
 使用项目中的首个模型；如果两者都没有配置，生成请求会直接失败，不会降级到替身模型。
 Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整路径。
 当前项目的生成对话和 Harness 代码任务都明确使用 `deepseek/deepseek-v4-flash`。前者负责理解需求和
-生成工作流，后者通过 `openagent_studio.harness_opencode` 执行实际 Agent 任务。
+生成工作流，后者通过独立的 `openagent-harness-opencode` 适配器执行实际 Agent 任务。
 页面首次打开会显示 OpenCode 创作对话框；关闭后可通过顶部“OpenCode 创建”按钮或
 右侧“AI 创建”页签重新打开。每次 AI 创建或修改都会先生成验收用例和三套隔离候选。候选不会边生成
-边污染当前画布；Studio 会沿正式 `WorkflowManager → Harness` 路径逐个真实执行，任务型 Agent、
-服务型 Agent、工具、HTTP 与子工作流均使用正式运行语义。只有运行到 `completed`、输出检查通过，
+边污染当前画布；Studio 会沿正式 `WorkflowManager → agent-harness-sdk → /api/v1` 路径逐个真实执行，
+Agent、工具、HTTP 与子工作流均使用正式运行语义。只有运行到 `completed`、输出检查通过，
 并由独立 OpenCode 验证会话明确返回 `passed=true` 且评分不低于 80 的候选才能进入排序和保存。
 失败证据会交给 OpenCode 进行有限轮修复并重新完整执行；仍未通过、取消或发生 ETag 冲突时保留原工作流。
 验收运行不写入普通运行历史。
 
+生成器通过标准输入以 UTF-8 传递提示词，不依赖 Windows 命令行长度或模型不可见的文件附件。超过
+`OPENCODE_COMPACT_PROMPT_LENGTH`（默认 12000 字）的上下文会先由禁用工具的 compaction Agent
+无损提炼，提炼默认最多等待 `OPENCODE_COMPACTION_TIMEOUT=30` 秒。提炼超时时会保留原始完整上下文继续生成，
+并在当前生成任务中跳过后续提炼；其他提炼错误仍会直接终止并把真实错误返回页面；
+正式生成继续使用 OpenCode 原生 `plan` 创作助手，不切换到其他兜底 Agent。
+
 右侧“验收标准”可编辑真实运行输入、输出检查、语义目标、审批决策和单用例超时。确定性断言只负责在
 真实运行完成后检查输出字段、值、类型或格式，不能代替真实执行。审批节点在无人值守验收时使用用例中的
 决策；其他节点不使用 Mock。`OPENCODE_OPTIMIZATION_REPAIR_ROUNDS` 可设置自动修复轮数，默认 2，最大 5。
+OpenCode 生成调用默认最多等待 120 秒（`OPENCODE_GENERATOR_CALL_TIMEOUT`，范围 30–1800）；
+修复候选默认最多等待 60 秒（`OPENCODE_REPAIR_CALL_TIMEOUT`，范围 30–600），修复超时不会重复请求，
+以免多个候选串行等待造成无意义的长时间阻塞。
 生成器会把可用 Harness Agent 清单交给模型，并要求每个节点同时生成执行参数：Agent
 必须包含 `agent_id` 和完整 `prompt`，提示词/循环/输出节点包含 `template`，条件节点包含
 `expression` 与分支条件。后端会拒绝不存在的 Agent，并为遗漏的可选参数补充可执行默认值。
@@ -113,7 +125,7 @@ Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整
 
 - 触发器：`manual_trigger`、`webhook`、`schedule`；Webhook 使用配置的 `/hooks/...`
   路径启动工作流，Schedule 支持带范围、列表和步长的五段 Cron、字段范围校验、IANA 时区和分钟级去重；
-- AI：`llm`、`agent`、`tool`、`code` 均通过 Harness task/service 执行，
+- AI：`llm`、`agent`、`tool`、`code` 均通过 Harness v1 task 执行，
   `knowledge_retrieval` 支持查询模板、内置文档和 Top-K 召回；
 - 数据处理：`prompt`、`variable_set`、`transform`、`merge`，支持 JSON 解析/序列化、
   路径提取、字段筛选、数组扁平化以及 array/object/concat 合并；
@@ -132,20 +144,13 @@ Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整
 始终执行；条件节点的分支通常分别填写 `true` 和 `false`。
 
 Agent 节点会使用 `openagent-{run_id}-{node_id}` 作为 Harness 幂等键。取消工作流时，
-执行器会唤醒等待中的审批节点，并向所有活跃 Harness task 发送取消请求。
-OpenAgent 已对接 Harness 的结构化环境协议：优先读取任务的 `error_code=setup_required` / `setup_required`，
-并兼容旧版 `environment drift; run setup` 文本。仓库中的 `coding` manifest 启用
-`environment.auto_setup_on_drift: true`，通常由 Harness 在任务执行前完成恢复；若仍收到阻塞任务，
-执行器只会发起一次带幂等键的异步 setup，轮询 `/api/setup-operations/{id}` 到 `ready` 后再用新幂等键重试。
-setup 超时或结构化失败原因会写入运行错误，不会无限重试或掩盖其他任务失败。
-Harness 允许省略 `environment.setup_command` 并把它视为内部 no-op；需要可复现依赖准备的任务应显式配置。
-仓库中的 `coding` Agent 使用项目虚拟环境执行
-`python -m openagent_studio.harness_setup`。该模块兼容 uv 创建的无 pip 虚拟环境，会先通过
-`ensurepip` 自举，再执行 editable install。setup 成功后 Harness 会记录依赖文件指纹。修改 `pyproject.toml`、锁文件或
-其他环境指纹文件后，下一次任务会自动重新 setup 一次。
+执行器会唤醒等待中的审批节点，并通过 SDK 向所有活跃 Harness task 发送取消请求。
+环境 setup、Catalog、manifest、沙箱和验证命令全部由独立 Harness 管理；Studio 不调用管理接口，
+也不会在任务失败后擅自执行 setup。
 
-Harness 新版沙箱默认拒绝网络。OpenCode 需要访问 DeepSeek API，因此 `coding.task.sandbox.network`
-显式设为 `allow`，并在 `tools.allow` 中声明 `network`；其他 Agent 若不需要联网，应继续保持默认 `deny`。
+Harness 新版沙箱默认拒绝网络。OpenCode 需要访问 DeepSeek API，因此注册脚本在 Harness-owned
+`coding` manifest 中把 task 网络设为 `allow`，并在工具策略中声明 `network`；其他 Agent 若不需要
+联网，应继续保持默认 `deny`。这些运行时字段不会写回 Studio 的 `project.yaml`。
 
 ## 飞书与 QQ 机器人
 
@@ -205,7 +210,6 @@ npm run build
 - `GET /api/spec`：返回规范和 ETag
 - `PUT /api/spec`：校验并原子保存规范，使用 `If-Match` 防止覆盖并发修改
 - `GET /api/compile/opencode`：生成 OpenCode JSON 配置
-- `GET /api/compile/harness/{agent_id}`：生成 Harness YAML manifest
 - `POST /api/workflows/{workflow_id}/runs`：启动工作流，body 可包含 `input` 和 `relative_path`
 - `GET|POST|PUT|PATCH|DELETE /hooks/{path}`：触发 path 匹配的 Webhook 工作流
 - `GET /api/workflow-runs?workflow_id=...`：列出运行记录
@@ -247,10 +251,8 @@ providers:
 harness:
   - id: builder
     name: Builder runtime
-    cwd: ../my-agent
-    task:
-      command: [.venv/bin/python, -m, openagent_studio.harness_opencode, --model, deepseek/deepseek-v4-flash, --agent, build, --env-file, /path/to/server-only/.env]
-      verification: [{name: tests, command: [uv, run, pytest]}]
+    backend_id: default
+    agent_id: builder
 workflows:
   - id: build-and-review
     name: 构建并审批
