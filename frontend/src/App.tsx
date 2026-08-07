@@ -246,6 +246,17 @@ function StudioCanvas() {
     listen('generation.context_compaction_retry', () => setMessage('首次上下文提炼返回空内容，正在使用同一 OpenCode compaction Agent 严格重试…'))
     listen('generation.context_compacted', ({ before_chars, after_chars, used }) => setMessage(used ? `上下文已从 ${before_chars} 字压缩至 ${after_chars} 字，正在继续生成…` : '上下文无需压缩，正在继续生成…'))
     listen('generation.context_compaction_failed', ({ before_chars }) => setMessage(`上下文提炼超时，已保留 ${before_chars} 字完整上下文继续生成…`))
+    listen('generation.repairing', ({ message: repairMessage, node_id }) => setMessage(`${repairMessage}${node_id ? `（节点 ${node_id}）` : ''}`))
+    const applyStreamingWorkflow = (workflow: Workflow, reverted = false) => {
+      if (!workflow || workflow.id !== workflowId) return
+      const view = toCanvas(workflow)
+      setNodes(view.nodes); setEdges(view.edges)
+      setSpec((project) => project ? { ...project, workflows: project.workflows.map((item) => item.id === workflow.id ? workflow : item) } : project)
+      setMessage(reverted ? '本步探测未通过，已恢复上一个稳定版本' : `正在实时渲染：${workflow.nodes.length} 个节点、${workflow.edges.length} 条连线…`)
+      setTimeout(() => fitView({ padding: 0.22 }), 40)
+    }
+    listen('workflow.preview', ({ workflow, reverted }) => applyStreamingWorkflow(workflow, reverted))
+    listen('workflow.updated', ({ workflow }) => applyStreamingWorkflow(workflow))
     listen('chat.assistant.delta', ({ text }) => setChatMessages((items) => {
       const last = items[items.length - 1]
       if (last?.role === 'assistant') return [...items.slice(0, -1), { ...last, content: last.content + text }]

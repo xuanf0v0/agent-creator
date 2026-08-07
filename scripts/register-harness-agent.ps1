@@ -14,7 +14,8 @@ $Secrets = @{}
 Get-Content -LiteralPath $RuntimeEnv | ForEach-Object {
     if ($_ -and -not $_.StartsWith("#") -and $_.Contains("=")) {
         $Name, $Value = $_.Split("=", 2)
-        $Secrets[$Name.Trim()] = $Value.Trim()
+        $cleanName = $Name.Trim().Trim([char]0xFEFF)
+        $Secrets[$cleanName] = $Value.Trim()
     }
 }
 if (-not $Secrets.AGENT_HARNESS_MANAGEMENT_TOKEN) { throw "缺少 Harness 管理 Token" }

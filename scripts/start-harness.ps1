@@ -14,7 +14,10 @@ if (-not (Test-Path -LiteralPath $RuntimeEnv)) { throw "Harness 运行时密钥�
 Get-Content -LiteralPath $RuntimeEnv | ForEach-Object {
     if ($_ -and -not $_.StartsWith("#") -and $_.Contains("=")) {
         $Name, $Value = $_.Split("=", 2)
-        [Environment]::SetEnvironmentVariable($Name.Trim(), $Value.Trim(), "Process")
+        # Windows PowerShell 5.1 preserves the UTF-8 BOM emitted by
+        # Set-Content on the first line; remove it before exporting the key.
+        $cleanName = $Name.Trim().Trim([char]0xFEFF)
+        [Environment]::SetEnvironmentVariable($cleanName, $Value.Trim(), "Process")
     }
 }
 $env:AGENT_HARNESS_HOME = Join-Path $HarnessRoot "state"

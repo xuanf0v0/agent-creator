@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 from typing import Any, Mapping
 
 
@@ -49,6 +50,44 @@ def _load_env_file(path: str | None, environment: dict[str, str]) -> None:
             environment[key] = value
 
 
+def _event_text(item: dict[str, Any]) -> str:
+    part = item.get("part")
+    if not isinstance(part, dict):
+        properties = item.get("properties")
+        part = properties.get("part") if isinstance(properties, dict) else None
+    if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+        return part["text"]
+    if item.get("type") == "text" and isinstance(item.get("text"), str):
+        return item["text"]
+    return ""
+
+
+def extract_final_text(lines: list[str]) -> tuple[str, list[str]]:
+    """Extract only assistant text from OpenCode's JSONL event stream.
+
+    Tool events, step metadata, and diagnostics are intentionally not passed
+    into the workflow. Returning the raw stream makes every downstream node
+    consume protocol logs instead of the model result.
+    """
+    chunks: list[str] = []
+    diagnostics: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            diagnostics.append(line[:1000])
+            continue
+        text = _event_text(item)
+        if text:
+            chunks.append(text)
+        if "error" in str(item.get("type", "")).lower() or item.get("error"):
+            diagnostics.append(json.dumps(item, ensure_ascii=False)[:1000])
+    return "".join(chunks).strip(), diagnostics
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run an Agent Harness task through the real OpenCode CLI")
     parser.add_argument("--model", required=True)
@@ -80,18 +119,36 @@ def main() -> int:
         prompt,
     ]
     try:
-        process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert process.stdout is not None
-        while chunk := process.stdout.read(16 * 1024):
-            # Harness consumes newline-delimited logs with a bounded reader.
-            # OpenCode JSON events can contain very large tool results on one
-            # line, so insert a delimiter at a safe byte boundary while
-            # preserving the complete child output.
-            sys.stdout.buffer.write(chunk)
-            if not chunk.endswith(b"\n"):
-                sys.stdout.buffer.write(b"\n")
-            sys.stdout.buffer.flush()
-        return process.wait()
+        assert process.stderr is not None
+        stderr_chunks: list[bytes] = []
+
+        def drain_stderr() -> None:
+            while chunk := process.stderr.read(16 * 1024):
+                stderr_chunks.append(chunk)
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+        lines: list[str] = []
+        for raw_line in process.stdout:
+            lines.append(raw_line.decode("utf-8", errors="replace"))
+        code = process.wait()
+        stderr_thread.join(timeout=2)
+        final_text, diagnostics = extract_final_text(lines)
+        if code != 0:
+            detail = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+            if detail:
+                print(detail[-4000:], file=sys.stderr, flush=True)
+            return code
+        if not final_text:
+            detail = diagnostics[-1] if diagnostics else "OpenCode 没有返回最终文本"
+            print(f"OpenCode 结果无效：{detail}", file=sys.stderr, flush=True)
+            return 3
+        sys.stdout.write(final_text)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return 0
     except OSError as exc:
         print(f"cannot start OpenCode: {exc}", file=sys.stderr, flush=True)
         return 127

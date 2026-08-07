@@ -138,11 +138,20 @@ class WorkflowManager:
             except Exception:
                 continue
 
-    def start(self, project: ProjectSpec, workflow_id: str, body: dict[str, Any] | None = None, *, policy: EvaluationPolicy | None = None, record: bool = True) -> WorkflowRun:
+    def start(
+        self,
+        project: ProjectSpec,
+        workflow_id: str,
+        body: dict[str, Any] | None = None,
+        *,
+        policy: EvaluationPolicy | None = None,
+        record: bool = True,
+        require_output: bool = True,
+    ) -> WorkflowRun:
         workflow = next((item for item in project.workflows if item.id == workflow_id), None)
         if workflow is None:
             raise KeyError(workflow_id)
-        errors = validate_executable_workflow(project, workflow, runtime=True)
+        errors = validate_executable_workflow(project, workflow, runtime=True, require_output=require_output)
         if errors:
             raise ValueError("；".join(errors))
         body = body or {}
@@ -380,7 +389,7 @@ class WorkflowManager:
             return latest
         if node.type == "output":
             template = str(node.data.get("template", ""))
-            return self._render(template, run, latest) if template else latest
+            return self._render(template, run, latest) if template else _display_harness_output(latest)
         raise RuntimeError(f"不支持的节点类型：{node.type}")
 
     @staticmethod
@@ -645,6 +654,8 @@ class WorkflowManager:
                 value = _lookup(run.outputs, key[6:])
             else:
                 value = _lookup({"input": run.input, "latest": latest, "nodes": run.outputs}, key)
+            if key == "latest" or key.startswith("nodes."):
+                value = _display_harness_output(value)
             return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", replace, template)
 
@@ -697,6 +708,13 @@ def _lookup(value: Any, path: str) -> Any:
         else:
             return None
     return current
+
+
+def _display_harness_output(value: Any) -> Any:
+    """Return the model answer when a node receives a Harness task envelope."""
+    if isinstance(value, dict) and isinstance(value.get("text"), str) and isinstance(value.get("task"), dict):
+        return value["text"]
+    return value
 
 
 def _cron_matches(expression: str, now: datetime) -> bool:
@@ -753,12 +771,19 @@ def _cron_field_matches(field: str, value: int, bounds: tuple[int, int]) -> bool
     return False
 
 
-def validate_executable_workflow(project: ProjectSpec, workflow: WorkflowSpec, runtime: bool = False) -> list[str]:
+def validate_executable_workflow(
+    project: ProjectSpec,
+    workflow: WorkflowSpec,
+    runtime: bool = False,
+    require_output: bool = True,
+) -> list[str]:
     errors: list[str] = []
     nodes = {node.id: node for node in workflow.nodes}
     if not nodes:
         errors.append("工作流没有节点")
         return errors
+    if len(nodes) != len(workflow.nodes):
+        errors.append("工作流包含重复节点编号")
     for edge in workflow.edges:
         if edge.source not in nodes or edge.target not in nodes:
             errors.append(f"连线引用了不存在的节点：{edge.source} → {edge.target}")
@@ -769,8 +794,16 @@ def validate_executable_workflow(project: ProjectSpec, workflow: WorkflowSpec, r
     inbound_ids = {edge.target for edge in workflow.edges}
     webhook_paths: set[str] = set()
     for node in workflow.nodes:
-        if runtime and node.type in {"llm", "agent", "tool", "code"} and node.data.get("agent_id") not in agent_ids:
-            errors.append(f"节点 {node.id} 未选择有效的 Harness 智能体")
+        if runtime and node.type in {"llm", "agent", "tool", "code", "validator"}:
+            agent_id = node.data.get("agent_id")
+            if node.type != "validator" or agent_id:
+                if agent_id not in agent_ids:
+                    errors.append(f"节点 {node.id} 未选择有效的 Harness 智能体")
+            if node.type != "validator" or agent_id:
+                if not str(node.data.get("prompt") or node.data.get("description") or "").strip():
+                    errors.append(f"节点 {node.id} 缺少可执行 prompt")
+            elif not str(node.data.get("expression") or "").strip():
+                errors.append(f"验证器 {node.id} 缺少 agent_id 或 expression")
         if node.type in {"manual_trigger", "webhook", "schedule"} and node.id in inbound_ids:
             errors.append(f"触发器节点 {node.id} 不能有入边")
         if node.type == "schedule" and not str(node.data.get("cron", "")).strip():
@@ -795,11 +828,16 @@ def validate_executable_workflow(project: ProjectSpec, workflow: WorkflowSpec, r
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"循环节点 {node.id} 的次数必须是 1 到 100")
+    indegree: dict[str, int] = {}
+    incoming: dict[str, list[str]] = {}
+    outgoing: dict[str, list[str]] = {}
     if not errors:
         indegree = {node_id: 0 for node_id in nodes}
+        incoming = {node_id: [] for node_id in nodes}
         outgoing = {node_id: [] for node_id in nodes}
         for edge in workflow.edges:
             indegree[edge.target] += 1
+            incoming[edge.target].append(edge.source)
             outgoing[edge.source].append(edge.target)
         queue = [node_id for node_id, degree in indegree.items() if degree == 0]
         visited = 0
@@ -812,4 +850,28 @@ def validate_executable_workflow(project: ProjectSpec, workflow: WorkflowSpec, r
                     queue.append(target)
         if visited != len(nodes):
             errors.append("工作流包含图循环；请使用循环节点表达有限次数循环")
+    if require_output and not errors:
+        output_ids = {node_id for node_id, node in nodes.items() if node.type == "output"}
+        if not output_ids:
+            errors.append("工作流至少需要一个 output 节点")
+        elif len(nodes) > 1:
+            for node_id, node in nodes.items():
+                if node.type != "output" and not outgoing[node_id]:
+                    errors.append(f"节点 {node_id} 没有连接到后续节点")
+                if node.type == "output" and incoming[node_id] == []:
+                    errors.append(f"输出节点 {node_id} 没有上游输入")
+            reverse: dict[str, set[str]] = {node_id: set() for node_id in nodes}
+            for edge in workflow.edges:
+                reverse[edge.target].add(edge.source)
+            reaches_output: set[str] = set(output_ids)
+            stack = list(output_ids)
+            while stack:
+                node_id = stack.pop()
+                for parent in reverse[node_id]:
+                    if parent not in reaches_output:
+                        reaches_output.add(parent)
+                        stack.append(parent)
+            missing = sorted(set(nodes) - reaches_output)
+            if missing:
+                errors.append(f"节点无法到达 output：{', '.join(missing)}")
     return errors

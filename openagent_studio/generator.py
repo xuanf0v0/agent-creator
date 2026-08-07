@@ -105,7 +105,7 @@ INCREMENTAL_STEP_PROMPT = """你是 OpenAgent Studio 的增量工作流构建器
 硬约束：
 1. add/update 每次只能包含一个 node；本步 edges 必须全部与该 node 直接相连。禁止同时改其他节点。
 2. 新增节点后必须立即接入当前图；除第一个节点外禁止孤立节点。创建分支时，每轮只创建分支中的一个节点并连接，下一轮再创建另一个。
-3. 优先保持当前已通过探测的节点不变；只有失败证据明确指向旧节点时才 update/delete。
+3. 优先保持当前已通过探测的节点不变。运行失败时必须先根据失败证据诊断原因，再使用 update_node 修复原节点的参数、提示词、输入映射或连线；失败重试阶段严禁 delete_node。只有用户本轮明确要求删除某个节点时才允许 delete_node。
 4. 节点必须使用合法具体 type；AI 节点必须填写可用 agent_id 和完整 prompt；结束时至少有一个 output 节点。
 5. 只有当前图已完整满足用户目标、包含必要分支和输出时才 complete。不要因为本层通过探测就提前 complete。
 6. probe_input 和 probe_approvals 必须让本次新增/修改的节点在本层真实探测中被执行，尤其要覆盖条件分支。
@@ -365,10 +365,33 @@ class GeneratorManager:
                 feedback=json.dumps(failures[-5:], ensure_ascii=False),
                 layer=accepted_layers,
             )
+            if failures and not _explicit_delete_request(generation.prompt):
+                prompt += (
+                    "\n本轮处于失败修复阶段。请先阅读最近失败证据并明确诊断原因；"
+                    "必须优先返回 update_node 修复已存在节点的参数、prompt、输入映射或连线。"
+                    "禁止返回 delete_node，也不要用删除节点来规避运行错误。"
+                )
             raw = self._invoke_result(
                 generation, spec, command, workdir, prompt,
                 f"增量构建第 {accepted_layers + 1} 层（迭代 {iteration}）",
             )
+            raw_action = raw.get("action") if isinstance(raw, dict) else None
+            if failures and raw_action == "delete_node" and not _explicit_delete_request(generation.prompt):
+                failure = {
+                    "phase": "repair_policy",
+                    "message": "运行失败后的修复阶段禁止删除节点；必须先根据失败证据使用 update_node 修复原节点",
+                    "node_id": raw.get("node_id") or raw.get("id"),
+                    "iteration": iteration,
+                }
+                failures.append(failure)
+                generation.emit("generation.layer_failed", failure)
+                generation.emit("generation.repairing", {
+                    "phase": "repair_policy",
+                    "node_id": failure["node_id"],
+                    "message": failure["message"],
+                    "strategy": "update_existing_node",
+                })
+                continue
             try:
                 candidate, action, touched_node_id, probe_input, probe_approvals, summary = _apply_incremental_step(
                     current, raw, generation.harness_agent_ids,
@@ -377,7 +400,24 @@ class GeneratorManager:
                 failure = {"phase": "step_contract", "message": str(exc), "iteration": iteration}
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
+                generation.emit("generation.repairing", {
+                    "phase": failure["phase"], "node_id": failure.get("node_id"),
+                    "message": failure.get("message") or "已收集失败证据，下一轮将诊断并修复原节点",
+                    "strategy": "diagnose_then_update",
+                })
                 continue
+
+            # Expose the model's validated incremental result immediately so
+            # the Studio canvas can render the new node/parameters while the
+            # runtime probe is still running. A later preview event restores
+            # the last accepted graph if the probe rejects this candidate.
+            generation.emit("workflow.preview", {
+                "workflow": candidate.model_dump(mode="json"),
+                "layer": accepted_layers + 1,
+                "action": action,
+                "node_id": touched_node_id,
+                "summary": summary,
+            })
 
             generation.emit("generation.step_proposed", {
                 "action": action, "node_id": touched_node_id, "summary": summary,
@@ -398,6 +438,17 @@ class GeneratorManager:
                 }
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
+                generation.emit("generation.repairing", {
+                    "phase": failure["phase"], "node_id": failure.get("node_id"),
+                    "message": "结构检查未通过，下一轮将根据错误修复节点或连线",
+                    "strategy": "diagnose_then_update",
+                })
+                generation.emit("workflow.preview", {
+                    "workflow": current.model_dump(mode="json"),
+                    "layer": accepted_layers,
+                    "reverted": True,
+                    "reason": "connectivity",
+                })
                 continue
 
             if action == "complete":
@@ -432,7 +483,18 @@ class GeneratorManager:
                 }
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
+                generation.emit("generation.repairing", {
+                    "phase": failure["phase"], "node_id": failure.get("node_id"),
+                    "message": "完整验收未通过，下一轮将保留节点并修复失败原因",
+                    "strategy": "diagnose_then_update",
+                })
                 current.evaluation = candidate.evaluation.model_copy(deep=True)
+                generation.emit("workflow.preview", {
+                    "workflow": current.model_dump(mode="json"),
+                    "layer": accepted_layers,
+                    "reverted": True,
+                    "reason": "full_evaluation",
+                })
                 continue
 
             generation.emit("generation.stage", {
@@ -450,6 +512,17 @@ class GeneratorManager:
                 }
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
+                generation.emit("generation.repairing", {
+                    "phase": failure["phase"], "node_id": failure.get("node_id"),
+                    "message": "运行探测失败，下一轮将诊断 Harness/参数原因并修复原节点",
+                    "strategy": "diagnose_then_update",
+                })
+                generation.emit("workflow.preview", {
+                    "workflow": current.model_dump(mode="json"),
+                    "layer": accepted_layers,
+                    "reverted": True,
+                    "reason": "runtime_probe",
+                })
                 continue
             current = candidate
             generation.draft = current.model_dump(mode="json")
@@ -458,6 +531,13 @@ class GeneratorManager:
             generation.emit("generation.layer_completed", {
                 "layer": accepted_layers, "action": action, "node_id": touched_node_id,
                 "summary": summary, "nodes": len(current.nodes), "edges": len(current.edges),
+            })
+            generation.emit("workflow.updated", {
+                "workflow": current.model_dump(mode="json"),
+                "layer": accepted_layers,
+                "action": action,
+                "node_id": touched_node_id,
+                "summary": summary,
             })
 
     def _probe_incremental_workflow(
@@ -485,7 +565,17 @@ class GeneratorManager:
             live_execution=True,
         )
         try:
-            run = manager.start(project, workflow.id, body, policy=policy, record=False)
+            # Incremental layers are intentionally probed before an output
+            # node exists. The final `complete` path is still required to
+            # contain an output node by the strict connectivity checks.
+            run = manager.start(
+                project,
+                workflow.id,
+                body,
+                policy=policy,
+                record=False,
+                require_output=False,
+            )
         except (RuntimeError, ValueError) as exc:
             message = str(exc)
             if _is_harness_infrastructure_message(message):
@@ -724,6 +814,15 @@ class GeneratorManager:
             "pid": current_process.pid, "timeout_seconds": call_timeout, "model": generation.model,
         })
         assistant_text, diagnostics = "", []
+        event_counts: dict[str, int] = {}
+        tool_counts: dict[str, int] = {}
+        protocol_events = 0
+        reasoning_chars = 0
+        text_events = 0
+        tool_events = 0
+        last_event_at = started
+        last_event_type = "process_started"
+        last_tool: str | None = None
         code: int | None = None
         try:
             for raw in current_process.stdout:
@@ -735,6 +834,24 @@ class GeneratorManager:
                     if raw.strip():
                         diagnostics.append(raw.strip())
                     continue
+                protocol_events += 1
+                event_type = str(item.get("type") or "unknown")
+                event_counts[event_type] = event_counts.get(event_type, 0) + 1
+                last_event_at = time.monotonic()
+                last_event_type = event_type
+                part = item.get("part") or item.get("properties", {}).get("part")
+                if isinstance(part, dict):
+                    part_type = str(part.get("type") or "")
+                    if part_type:
+                        event_counts[part_type] = event_counts.get(part_type, 0) + 1
+                    if part_type == "reasoning":
+                        reasoning_chars += len(str(part.get("text") or ""))
+                    elif part_type == "text":
+                        text_events += 1
+                    elif part_type == "tool":
+                        tool_events += 1
+                        last_tool = str(part.get("tool") or part.get("name") or "unknown")
+                        tool_counts[last_tool] = tool_counts.get(last_tool, 0) + 1
                 if error := _extract_error(item):
                     diagnostics.append(error)
                 text = _extract_text(item)
@@ -754,9 +871,29 @@ class GeneratorManager:
                 "output_chars": len(assistant_text),
                 "diagnostics": [_redact_log_text(item) for item in diagnostics[-10:]],
                 "response_tail": _redact_log_text(assistant_text[-4000:]),
+                "protocol_events": protocol_events,
+                "event_counts": event_counts,
+                "tool_counts": tool_counts,
+                "reasoning_chars": reasoning_chars,
+                "text_events": text_events,
+                "tool_events": tool_events,
+                "last_event_type": last_event_type,
+                "last_tool": last_tool,
+                "last_activity_ms": round((last_event_at - started) * 1000),
+                "idle_at_exit_ms": round((time.monotonic() - last_event_at) * 1000),
             })
         if timed_out.is_set():
-            raise _OpenCodeTimeoutError(f"OpenCode 单次调用超时（{call_timeout} 秒）")
+            activity = (
+                f"协议事件 {protocol_events} 个，工具调用 {tool_events} 次，"
+                f"reasoning {reasoning_chars} 字，最终文本 {len(assistant_text)} 字；"
+                f"最后事件 {last_event_type}，最后工具 {last_tool or '无'}，"
+                f"最后活动距启动 {round((last_event_at - started) * 1000)} ms，"
+                f"超时前空闲 {round((time.monotonic() - last_event_at) * 1000)} ms"
+            )
+            raise _OpenCodeTimeoutError(
+                f"OpenCode 单次调用超时（{call_timeout} 秒）；{activity}。"
+                "详见 .openagent-logs/opencode.jsonl"
+            )
         if code == 0:
             return assistant_text
         detail = diagnostics[-1] if diagnostics else "没有返回错误详情"
@@ -1312,7 +1449,7 @@ def _incremental_connectivity_errors(
     *,
     require_output: bool,
 ) -> list[str]:
-    errors = validate_executable_workflow(project, candidate, runtime=True)
+    errors = validate_executable_workflow(project, candidate, runtime=True, require_output=require_output)
     node_ids = {node.id for node in candidate.nodes}
     edge_keys = [(edge.source, edge.target, edge.condition) for edge in candidate.edges]
     if len(edge_keys) != len(set(edge_keys)):
@@ -1349,6 +1486,10 @@ def _incremental_connectivity_errors(
         if invalid_sinks:
             errors.append(f"完整工作流的终点必须是 output 节点：{', '.join(invalid_sinks)}")
     return list(dict.fromkeys(errors))
+
+
+def _explicit_delete_request(prompt: str) -> bool:
+    return bool(re.search(r"(?:删除|移除|删掉|去掉|delete|remove)\s*[^。！？\n]{0,80}(?:节点|node)?", prompt, re.IGNORECASE))
 
 
 def _incremental_trigger_for_node(workflow: WorkflowSpec, touched_node_id: str | None) -> str | None:
