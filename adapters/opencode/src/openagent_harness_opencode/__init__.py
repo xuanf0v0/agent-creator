@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 from typing import Any, Mapping
 
 
@@ -100,6 +101,15 @@ def main() -> int:
         prompt = build_prompt(payload)
         environment = os.environ.copy()
         _load_env_file(args.env_file, environment)
+        # OpenCode writes its own protocol log under XDG_DATA_HOME. Harness
+        # seatbelt tasks may not write the user's home directory, so provide
+        # an isolated writable runtime directory for every invocation.
+        runtime_root = Path(tempfile.mkdtemp(prefix="openagent-opencode-") )
+        environment.setdefault("XDG_DATA_HOME", str(runtime_root / "data"))
+        environment.setdefault("XDG_CACHE_HOME", str(runtime_root / "cache"))
+        environment.setdefault("XDG_STATE_HOME", str(runtime_root / "state"))
+        for key in ("XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+            Path(environment[key]).mkdir(parents=True, exist_ok=True)
         binary = resolve_executable(args.binary, environment)
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         print(f"invalid Harness invocation: {exc}", file=sys.stderr, flush=True)
