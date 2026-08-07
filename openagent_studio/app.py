@@ -272,8 +272,24 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
     def generator_events(generation_id: str):
         try:
             generation = generator.require(generation_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="找不到生成任务") from exc
+        except KeyError:
+            # Generations are intentionally process-local. After Studio restarts,
+            # an already-open browser tab may reconnect its old EventSource.
+            # Return the existing terminal failure event so old and new browser
+            # bundles close instead of retrying a permanent 404 forever.
+            data = json.dumps({
+                "generation_id": generation_id,
+                "reason": "expired",
+                "message": "生成任务已失效（Studio 可能已重启），请重新发起优化",
+            }, ensure_ascii=False)
+
+            def expired_stream():
+                yield f"event: generation.failed\ndata: {data}\n\n"
+
+            return StreamingResponse(
+                expired_stream(), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
         def stream():
             cursor = 0

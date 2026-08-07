@@ -1,9 +1,9 @@
 from pathlib import Path
 from fastapi.testclient import TestClient
 from openagent_studio.app import create_app
-from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _with_file_prompt
+from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _EmptyCompactionError, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _with_file_prompt
 from openagent_studio.store import SpecStore
-from openagent_studio.models import EvaluationAssertion, ProjectSpec, QQIntegrationSpec, WorkflowEvaluation
+from openagent_studio.models import EvaluationAssertion, ProjectSpec, QQIntegrationSpec, WorkflowEvaluation, WorkflowSpec
 from openagent_studio.workflow_runner import EvaluationPolicy, WorkflowManager
 from openagent_studio.evaluation import CandidateResult, HarnessInfrastructureError, SemanticVerdict, WorkflowEvaluator, check_assertion, complexity_metrics
 from openagent_studio.workflow_runner import _cron_matches, _cron_valid
@@ -82,6 +82,17 @@ def test_ui_is_chinese(tmp_path: Path):
     assert "/assets/" in body
 
 
+def test_expired_generation_event_stops_stale_sse_reconnect(tmp_path: Path):
+    response = TestClient(create_app(tmp_path / "project.yaml")).get(
+        "/api/generator/generations/stale-generation/events",
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: generation.failed" in response.text
+    assert '"reason": "expired"' in response.text
+    assert "请重新发起优化" in response.text
+
+
 def test_form_options_and_validation(tmp_path: Path):
     client = TestClient(create_app(tmp_path / "project.yaml"))
     options = client.get("/api/form-options").json()
@@ -132,6 +143,62 @@ def test_generator_prompt_treats_canvas_as_complete_snapshot():
     assert "完整快照" in SYSTEM_PROMPT
     assert "不要只关注当前会话" in SYSTEM_PROMPT
     assert "以本轮提供的完整快照为准" in SYSTEM_PROMPT
+
+
+def test_generator_chat_reply_does_not_modify_workflow(monkeypatch, tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "对话", "project_dir": str(tmp_path),
+        "workflows": [{"id": "flow", "name": "原流程", "nodes": [
+            {"id": "result", "type": "output", "data": {"description": "返回结果"}},
+        ]}],
+    })
+    store.save(project)
+    manager = GeneratorManager(store)
+    generation = Generation(
+        id="chat", workflow_id="flow", base_etag=store.etag(),
+        draft=project.workflows[0].model_dump(mode="json"), prompt="这个输出节点有什么作用？",
+        model="provider/model", chat_routing=True,
+    )
+    manager.history["flow"] = [{"role": "user", "content": generation.prompt}]
+    monkeypatch.setattr("openagent_studio.generator.resolve_executable", lambda *_: "opencode")
+    prompts = []
+
+    def fake_invoke(*args, **_kwargs):
+        prompts.append(args[4])
+        return '<result>{"action":"reply","answer":"输出节点负责定义工作流最终返回值。"}</result>'
+
+    manager._invoke = fake_invoke
+    original_etag = store.etag()
+    manager._run(generation, project)
+
+    assert "当前工作流" in prompts[0]
+    assert "用户本轮消息：这个输出节点有什么作用？" in prompts[0]
+    assert store.etag() == original_etag
+    assert [item["event"] for item in generation.events] == [
+        "generation.started", "generation.stage", "chat.assistant.delta", "chat.completed",
+    ]
+    assert generation.events[-1]["data"]["message"] == "输出节点负责定义工作流最终返回值。"
+    assert manager.history["flow"][-1] == {"role": "assistant", "content": "输出节点负责定义工作流最终返回值。"}
+
+
+def test_generator_chat_router_can_return_complete_modify_request(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    workflow = WorkflowSpec.model_validate({"id": "flow", "name": "流程", "nodes": [], "edges": []})
+    generation = Generation(id="chat-modify", workflow_id="flow", base_etag="etag", draft={}, prompt="加一个审批", model="provider/model")
+    manager.history["flow"] = [
+        {"role": "assistant", "content": "审批放在哪里？"},
+        {"role": "user", "content": "验证之前"},
+    ]
+    manager._invoke_result = lambda *_args, **_kwargs: {
+        "action": "modify", "request": "在验证节点之前增加人工审批节点，并保持其他节点不变。",
+    }
+
+    decision = manager._route_chat_turn(generation, ProjectSpec(name="测试"), ["opencode"], tmp_path, workflow)
+
+    assert decision == {
+        "action": "modify", "request": "在验证节点之前增加人工审批节点，并保持其他节点不变。",
+    }
 
 
 def test_generator_normalizes_generic_task_nodes_and_edges():
@@ -199,6 +266,25 @@ def test_generator_retries_invalid_structured_result_once(tmp_path: Path):
     assert manager._invoke_result(generation, None, [], tmp_path, "生成结果", "候选工作流") == {"ok": True}
     assert len(prompts) == 2
     assert "上一次没有返回可解析" in prompts[1]
+
+
+def test_generator_writes_redacted_opencode_jsonl(monkeypatch, tmp_path: Path):
+    log_path = tmp_path / "logs" / "opencode.jsonl"
+    monkeypatch.setenv("OPENAGENT_OPENCODE_LOG", str(log_path))
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="log-call", workflow_id="flow", base_etag="etag", draft={}, prompt="x")
+
+    manager._write_opencode_log(generation, {
+        "purpose": "候选工作流 1",
+        "status": "failed",
+        "diagnostics": ["Authorization: Bearer secret-value", "api_key=sk-12345678901234567890"],
+    })
+
+    record = json.loads(log_path.read_text(encoding="utf-8"))
+    assert record["generation_id"] == "log-call"
+    assert record["purpose"] == "候选工作流 1"
+    assert "secret-value" not in json.dumps(record)
+    assert "sk-12345678901234567890" not in json.dumps(record)
 
 
 def test_generator_normalizes_evaluation_collection_fields():
@@ -300,6 +386,42 @@ def test_generator_retries_evaluation_with_missing_assertions_and_criteria(tmp_p
     assert "boundary 缺少 semantic_criteria 语义质量标准" in prompts[1]
 
 
+def test_generator_retries_evaluation_when_comparison_expected_is_missing(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="evaluation-expected-repair", workflow_id="flow", base_etag="etag", draft={}, prompt="优化")
+    invalid = {"cases": [
+        {
+            "id": case_id, "name": case_id, "input": value,
+            "assertions": [{"path": "output", "operator": "equals"}],
+            "semantic_criteria": ["输出与输入一致"],
+        }
+        for case_id, value in (("normal", "hello"), ("boundary", ""), ("failure", "特殊字符"))
+    ]}
+    valid = {"cases": [
+        {
+            "id": case_id, "name": case_id, "input": value,
+            "assertions": [{"path": "output", "operator": "equals", "expected": value}],
+            "semantic_criteria": ["输出与输入一致"],
+        }
+        for case_id, value in (("normal", "hello"), ("boundary", ""), ("failure", "特殊字符"))
+    ]}
+    responses = iter((invalid, valid))
+    prompts = []
+
+    def fake_invoke_result(*args):
+        prompts.append(args[-2])
+        return next(responses)
+
+    manager._invoke_result = fake_invoke_result
+    evaluation = manager._generate_evaluation(
+        generation, ProjectSpec(name="测试"), ["opencode", "run"], tmp_path,
+        "生成验收用例", WorkflowEvaluation(),
+    )
+    assert [case.assertions[0].expected for case in evaluation.cases] == ["hello", "", "特殊字符"]
+    assert len(prompts) == 2
+    assert "normal 缺少 非 exists 断言缺少 expected（output:equals）" in prompts[1]
+
+
 def test_generator_reports_case_ids_when_evaluation_requirements_are_missing():
     evaluation = WorkflowEvaluation.model_validate({"cases": [
         {"id": "missing-check", "name": "缺断言", "semantic_criteria": ["输出有效"]},
@@ -361,6 +483,44 @@ def test_generator_surfaces_compaction_failure_without_fallback(monkeypatch, tmp
     else:
         raise AssertionError("上下文提炼错误不应被兜底吞掉")
     assert [item["event"] for item in generation.events] == ["generation.context_compacting"]
+
+
+def test_generator_retries_empty_compaction_once_with_same_path(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENCODE_COMPACT_PROMPT_LENGTH", "4000")
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="compact-empty", workflow_id="flow", base_etag="etag", draft={}, prompt="x", model="provider/model")
+    calls = []
+
+    def compact(*args):
+        calls.append(args[3])
+        if len(calls) == 1:
+            raise _EmptyCompactionError("OpenCode 内部上下文提炼没有返回内容")
+        return "严格重试后的非空摘要"
+
+    manager._compact_prompt = compact
+    prompt = "必须完整保留的工作流上下文" * 1000
+
+    assert manager._prepare_prompt(generation, ProjectSpec(name="测试"), ["opencode"], tmp_path, prompt) == "严格重试后的非空摘要"
+    assert calls[0] == prompt
+    assert "上一次提炼进程成功退出但返回了空内容" in calls[1]
+    assert prompt in calls[1]
+    assert [item["event"] for item in generation.events] == [
+        "generation.context_compacting", "generation.context_compaction_retry", "generation.context_compacted",
+    ]
+
+
+def test_generator_surfaces_second_empty_compaction(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENCODE_COMPACT_PROMPT_LENGTH", "4000")
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="compact-empty-twice", workflow_id="flow", base_etag="etag", draft={}, prompt="x", model="provider/model")
+    manager._compact_prompt = lambda *_args: (_ for _ in ()).throw(_EmptyCompactionError("empty"))
+
+    try:
+        manager._prepare_prompt(generation, ProjectSpec(name="测试"), ["opencode"], tmp_path, "长上下文" * 1000)
+    except _EmptyCompactionError as exc:
+        assert "自动严格重试 1 次后仍没有返回内容" in str(exc)
+    else:
+        raise AssertionError("连续两次空提炼不应被兜底吞掉")
 
 
 def test_generator_keeps_full_prompt_after_compaction_timeout(monkeypatch, tmp_path: Path):
@@ -824,13 +984,18 @@ def test_live_acceptance_uses_formal_harness_execution_path():
     assert run.id not in manager.runs
 
 
-def test_generator_builds_three_isolated_candidates_and_saves_shortest(tmp_path: Path):
+def test_generator_builds_one_node_per_layer_and_saves_after_full_verification(tmp_path: Path):
     store = SpecStore(tmp_path / "project.yaml")
-    project = ProjectSpec.model_validate({"version": "1", "name": "候选", "project_dir": str(tmp_path), "workflows": [{"id": "flow", "name": "原流程", "nodes": [{"id": "old", "type": "output", "data": {"description": "旧结果"}}]}]})
+    project = ProjectSpec.model_validate({"version": "1", "name": "增量", "project_dir": str(tmp_path), "workflows": [{"id": "flow", "name": "原流程", "nodes": []}]})
     store.save(project)
     manager = GeneratorManager(store)
-    generation = Generation(id="best", workflow_id="flow", base_etag=store.etag(), draft=project.workflows[0].model_dump(mode="json"), prompt="优化", model="provider/model")
-    candidate_prompts = []
+    generation = Generation(id="incremental", workflow_id="flow", base_etag=store.etag(), draft=project.workflows[0].model_dump(mode="json"), prompt="创建输入后输出的流程", model="provider/model")
+    steps = iter([
+        {"action": "add_node", "node": {"id": "start", "type": "manual_trigger", "data": {"description": "接收输入"}}, "edges": [], "summary": "创建入口"},
+        {"action": "add_node", "node": {"id": "done", "type": "output", "data": {"description": "输出结果"}}, "edges": [{"source": "start", "target": "done"}], "summary": "创建出口"},
+        {"action": "complete", "summary": "入口和出口已经连通"},
+    ])
+    planning_prompts = []
 
     def fake_invoke(generation, spec, command, workdir, prompt):
         if "验收设计师" in prompt:
@@ -839,24 +1004,23 @@ def test_generator_builds_three_isolated_candidates_and_saves_shortest(tmp_path:
                 "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": ["输出有效"],
             } for index in range(1, 4)]
             return f"<result>{json.dumps({'cases': cases}, ensure_ascii=False)}</result>"
-        if "工作流架构师" in prompt:
-            candidate_prompts.append(prompt)
-            count = 1 if "minimal：" in prompt else 2 if "balanced：" in prompt else 3
-            nodes = [{"id": f"node-{index}", "type": "output", "data": {"description": f"结果 {index}"}} for index in range(count)]
-            return f"<result>{json.dumps({'id': 'flow', 'name': '候选', 'nodes': nodes, 'edges': []}, ensure_ascii=False)}</result>"
+        if "增量工作流构建器" in prompt:
+            planning_prompts.append(prompt)
+            return f"<result>{json.dumps(next(steps), ensure_ascii=False)}</result>"
         if "独立 OpenCode 验证智能体" in prompt:
             return '<result>{"passed":true,"score":90,"issues":[]}</result>'
         raise AssertionError(prompt)
 
     manager._invoke = fake_invoke
+    manager._probe_incremental_workflow = lambda *_args: []
     manager._run(generation, project)
-    assert len(candidate_prompts) == 3
-    assert all("WorkflowSpec 严格契约" in prompt for prompt in candidate_prompts)
-    assert all("只能填写为 agent/llm/tool/code/validator 节点的 data.agent_id" in prompt for prompt in candidate_prompts)
-    assert [item["data"]["stage"] for item in generation.events if item["event"] == "generation.stage"] == ["preparing_cases", "generating", "validating", "evaluating", "verifying", "selecting", "saving"]
+    assert len(planning_prompts) == 3
+    assert all("一次只处理一个节点" in prompt for prompt in planning_prompts)
+    assert len([item for item in generation.events if item["event"] == "generation.layer_completed"]) == 2
     assert generation.events[-1]["event"] == "generation.completed", generation.events[-1]
     saved = store.load().workflows[0]
-    assert len(saved.nodes) == 1
+    assert [node.id for node in saved.nodes] == ["start", "done"]
+    assert [(edge.source, edge.target) for edge in saved.edges] == [("start", "done")]
     assert len(saved.evaluation.cases) == 3
 
 
@@ -890,7 +1054,7 @@ def test_generator_fails_before_model_calls_when_harness_is_unavailable(monkeypa
     assert "Harness 验收运行时不可用" in generation.events[-1]["data"]["message"]
 
 
-def test_generator_all_failed_candidates_preserve_original(tmp_path: Path):
+def test_generator_invalid_incremental_layers_preserve_original(monkeypatch, tmp_path: Path):
     store = SpecStore(tmp_path / "project.yaml")
     project = ProjectSpec.model_validate({"version": "1", "name": "失败保护", "project_dir": str(tmp_path), "workflows": [{"id": "flow", "name": "原流程", "nodes": [{"id": "original", "type": "output", "data": {"description": "不可覆盖"}}]}]})
     store.save(project)
@@ -898,53 +1062,52 @@ def test_generator_all_failed_candidates_preserve_original(tmp_path: Path):
     manager = GeneratorManager(store)
     generation = Generation(id="failed", workflow_id="flow", base_etag=original_etag, draft=project.workflows[0].model_dump(mode="json"), prompt="优化", model="provider/model")
 
+    monkeypatch.setenv("OPENAGENT_INCREMENTAL_MAX_ITERATIONS", "3")
+    attempts = 0
+
     def fake_invoke(generation, spec, command, workdir, prompt):
-        if "验收设计师" in prompt:
-            cases = [{"id": f"case-{i}", "name": "失败", "input": i, "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": ["必须优秀"]} for i in range(3)]
-            return f"<result>{json.dumps({'cases': cases}, ensure_ascii=False)}</result>"
-        if "工作流架构师" in prompt or "工作流修复工程师" in prompt:
-            return '<result>{"id":"flow","name":"失败候选","nodes":[{"id":"candidate","type":"output","data":{"description":"候选"}}],"edges":[]}</result>'
-        return '<result>{"passed":false,"score":20,"issues":["结果不符合标准"]}</result>'
+        nonlocal attempts
+        attempts += 1
+        step = {"action": "add_node", "node": {"id": f"orphan-{attempts}", "type": "output", "data": {}}, "edges": []}
+        return f"<result>{json.dumps(step)}</result>"
 
     manager._invoke = fake_invoke
     manager._run(generation, project)
     assert generation.events[-1]["event"] == "generation.failed"
-    assert len([item for item in generation.events if item["event"] == "generation.stage" and item["data"]["stage"] == "repairing"]) == 2
+    assert len([item for item in generation.events if item["event"] == "generation.layer_failed"]) == 3
     assert store.etag() == original_etag
     assert store.load().workflows[0].nodes[0].id == "original"
 
 
-def test_generator_skips_one_malformed_repair_candidate(tmp_path: Path):
+def test_generator_retries_same_layer_after_runtime_probe_failure(tmp_path: Path):
     store = SpecStore(tmp_path / "project.yaml")
-    project = ProjectSpec.model_validate({"version": "1", "name": "修复容错", "project_dir": str(tmp_path), "workflows": [{"id": "flow", "name": "原流程", "nodes": [{"id": "original", "type": "output", "data": {"description": "旧结果"}}]}]})
+    project = ProjectSpec.model_validate({"version": "1", "name": "探测重试", "project_dir": str(tmp_path), "workflows": [{"id": "flow", "name": "原流程", "nodes": []}]})
     store.save(project)
     manager = GeneratorManager(store)
-    generation = Generation(id="repair", workflow_id="flow", base_etag=store.etag(), draft=project.workflows[0].model_dump(mode="json"), prompt="优化", model="provider/model")
-    repairs = 0
+    generation = Generation(id="probe-retry", workflow_id="flow", base_etag=store.etag(), draft=project.workflows[0].model_dump(mode="json"), prompt="创建输出流程", model="provider/model")
+    steps = iter([
+        {"action": "add_node", "node": {"id": "done", "type": "output", "data": {}}, "edges": []},
+        {"action": "add_node", "node": {"id": "done", "type": "output", "data": {"template": "{{latest}}"}}, "edges": []},
+        {"action": "complete"},
+    ])
 
     def fake_invoke(generation, spec, command, workdir, prompt):
-        nonlocal repairs
         if "验收设计师" in prompt:
             cases = [{"id": f"case-{i}", "name": "用例", "input": i, "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": ["有效"]} for i in range(3)]
             return f"<result>{json.dumps({'cases': cases}, ensure_ascii=False)}</result>"
-        if "工作流架构师" in prompt:
-            return '<result>{"id":"flow","name":"候选","nodes":[{"id":"bad","type":"output","data":{}}],"edges":[]}</result>'
-        if "工作流修复工程师" in prompt:
-            repairs += 1
-            if repairs <= 2:
-                return "不是 JSON"
-            return '<result>{"id":"flow","name":"修复候选","nodes":[{"id":"good","type":"output","data":{}}],"edges":[]}</result>'
-        return '<result>{"passed":false,"score":10,"issues":["不通过"]}</result>'
+        if "增量工作流构建器" in prompt:
+            return f"<result>{json.dumps(next(steps), ensure_ascii=False)}</result>"
+        return '<result>{"passed":true,"score":90,"issues":[]}</result>'
 
     manager._invoke = fake_invoke
-    manager._evaluate_candidates = lambda generation, spec, candidates, evaluator: [
-        CandidateResult(index=index, workflow=item, passed=item.nodes[0].id == "good", cases=[], metrics=(0, 0, 0, 0, 0, 0.0, 0), errors=[])
-        for index, item in enumerate(candidates)
-    ]
-    manager._finalize = lambda generation: setattr(generation, "completed", True) or generation.emit("generation.completed", {"workflow": generation.draft, "etag": "test"})
+    probes = iter((["模拟的本层执行失败"], []))
+    manager._probe_incremental_workflow = lambda *_args: next(probes)
     manager._run(generation, project)
     assert generation.events[-1]["event"] == "generation.completed", generation.events[-1]
-    assert any(item["event"] == "generation.repair_candidate_failed" for item in generation.events)
+    failures = [item for item in generation.events if item["event"] == "generation.layer_failed"]
+    assert len(failures) == 1
+    assert failures[0]["data"]["phase"] == "runtime_probe"
+    assert len([item for item in generation.events if item["event"] == "generation.layer_completed"]) == 1
 
 
 def _platform_project(env_file: Path) -> dict:

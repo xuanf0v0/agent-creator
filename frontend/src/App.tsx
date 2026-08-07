@@ -230,9 +230,20 @@ function StudioCanvas() {
     setGenerationId(started.generation_id)
     const source = new EventSource(`/api/generator/generations/${started.generation_id}/events`)
     const listen = (name: string, handler: (data: any) => void) => source.addEventListener(name, (event) => handler(JSON.parse((event as MessageEvent).data)))
-    const stages: Record<string, string> = { checking_runtime: '正在检查 Harness 验收运行时…', preparing_cases: '正在准备验收用例…', generating: '正在生成 3 个独立候选…', validating: '正在校验候选结构…', evaluating: '正在真实试运行验收用例…', verifying: '独立 OpenCode 正在确认每项标准通过…', selecting: '正在选择最短且最清晰的通过方案…', repairing: '候选未通过，OpenCode 正在根据验证结果修复…', saving: '正在原子保存已验证通过的工作流…' }
+    const stages: Record<string, string> = {
+      understanding: 'OpenCode 正在理解问题和判断是否需要修改画布…',
+      checking_runtime: '正在检查 Harness 验收运行时…',
+      planning_layer: '正在规划下一层节点或分支…',
+      preparing_cases: '正在准备完整验收用例…',
+      validating_node: '正在检查新节点与连线的结构连通性…',
+      probing_layer: '正在真实探测当前层节点…',
+      full_evaluating: '正在完整验收当前工作流…',
+      layer_failed: '当前层未通过，正在根据失败证据重建…',
+      saving: '正在保存完整验收通过的工作流…',
+    }
     listen('generation.stage', ({ stage, round }) => setMessage(`${stages[stage] || '正在优化工作流…'}${round ? `（第 ${round} 轮）` : ''}`))
     listen('generation.context_compacting', ({ before_chars }) => setMessage(`上下文较长（${before_chars} 字），正在提炼重点…`))
+    listen('generation.context_compaction_retry', () => setMessage('首次上下文提炼返回空内容，正在使用同一 OpenCode compaction Agent 严格重试…'))
     listen('generation.context_compacted', ({ before_chars, after_chars, used }) => setMessage(used ? `上下文已从 ${before_chars} 字压缩至 ${after_chars} 字，正在继续生成…` : '上下文无需压缩，正在继续生成…'))
     listen('generation.context_compaction_failed', ({ before_chars }) => setMessage(`上下文提炼超时，已保留 ${before_chars} 字完整上下文继续生成…`))
     listen('chat.assistant.delta', ({ text }) => setChatMessages((items) => {
@@ -240,8 +251,13 @@ function StudioCanvas() {
       if (last?.role === 'assistant') return [...items.slice(0, -1), { ...last, content: last.content + text }]
       return [...items, { role: 'assistant', content: text }]
     }))
-    listen('generation.completed', ({ workflow: completed, etag: tag }) => {
-      applyCompletedWorkflow(completed, tag); setGenerationId(null); setMessage(successMessage); source.close()
+    listen('chat.completed', () => {
+      setGenerationId(null); setMessage('OpenCode 已回复'); source.close()
+    })
+    listen('generation.completed', ({ workflow: completed, etag: tag, assistant_message }) => {
+      applyCompletedWorkflow(completed, tag)
+      if (assistant_message) setChatMessages((items) => [...items, { role: 'assistant', content: assistant_message }])
+      setGenerationId(null); setMessage(successMessage); source.close()
     })
     const finishError = (text: string) => { setGenerationId(null); setMessage(text); setChatMessages((items) => [...items, { role: 'system', content: text }]); source.close() }
     listen('generation.failed', ({ message: text }) => finishError(`优化失败：${text}`))
@@ -359,9 +375,9 @@ function StudioCanvas() {
         <div className="chat-messages">
           {chatMessages.length === 0 && <div className="chat-empty"><p>你可以这样说：</p><button onClick={() => setChatInput('创建一个代码审查流程，先分析代码，再人工审批，最后运行测试')}>创建代码审查流程</button><button onClick={() => setChatInput('在当前流程的验证前增加一个人工审批节点')}>增量修改当前流程</button></div>}
           {chatMessages.map((item, index) => <div key={index} className={`chat-message ${item.role}`}><span>{item.role === 'user' ? '你' : item.role === 'assistant' ? 'AI' : '!'}</span><p>{item.content}</p></div>)}
-          {generationId && <div className="thinking"><i/><i/><i/><span>OpenCode 正在生成节点…</span></div>}
+          {generationId && <div className="thinking"><i/><i/><i/><span>OpenCode 正在思考…</span></div>}
         </div>
-        <div className="chat-composer"><textarea autoFocus value={chatInput} disabled={!!generationId} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); generateFromChat() } }} placeholder="例如：创建代码审查流程，分析代码后等待人工审批，最后运行测试…"/>
+        <div className="chat-composer"><textarea autoFocus value={chatInput} disabled={!!generationId} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); generateFromChat() } }} placeholder="可以询问当前工作流，也可以要求创建、修改或优化节点…"/>
           {generationId ? <button className="stop" onClick={stopGeneration}>停止生成</button> : <button className="send" onClick={generateFromChat} disabled={!chatInput.trim()}>发送并构建工作流</button>}
         </div>
       </div> : rightTab === 'evaluation' ? <div className="run-panel evaluation-panel">

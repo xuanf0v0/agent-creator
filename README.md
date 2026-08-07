@@ -9,7 +9,7 @@
 - 编译 OpenCode 配置，并通过独立 `agent-harness-sdk` 调用稳定 `/api/v1`；
 - React + TypeScript + React Flow 正规前端；
 - 画布式节点拖放、连线、属性编辑、缩放和小地图；
-- OpenCode 驱动的 AI 对话生成器，生成多个隔离候选并只采用真实运行通过的最佳工作流；
+- OpenCode 驱动的 AI 对话生成器，按节点和层级增量构建，并只保存真实运行通过的完整工作流；
 - 接入独立 my-harness 的 Workflow 执行器，支持任务提交、状态、日志、结果和取消；
 - 条件分支、并行调度、有限循环、人工审批、验证器、输出聚合和运行取消；
 - 基于 SSE 的实时节点状态、Harness 任务进度和运行事件面板。
@@ -70,15 +70,15 @@ Studio 不读取 `AGENT_HARNESS_MANAGEMENT_TOKEN`。管理 Token 只应存在于
 
 ```powershell
 .\scripts\install-harness.ps1
-.\scripts\start-harness.ps1
-# 在另一个 PowerShell 中
 .\scripts\register-harness-agent.ps1
 .\scripts\start-studio.ps1
 ```
 
+`start-studio.ps1` 默认会自动启动本机独立 Harness，等待 `/api/v1/capabilities` 协商到 v1 后再启动 Studio；重复执行不会启动第二个 Harness。若启动失败，脚本会直接显示 Harness 原始错误，完整输出保存在 `.harness/start-harness.stdout.log` 和 `.harness/start-harness.stderr.log`。若 Harness 已由其他方式管理，使用 `-SkipHarness` 跳过自动启动。远程 `HarnessUrl` 也不会被本脚本代管。
+
 默认安装目录是 `D:\Projects\my-harness`。它拥有独立虚拟环境、`state` 目录、空 bootstrap
 manifest 目录和 `.runtime.env`。`catalog.json` 由 Harness 管理；注册脚本只在运维侧读取管理
-Token。`start-studio.ps1` 只把任务 Token 注入 Studio 进程。OpenCode 适配器位于
+Token。`start-studio.ps1` 会把任务 Token 注入 Studio 进程。OpenCode 适配器位于
 `adapters/opencode`，是独立可安装包，不导入 `openagent_studio`。
 
 OpenCode 生成器使用本机 `opencode run --format json`。可通过
@@ -88,25 +88,28 @@ Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整
 当前项目的生成对话和 Harness 代码任务都明确使用 `deepseek/deepseek-v4-flash`。前者负责理解需求和
 生成工作流，后者通过独立的 `openagent-harness-opencode` 适配器执行实际 Agent 任务。
 页面首次打开会显示 OpenCode 创作对话框；关闭后可通过顶部“OpenCode 创建”按钮或
-右侧“AI 创建”页签重新打开。每次 AI 创建或修改都会先生成验收用例和三套隔离候选。候选不会边生成
-边污染当前画布；Studio 会沿正式 `WorkflowManager → agent-harness-sdk → /api/v1` 路径逐个真实执行，
-Agent、工具、HTTP 与子工作流均使用正式运行语义。只有运行到 `completed`、输出检查通过，
-并由独立 OpenCode 验证会话明确返回 `passed=true` 且评分不低于 80 的候选才能进入排序和保存。
-失败证据会交给 OpenCode 进行有限轮修复并重新完整执行；仍未通过、取消或发生 ETag 冲突时保留原工作流。
+右侧“AI 创建”页签重新打开。创作助手支持连续对话：询问概念、当前画布、节点作用、设计建议或错误原因时会直接由真实 OpenCode 回答，不修改画布；需求不完整时会先追问，只有明确要求创建、增加、删除、连接、调整或优化工作流时才进入修改流程。
+
+进入修改流程后，生成器会逐层增量构建：一次只提出一个节点或一条变更，先做节点/连线引用、DAG 和弱连通性检查，再沿正式 `WorkflowManager → agent-harness-sdk → /api/v1` 路径真实探测当前层；通过后才接受该层并继续下一个节点或分支。收到 `complete` 后生成并锁定验收用例，执行完整工作流验收；完整验收失败时保留已通过部分，把失败证据交回 OpenCode，继续在同一层循环修复，直到通过、用户取消或 Harness 基础设施直接报错。中间草稿不会写入 `project.yaml`，取消或失败时保留原工作流。
 验收运行不写入普通运行历史。
 
 生成器通过标准输入以 UTF-8 传递提示词，不依赖 Windows 命令行长度或模型不可见的文件附件。超过
 `OPENCODE_COMPACT_PROMPT_LENGTH`（默认 12000 字）的上下文会先由禁用工具的 compaction Agent
 无损提炼，提炼默认最多等待 `OPENCODE_COMPACTION_TIMEOUT=30` 秒。提炼超时时会保留原始完整上下文继续生成，
-并在当前生成任务中跳过后续提炼；其他提炼错误仍会直接终止并把真实错误返回页面；
+并在当前生成任务中跳过后续提炼；进程成功退出但返回空内容时，会沿同一模型和同一 compaction Agent 严格重试一次，再次为空或其他提炼错误仍会直接终止并把真实错误返回页面；
 正式生成继续使用 OpenCode 原生 `plan` 创作助手，不切换到其他兜底 Agent。
 
 右侧“验收标准”可编辑真实运行输入、输出检查、语义目标、审批决策和单用例超时。确定性断言只负责在
 真实运行完成后检查输出字段、值、类型或格式，不能代替真实执行。审批节点在无人值守验收时使用用例中的
-决策；其他节点不使用 Mock。`OPENCODE_OPTIMIZATION_REPAIR_ROUNDS` 可设置自动修复轮数，默认 2，最大 5。
+决策；其他节点不使用 Mock。增量层探测默认最多等待 `OPENAGENT_INCREMENTAL_PROBE_TIMEOUT=120` 秒；
+`OPENAGENT_INCREMENTAL_MAX_ITERATIONS` 可设置最大增量迭代次数，默认 `0` 表示不设上限，直到通过或用户点击停止生成。
 OpenCode 生成调用默认最多等待 120 秒（`OPENCODE_GENERATOR_CALL_TIMEOUT`，范围 30–1800）；
 修复候选默认最多等待 60 秒（`OPENCODE_REPAIR_CALL_TIMEOUT`，范围 30–600），修复超时不会重复请求，
 以免多个候选串行等待造成无意义的长时间阻塞。
+每次 OpenCode 调用还会把用途、进程号、退出码、耗时、超时、诊断摘要和响应尾部写入
+`.openagent-logs/opencode.jsonl`；日志已过滤常见 Bearer/API key/token 字段，不记录完整提示词。
+可通过 `OPENAGENT_OPENCODE_LOG` 指定其他日志文件路径。日志写入失败不会改变生成任务的真实结果。
+Windows 下可在另一个 PowerShell 中运行 `.\scripts\tail-opencode-log.ps1` 实时查看最近 50 条调用记录。
 生成器会把可用 Harness Agent 清单交给模型，并要求每个节点同时生成执行参数：Agent
 必须包含 `agent_id` 和完整 `prompt`，提示词/循环/输出节点包含 `template`，条件节点包含
 `expression` 与分支条件。后端会拒绝不存在的 Agent，并为遗漏的可选参数补充可执行默认值。
