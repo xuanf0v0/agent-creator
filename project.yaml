@@ -36,6 +36,10 @@ harness:
   description: 独立 my-harness 治理下的真实 OpenCode CLI 任务
   backend_id: default
   agent_id: coding
+  labels:
+    runtime.example/implementation: openagent-harness-opencode
+    runtime.example/model: deepseek/deepseek-v4-flash
+  protocol: stdin_json
 workflows:
 - id: product-selection
   name: 智能选品决策流程

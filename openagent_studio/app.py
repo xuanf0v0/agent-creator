@@ -333,10 +333,18 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
             try:
                 client = create_harness_client(backend_id, timeout=2)
                 capabilities = client.capabilities()
+                task_agents = None
+                task_agent_error = ""
+                try:
+                    task_agents = client.task_agents()
+                except (HarnessAPIError, httpx.HTTPError, AttributeError) as exc:
+                    task_agent_error = str(exc)
                 backends[backend_id] = {
                     "running": True,
                     "api_version": capabilities.get("api", {}).get("selected_version"),
                     "capabilities": capabilities,
+                    "task_agents": task_agents,
+                    "task_agent_error": task_agent_error,
                     "error": "",
                 }
             except (HarnessAPIError, httpx.HTTPError, RuntimeError) as exc:
@@ -344,6 +352,8 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
                     "running": False,
                     "api_version": None,
                     "capabilities": None,
+                    "task_agents": None,
+                    "task_agent_error": "",
                     "error": str(exc),
                 }
             finally:

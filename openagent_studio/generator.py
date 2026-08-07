@@ -300,6 +300,10 @@ class GeneratorManager:
             live_execution=True,
             harness_base_url=os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"),
         )
+        evaluator.task_agent_requirements = {
+            item.agent_id: {"labels": item.labels, "protocol": item.protocol}
+            for item in spec.harness if item.agent_id
+        }
         try:
             if generation.chat_routing:
                 generation.emit("generation.stage", {"stage": "understanding"})
@@ -1520,6 +1524,11 @@ def _is_harness_infrastructure_message(message: str) -> bool:
         "Harness 请求失败（502）",
         "Harness 请求失败（503）",
         "Harness 请求失败（504）",
+        "environment drift",
+        "setup required",
+        "setup_required",
+        "agent environment setup is required",
+        "agent setup or runtime is in error",
     ))
 
 

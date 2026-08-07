@@ -54,6 +54,8 @@ Studio 固定依赖 [xuanf0v0/my-harness](https://github.com/xuanf0v0/my-harness
 提交 `bea70fb812e98f530d262eeccb5a889b51dc821d` 的独立 Python SDK。所有任务只走
 `/api/v1/tasks`、状态、日志、结果和取消接口，不再包含旧 `/api/tasks` 或服务代理兼容路径。
 `project.yaml` 的 Harness 项只保存逻辑 ID、`backend_id` 和 Harness Catalog 中的 `agent_id`。
+任务客户端还会通过 `/api/v1/task-agents`（仅需 Task Token）检查 Agent 的通用 labels、协议和 setup readiness；
+缺失、身份不匹配或 `setup_required` 会在首次 OpenCode 调用前快速失败，不会交给模型修复。
 
 相关环境变量：
 
@@ -72,6 +74,12 @@ Studio 不读取 `AGENT_HARNESS_MANAGEMENT_TOKEN`。管理 Token 只应存在于
 .\scripts\install-harness.ps1
 .\scripts\register-harness-agent.ps1
 .\scripts\start-studio.ps1
+```
+
+macOS 可使用同等的一键编排入口：
+
+```bash
+./scripts/start-studio.sh
 ```
 
 `start-studio.ps1` 默认会自动启动本机独立 Harness，等待 `/api/v1/capabilities` 协商到 v1 后再启动 Studio；重复执行不会启动第二个 Harness。若启动失败，脚本会直接显示 Harness 原始错误，完整输出保存在 `.harness/start-harness.stdout.log` 和 `.harness/start-harness.stderr.log`。若 Harness 已由其他方式管理，使用 `-SkipHarness` 跳过自动启动。远程 `HarnessUrl` 也不会被本脚本代管。

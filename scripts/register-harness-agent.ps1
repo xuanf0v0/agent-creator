@@ -24,6 +24,10 @@ $Manifest = @{
     id = "coding"
     name = "OpenCode Coding Agent"
     description = "Independent OpenCode adapter used by OpenAgent Studio"
+    labels = @{
+        "runtime.example/implementation" = "openagent-harness-opencode"
+        "runtime.example/model" = "deepseek/deepseek-v4-flash"
+    }
     cwd = $ProjectRoot
     env_file = (Join-Path $ProjectRoot ".env")
     task = @{
@@ -50,4 +54,13 @@ $SetupHeaders = @{
     "Idempotency-Key" = "coding-setup-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
 }
 Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/agents/coding/setup" -Headers $SetupHeaders | Out-Null
-Write-Host "coding Agent 已注册到独立 Harness，环境状态已准备"
+for ($attempt = 0; $attempt -lt 120; $attempt++) {
+    $Status = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/agents/coding" -Headers $Headers
+    if ($Status.lifecycle_state -eq "ready") {
+        Write-Host "coding Agent 已注册到独立 Harness，环境状态已准备"
+        exit 0
+    }
+    if ($Status.lifecycle_state -eq "error") { throw "coding Agent setup 失败：$($Status.latest_setup.error_code)" }
+    Start-Sleep -Milliseconds 500
+}
+throw "coding Agent setup 未在 60 秒内 ready"

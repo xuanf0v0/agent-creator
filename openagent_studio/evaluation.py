@@ -163,6 +163,7 @@ class WorkflowEvaluator:
                     raise HarnessInfrastructureError(
                         f"Harness 后端 {backend_id} 未协商到 API v1；候选工作流未进入无效修复。"
                     )
+                self._ensure_task_agents(client, backend_id)
             except (httpx.HTTPError, HarnessAPIError, RuntimeError) as exc:
                 if isinstance(exc, HarnessInfrastructureError):
                     raise
@@ -173,6 +174,37 @@ class WorkflowEvaluator:
             finally:
                 if client is not None:
                     client.close()
+
+    def _ensure_task_agents(self, client: Any, backend_id: str) -> None:
+        discover = getattr(client, "task_agents", None)
+        if discover is None:
+            return
+        expected = getattr(self, "task_agent_requirements", {})
+        records = discover()
+        by_id = {str(item.get("id")): item for item in records if isinstance(item, dict)}
+        for agent_id, requirement in expected.items():
+            descriptor = by_id.get(agent_id)
+            if descriptor is None:
+                raise HarnessInfrastructureError(f"Harness 后端 {backend_id} 缺少任务 Agent {agent_id}；请注册正确的 Agent")
+            self._validate_task_descriptor(backend_id, descriptor, requirement)
+
+    @staticmethod
+    def _validate_task_descriptor(backend_id: str, descriptor: dict[str, Any], requirement: dict[str, Any]) -> None:
+        readiness = descriptor.get("readiness") or {}
+        state = readiness.get("state")
+        if not descriptor.get("enabled", False):
+            raise HarnessInfrastructureError(f"Harness 后端 {backend_id} 的任务 Agent 已禁用")
+        if state != "ready" or not descriptor.get("accepts_tasks", False):
+            code = readiness.get("error_code") or state or "not_ready"
+            raise HarnessInfrastructureError(f"Harness 后端 {backend_id} 的任务 Agent 未就绪（{code}）；请先完成 setup")
+        expected_protocol = requirement.get("protocol")
+        actual_protocol = (descriptor.get("protocol") or {}).get("kind")
+        if expected_protocol and actual_protocol != expected_protocol:
+            raise HarnessInfrastructureError(f"Harness 后端 {backend_id} 的任务协议不匹配（需要 {expected_protocol}，实际 {actual_protocol or 'unknown'}）")
+        expected_labels = requirement.get("labels") or {}
+        labels = descriptor.get("labels") or {}
+        if any(labels.get(key) != value for key, value in expected_labels.items()):
+            raise HarnessInfrastructureError(f"Harness 后端 {backend_id} 的任务 Agent 身份标签不匹配；请更新注册配置")
 
     def evaluate(self, project: ProjectSpec, workflow: WorkflowSpec, index: int) -> CandidateResult:
         validation = validate_executable_workflow(project, workflow, runtime=True)

@@ -72,6 +72,12 @@ if (-not $SkipHarness -and $harnessUri.Host -in @("127.0.0.1", "localhost", "::1
     Write-Host "HarnessUrl 不是本机地址，跳过自动启动：$HarnessUrl"
 }
 
+$registerScript = Join-Path $PSScriptRoot "register-harness-agent.ps1"
+if (-not $SkipHarness -and (Test-Path -LiteralPath $registerScript)) {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $registerScript -HarnessRoot $HarnessRoot -BaseUrl $HarnessUrl
+    if ($LASTEXITCODE -ne 0) { throw "Harness Agent 注册/setup 失败" }
+}
+
 $env:AGENT_HARNESS_URL = $HarnessUrl
 $env:AGENT_HARNESS_TASK_TOKEN = $TaskTokenLine.Split("=", 2)[1]
 $PythonBin = Join-Path $ProjectRoot ".venv\Scripts\python.exe"

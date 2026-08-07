@@ -53,6 +53,8 @@ class HarnessSpec(BaseModel):
     description: str = ""
     backend_id: str = Field(default="default", pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
     agent_id: str | None = Field(default=None, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    labels: dict[str, str] = Field(default_factory=dict)
+    protocol: str = "stdin_json"
 
     @model_validator(mode="after")
     def default_agent_id(self):
