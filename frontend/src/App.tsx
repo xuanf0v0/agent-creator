@@ -4,8 +4,8 @@ import {
   SelectionMode, addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
   type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange,
 } from '@xyflow/react'
-import { cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadSpec, optimizeWorkflow, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
-import type { EvaluationCase, IntegrationsStatus, NodeKind, ProjectSpec, Workflow, WorkflowRun } from './types'
+import { cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadRuntimeStatus, loadSpec, optimizeWorkflow, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
+import type { EvaluationCase, IntegrationsStatus, NodeKind, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
 
 type CatalogItem = { type: NodeKind; category: string; label: string; icon: string; description: string }
 const nodeCatalog: CatalogItem[] = [
@@ -104,6 +104,7 @@ function StudioCanvas() {
   const [runEvents, setRunEvents] = useState<string[]>([])
   const [libraryQuery, setLibraryQuery] = useState('')
   const [integrations, setIntegrations] = useState<IntegrationsStatus>({ feishu: [], qq: [] })
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null)
   const { screenToFlowPosition, fitView } = useReactFlow()
 
   const workflow = useMemo(() => spec?.workflows.find((item) => item.id === workflowId), [spec, workflowId])
@@ -138,6 +139,7 @@ function StudioCanvas() {
 
   useEffect(() => { loadGeneratorStatus().then((status) => setGeneratorModel(status.ready ? status.model : `${status.model}（缺少 ${status.credential_env}）`)).catch((error: Error) => setGeneratorModel(error.message)) }, [])
   useEffect(() => { loadIntegrationsStatus().then(setIntegrations).catch(() => setIntegrations({ feishu: [], qq: [] })) }, [])
+  useEffect(() => { loadRuntimeStatus().then(setRuntimeStatus).catch(() => setRuntimeStatus(null)) }, [])
 
   const onNodesChange = useCallback((changes: NodeChange<CanvasNode>[]) => setNodes((items) => applyNodeChanges(changes, items)), [])
   const onEdgesChange = useCallback((changes: EdgeChange[]) => setEdges((items) => applyEdgeChanges(changes, items)), [])
@@ -451,7 +453,7 @@ function StudioCanvas() {
       </>}
     </aside>
 
-    <footer className="console"><span className="status-dot"/><strong>运行控制台</strong><span>{message}</span><span className="console-meta">{nodes.length} 个节点 · {edges.length} 条连线</span></footer>
+    <footer className="console"><span className="status-dot"/><strong>运行控制台</strong><span>{message}</span><span className="console-meta">{nodes.length} 个节点 · {edges.length} 条连线</span>{runtimeStatus && !runtimeStatus.running && <span className="runtime-warning">Harness 未就绪：需要注册/setup/修正配置</span>}</footer>
   </div>
 }
 

@@ -235,7 +235,7 @@ class WorkflowEvaluator:
                 run.cancel_event.set()
                 result = CaseResult(case.id, False, errors=["验收执行超时"])
             elif run.status != "completed":
-                if run.error.startswith((
+                if run.error_code in {"setup_required", "agent_process_failed", "agent_timeout", "agent_permission_denied", "sandbox_unavailable", "sandbox_denied", "protocol_output_invalid"} or run.error.startswith((
                     "Harness 不可用：",
                     "Harness 基础设施错误：",
                     "Harness 任务 API 契约不兼容：",

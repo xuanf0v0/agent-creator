@@ -339,12 +339,40 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
                     task_agents = client.task_agents()
                 except (HarnessAPIError, httpx.HTTPError, AttributeError) as exc:
                     task_agent_error = str(exc)
+                expected = {item.agent_id: item for item in spec.harness if item.backend_id == backend_id and item.agent_id}
+                identity_mismatch: list[str] = []
+                readiness: dict[str, object] = {}
+                for agent_id, requirement in expected.items():
+                    descriptor = next((item for item in (task_agents or []) if str(item.get("id")) == agent_id), None)
+                    if descriptor is None:
+                        identity_mismatch.append(f"缺少任务 Agent {agent_id}")
+                        continue
+                    labels = descriptor.get("labels") or {}
+                    required_labels = requirement.labels or {}
+                    if any(labels.get(key) != value for key, value in required_labels.items()):
+                        identity_mismatch.append(f"任务 Agent {agent_id} 身份标签不匹配")
+                    item_readiness = descriptor.get("readiness") or {}
+                    readiness[agent_id] = {
+                        "state": item_readiness.get("state"),
+                        "error_code": item_readiness.get("error_code"),
+                        "accepts_tasks": descriptor.get("accepts_tasks", False),
+                    }
+                actionable = ""
+                if task_agent_error:
+                    actionable = "需要检查 Harness API v1 和任务 Token"
+                elif identity_mismatch:
+                    actionable = "需要使用管理权限注册正确的 coding Agent"
+                elif any(item.get("state") != "ready" or not item.get("accepts_tasks") for item in readiness.values()):
+                    actionable = "需要完成 Harness Agent setup"
                 backends[backend_id] = {
                     "running": True,
                     "api_version": capabilities.get("api", {}).get("selected_version"),
                     "capabilities": capabilities,
                     "task_agents": task_agents,
                     "task_agent_error": task_agent_error,
+                    "identity_mismatch": identity_mismatch,
+                    "readiness": readiness,
+                    "actionable_error": actionable,
                     "error": "",
                 }
             except (HarnessAPIError, httpx.HTTPError, RuntimeError) as exc:
@@ -354,6 +382,9 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
                     "capabilities": None,
                     "task_agents": None,
                     "task_agent_error": "",
+                    "identity_mismatch": [],
+                    "readiness": {},
+                    "actionable_error": "需要启动正确的 Harness 实例",
                     "error": str(exc),
                 }
             finally:

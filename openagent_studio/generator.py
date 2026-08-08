@@ -67,7 +67,7 @@ disconnect_nodes: {"action":"disconnect_nodes","source":"来源节点","target":
 1. llm/agent/tool/code 节点必须从“可用 Harness 智能体”中选择 agent_id，并填写具体、可执行、包含输入上下文的 prompt；不要只复述节点名称。
 2. prompt 节点必须填写 template；condition 必须填写 expression，并给出带 true/false condition 的出边。
 3. iteration/loop 必须填写 1-100 的 iterations 和 template；validator 如选择智能体必须填写 agent_id 和 prompt。
-4. 模板可使用 {{input}}、{{latest}}、{{nodes.节点ID}}，循环模板还可使用 {{index}}。
+4. 模板只可使用 {{input}}、{{latest}}、{{nodes.节点ID}}，循环模板还可使用 {{index}}；不要发明 inputs、input_mapping、task、fields 等未声明字段。AI 节点必须把输入引用直接写入 prompt，output 节点必须把上游引用写入 template。
 5. 每个任务提示词要写明角色、目标、输入、约束和预期输出，确保单独交给智能体也能执行。
 6. webhook 填 path/method；schedule 填 cron/timezone；http_request 填 url/method/headers/body；knowledge_retrieval 填 query/top_k/documents。
 7. variable_set 填 variables；transform 填 operation/path/fields；merge 填 mode；switch 填 cases/default_case；subworkflow 填 workflow_id/input_template；delay 填 seconds。
@@ -288,7 +288,7 @@ class GeneratorManager:
         environment = self._environment(spec)
         binary = resolve_executable(os.environ.get("OPENCODE_BIN", "opencode"), environment)
         command = [
-            binary, "run", "--format", "json", "--agent", os.environ.get("OPENCODE_GENERATOR_AGENT", "plan"),
+            binary, "run", "--pure", "--format", "json", "--agent", os.environ.get("OPENCODE_GENERATOR_AGENT", "openagent-generator"),
             "--title", f"OpenAgent生成-{generation.workflow_id}",
         ]
         workdir = Path(spec.project_dir).expanduser()
@@ -370,11 +370,14 @@ class GeneratorManager:
                 layer=accepted_layers,
             )
             if failures and not _explicit_delete_request(generation.prompt):
-                prompt += (
-                    "\n本轮处于失败修复阶段。请先阅读最近失败证据并明确诊断原因；"
-                    "必须优先返回 update_node 修复已存在节点的参数、prompt、输入映射或连线。"
-                    "禁止返回 delete_node，也不要用删除节点来规避运行错误。"
-                )
+                latest_failure = failures[-1]
+                failed_node = str(latest_failure.get("node_id") or "")
+                candidate_was_accepted = bool(latest_failure.get("candidate_accepted"))
+                if latest_failure.get("action") == "add_node" and not candidate_was_accepted and failed_node not in {node.id for node in current.nodes}:
+                    repair_rule = f"该 add_node 候选已回滚，节点 {failed_node or '<unknown>'} 不在当前图中；必须使用 add_node 以相同合法 id 重新创建它。"
+                else:
+                    repair_rule = "失败节点已存在于当前 accepted graph；必须使用 update_node 修复其参数、prompt、输入映射或连线。"
+                prompt += f"\n本轮处于失败修复阶段。请先阅读最近失败证据并明确诊断原因；{repair_rule}禁止返回 delete_node，也不要用删除节点来规避运行错误。"
             raw = self._invoke_result(
                 generation, spec, command, workdir, prompt,
                 f"增量构建第 {accepted_layers + 1} 层（迭代 {iteration}）",
@@ -383,9 +386,11 @@ class GeneratorManager:
             if failures and raw_action == "delete_node" and not _explicit_delete_request(generation.prompt):
                 failure = {
                     "phase": "repair_policy",
-                    "message": "运行失败后的修复阶段禁止删除节点；必须先根据失败证据使用 update_node 修复原节点",
+                    "message": "运行失败后的修复阶段禁止删除节点；必须根据 accepted graph 判断使用 add_node 重建或 update_node 修复",
                     "node_id": raw.get("node_id") or raw.get("id"),
                     "iteration": iteration,
+                    "action": raw_action,
+                    "candidate_accepted": False,
                 }
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
@@ -393,7 +398,7 @@ class GeneratorManager:
                     "phase": "repair_policy",
                     "node_id": failure["node_id"],
                     "message": failure["message"],
-                    "strategy": "update_existing_node",
+                    "strategy": "recreate_or_update_accepted_node",
                 })
                 continue
             try:
@@ -401,13 +406,13 @@ class GeneratorManager:
                     current, raw, generation.harness_agent_ids,
                 )
             except (ValidationError, ValueError, RuntimeError) as exc:
-                failure = {"phase": "step_contract", "message": str(exc), "iteration": iteration}
+                failure = {"phase": "step_contract", "message": str(exc), "iteration": iteration, "action": raw_action, "candidate_accepted": False}
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
                     "phase": failure["phase"], "node_id": failure.get("node_id"),
                     "message": failure.get("message") or "已收集失败证据，下一轮将诊断并修复原节点",
-                    "strategy": "diagnose_then_update",
+                    "strategy": "recreate_or_update_accepted_node",
                 })
                 continue
 
@@ -438,14 +443,14 @@ class GeneratorManager:
             if static_errors:
                 failure = {
                     "phase": "connectivity", "errors": static_errors, "action": action,
-                    "node_id": touched_node_id, "iteration": iteration,
+                    "node_id": touched_node_id, "iteration": iteration, "candidate_accepted": False,
                 }
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
                     "phase": failure["phase"], "node_id": failure.get("node_id"),
                     "message": "结构检查未通过，下一轮将根据错误修复节点或连线",
-                    "strategy": "diagnose_then_update",
+                    "strategy": "recreate_or_update_accepted_node",
                 })
                 generation.emit("workflow.preview", {
                     "workflow": current.model_dump(mode="json"),
@@ -483,14 +488,15 @@ class GeneratorManager:
                     return candidate
                 failure = {
                     "phase": "full_evaluation", "feedback": self._result_feedback(result),
-                    "iteration": iteration,
+                    "iteration": iteration, "action": action, "node_id": touched_node_id,
+                    "candidate_accepted": False,
                 }
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
                     "phase": failure["phase"], "node_id": failure.get("node_id"),
                     "message": "完整验收未通过，下一轮将保留节点并修复失败原因",
-                    "strategy": "diagnose_then_update",
+                    "strategy": "recreate_or_update_accepted_node",
                 })
                 current.evaluation = candidate.evaluation.model_copy(deep=True)
                 generation.emit("workflow.preview", {
@@ -512,14 +518,14 @@ class GeneratorManager:
             if probe_errors:
                 failure = {
                     "phase": "runtime_probe", "errors": probe_errors, "action": action,
-                    "node_id": touched_node_id, "iteration": iteration,
+                    "node_id": touched_node_id, "iteration": iteration, "candidate_accepted": False,
                 }
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
                     "phase": failure["phase"], "node_id": failure.get("node_id"),
                     "message": "运行探测失败，下一轮将诊断 Harness/参数原因并修复原节点",
-                    "strategy": "diagnose_then_update",
+                    "strategy": "recreate_or_update_accepted_node",
                 })
                 generation.emit("workflow.preview", {
                     "workflow": current.model_dump(mode="json"),
@@ -597,9 +603,9 @@ class GeneratorManager:
             run.cancel_event.set()
             return [f"第 {touched_node_id or '当前'} 层真实探测超时"]
         if run.status != "completed":
-            if _is_harness_infrastructure_message(run.error):
+            if run.error_code or _is_harness_infrastructure_message(run.error):
                 raise HarnessInfrastructureError(
-                    f"Harness 增量层探测基础设施失败：{run.error}。当前层未进入无效重建。"
+                    f"Harness 增量层探测基础设施失败（code={run.error_code or 'unknown'}）：{run.error}。当前层未进入无效重建。"
                 )
             return [run.error or f"增量层状态为 {run.status}"]
         if touched_node_id and touched_node_id in run.node_states:
@@ -645,7 +651,7 @@ class GeneratorManager:
         environment: dict[str, str],
     ) -> str:
         command = [
-            binary, "run", "--format", "json", "--agent", os.environ.get("OPENCODE_COMPACTION_AGENT", "compaction"),
+            binary, "run", "--pure", "--format", "json", "--agent", os.environ.get("OPENCODE_COMPACTION_AGENT", "openagent-generator"),
             "--title", "OpenAgent内部上下文提炼",
             "--model", model,
         ]
@@ -898,6 +904,14 @@ class GeneratorManager:
                 f"OpenCode 单次调用超时（{call_timeout} 秒）；{activity}。"
                 "详见 .openagent-logs/opencode.jsonl"
             )
+        if tool_events:
+            raise RuntimeError(
+                f"OpenCode 生成器违反无工具契约：检测到 {tool_events} 次工具调用（最后工具 {last_tool or 'unknown'}）；"
+                "请使用 openagent-generator，而不是带工具的 Agent。"
+            )
+        permission_diagnostics = [item for item in diagnostics if "permission requested" in item.lower() or "external_directory" in item.lower()]
+        if permission_diagnostics:
+            raise RuntimeError("OpenCode 生成器触发了被禁止的权限请求；请检查无工具 Agent 配置")
         if code == 0:
             return assistant_text
         detail = diagnostics[-1] if diagnostics else "没有返回错误详情"
@@ -1317,6 +1331,10 @@ def _normalize_workflow_result(
             for key in NODE_DATA_FIELDS:
                 if key not in data and key in raw_node:
                     data[key] = raw_node[key]
+            if "prompt" not in data and isinstance(data.get("task"), str):
+                data["prompt"] = data["task"]
+            if "inputs" not in data and isinstance(data.get("input_mapping"), dict):
+                data["inputs"] = data["input_mapping"]
             description = str(data.get("description") or raw_node.get("name") or raw_node.get("title") or raw_node.get("id") or "任务")
             data.setdefault("description", description)
             raw_type = str(raw_node.get("type", "")).strip().lower()
@@ -1344,6 +1362,10 @@ def _normalize_workflow_result(
                 node["type"] = "manual_trigger"
             elif raw_type in {"end", "finish", "terminal", "result", "final"}:
                 node["type"] = "output"
+            if node.get("type") == "output" and "template" not in data:
+                mapping = data.get("input_mapping")
+                if isinstance(mapping, dict) and len(mapping) == 1:
+                    data["template"] = next(iter(mapping.values()))
             node["data"] = data
             nodes.append(node)
         normalized["nodes"] = nodes
@@ -1529,7 +1551,10 @@ def _is_harness_infrastructure_message(message: str) -> bool:
         "setup_required",
         "agent environment setup is required",
         "agent setup or runtime is in error",
-    ))
+    )) or any(f"code={code}" in str(message) for code in {
+        "setup_required", "agent_process_failed", "agent_timeout", "agent_permission_denied",
+        "sandbox_unavailable", "sandbox_denied", "protocol_output_invalid",
+    })
 
 
 def _normalize_evaluation_result(value: Any) -> Any:

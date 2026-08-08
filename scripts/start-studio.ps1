@@ -31,6 +31,20 @@ function Test-HarnessReady([string]$Url) {
     }
 }
 
+function Assert-HarnessInstance([string]$Url, [string]$Root) {
+    $instanceFile = Join-Path (Join-Path $Root "state") "instance.json"
+    if (-not (Test-Path -LiteralPath $instanceFile)) { throw "8765 已有 Harness，但缺少预期 state instance；拒绝接入未知实例" }
+    $expected = (Get-Content -LiteralPath $instanceFile -Raw | ConvertFrom-Json).instance_id
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.UseProxy = $false
+    $client = New-Object System.Net.Http.HttpClient -ArgumentList $handler
+    try {
+        $client.Timeout = [TimeSpan]::FromSeconds(2)
+        $actual = ($client.GetStringAsync(($Url.TrimEnd("/") + "/api/v1/capabilities")).GetAwaiter().GetResult() | ConvertFrom-Json).instance.instance_id
+    } finally { $client.Dispose(); $handler.Dispose() }
+    if (-not $expected -or $expected -ne $actual) { throw "8765 上的 Harness instance 与预期 state 不匹配；拒绝继续" }
+}
+
 $harnessUri = [Uri]$HarnessUrl
 if (-not $SkipHarness -and $harnessUri.Host -in @("127.0.0.1", "localhost", "::1")) {
     $harnessScript = Join-Path $PSScriptRoot "start-harness.ps1"
@@ -71,6 +85,8 @@ if (-not $SkipHarness -and $harnessUri.Host -in @("127.0.0.1", "localhost", "::1
 } elseif (-not $SkipHarness) {
     Write-Host "HarnessUrl 不是本机地址，跳过自动启动：$HarnessUrl"
 }
+
+Assert-HarnessInstance $HarnessUrl $HarnessRoot
 
 $registerScript = Join-Path $PSScriptRoot "register-harness-agent.ps1"
 if (-not $SkipHarness -and (Test-Path -LiteralPath $registerScript)) {

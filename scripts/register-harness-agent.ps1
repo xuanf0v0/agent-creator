@@ -19,22 +19,25 @@ Get-Content -LiteralPath $RuntimeEnv | ForEach-Object {
     }
 }
 if (-not $Secrets.AGENT_HARNESS_MANAGEMENT_TOKEN) { throw "缺少 Harness 管理 Token" }
+if (-not $Secrets.AGENT_HARNESS_TASK_TOKEN) { throw "缺少 Harness 任务 Token" }
 
 $Manifest = @{
     id = "coding"
-    name = "OpenCode Coding Agent"
-    description = "Independent OpenCode adapter used by OpenAgent Studio"
+    name = "OpenCode Text Coding Agent"
+    description = "Independent no-tools OpenCode text adapter used by OpenAgent Studio"
     labels = @{
         "runtime.example/implementation" = "openagent-harness-opencode"
         "runtime.example/model" = "deepseek/deepseek-v4-flash"
+        "runtime.example/capability" = "text-generation"
+        "runtime.example/sandbox" = "read-only"
     }
     cwd = $ProjectRoot
     env_file = (Join-Path $ProjectRoot ".env")
     task = @{
-        command = @($AdapterBin, "--model", "deepseek/deepseek-v4-flash", "--agent", "plan", "--env-file", (Join-Path $ProjectRoot ".env"))
+        command = @($AdapterBin, "--model", "deepseek/deepseek-v4-flash", "--agent", "openagent-runtime-text", "--env-file", (Join-Path $ProjectRoot ".env"))
         protocol = @{ kind = "stdin_json" }
         verification = @(@{ name = "adapter import"; command = @($PythonBin, "-c", "import openagent_harness_opencode"); timeout_seconds = 30 })
-        tools = @{ allow = @("read", "network"); ask = @(); deny = @("write", "edit", "destructive") }
+        tools = @{ allow = @("network"); ask = @(); deny = @("read", "write", "edit", "bash", "task", "destructive") }
         sandbox = @{ enabled = $true; backend = "auto"; enforcement = "best_effort"; network = "allow"; workspace_write = $false }
     }
 }
@@ -49,18 +52,29 @@ if ($Existing.id -contains "coding") {
 } else {
     Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/v1/agents" -Headers $Headers -ContentType "application/json" -Body $Body | Out-Null
 }
+$sha = [Security.Cryptography.SHA256]::Create()
+$ManifestHash = [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Body))).ToLowerInvariant()
+$sha.Dispose()
 $SetupHeaders = @{
     Authorization = "Bearer $($Secrets.AGENT_HARNESS_MANAGEMENT_TOKEN)"
-    "Idempotency-Key" = "coding-setup-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    "Idempotency-Key" = "coding-setup-$ManifestHash"
 }
 Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/agents/coding/setup" -Headers $SetupHeaders | Out-Null
+$ready = $false
 for ($attempt = 0; $attempt -lt 120; $attempt++) {
     $Status = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/agents/coding" -Headers $Headers
     if ($Status.lifecycle_state -eq "ready") {
         Write-Host "coding Agent 已注册到独立 Harness，环境状态已准备"
-        exit 0
+        $ready = $true
+        break
     }
     if ($Status.lifecycle_state -eq "error") { throw "coding Agent setup 失败：$($Status.latest_setup.error_code)" }
     Start-Sleep -Milliseconds 500
 }
-throw "coding Agent setup 未在 60 秒内 ready"
+if (-not $ready) { throw "coding Agent setup 未在 60 秒内 ready" }
+$DescriptorHeaders = @{ Authorization = "Bearer $($Secrets.AGENT_HARNESS_TASK_TOKEN)"; "X-Harness-Supported-Versions" = "1" }
+$Descriptor = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/v1/task-agents/coding" -Headers $DescriptorHeaders
+$labels = $Descriptor.labels
+if (-not ($Descriptor.enabled -and $Descriptor.accepts_tasks -and $Descriptor.readiness.state -eq "ready" -and $Descriptor.protocol.kind -eq "stdin_json" -and $labels.'runtime.example/implementation' -eq "openagent-harness-opencode" -and $labels.'runtime.example/capability' -eq "text-generation")) {
+    throw "coding task-agent descriptor 不匹配或未 ready"
+}

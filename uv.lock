@@ -5,11 +5,11 @@ requires-python = ">=3.11"
 [[package]]
 name = "agent-harness-sdk"
 version = "0.1.0"
-source = { url = "https://github.com/xuanf0v0/my-harness/archive/b59f344a83ec6dfba03b32c906c11e5060e160e9.zip", subdirectory = "sdk/python" }
+source = { url = "https://github.com/xuanf0v0/my-harness/archive/d73a00704b98b343a36369989b299a3f71fc721c.zip", subdirectory = "sdk/python" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { hash = "sha256:e8dc206c3d4723d0e66a8003b7bbec05b9cb7485a0b657d05d7470a2e6fcf32a" }
+sdist = { hash = "sha256:bf0e4046871a20620add0a9e32442fe7304ff90d0576a229ca4ad019850c8d40" }
 
 [package.metadata]
 requires-dist = [{ name = "httpx", specifier = ">=0.27,<1" }]
@@ -368,7 +368,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-harness-sdk", url = "https://github.com/xuanf0v0/my-harness/archive/b59f344a83ec6dfba03b32c906c11e5060e160e9.zip", subdirectory = "sdk/python" },
+    { name = "agent-harness-sdk", url = "https://github.com/xuanf0v0/my-harness/archive/d73a00704b98b343a36369989b299a3f71fc721c.zip", subdirectory = "sdk/python" },
     { name = "cryptography", specifier = ">=43,<47" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", specifier = ">=0.27,<1" },

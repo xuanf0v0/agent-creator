@@ -147,6 +147,7 @@ input:focus, select:focus, textarea:focus { outline: 0; border-color: hsl(var(--
 .console strong { color: hsl(var(--text) / .74); font-weight: 500; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: hsl(var(--text) / .8); box-shadow: 0 0 0 3px hsl(var(--line) / .08); }
 .console-meta { margin-left: auto; color: hsl(var(--text) / .38); }
+.runtime-warning { color: #f0b36a; }
 .run-panel { padding-bottom: 18px; }
 .run-panel > label { display: flex; flex-direction: column; gap: 7px; padding: 14px 16px 8px; color: hsl(var(--text) / .68); font-size: 12px; font-weight: 500; }
 .run-panel textarea { min-height: 96px; resize: vertical; }

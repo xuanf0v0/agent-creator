@@ -47,6 +47,7 @@ class WorkflowRun:
     started_at: float | None = None
     completed_at: float | None = None
     error: str = ""
+    error_code: str = ""
     depth: int = 0
     trigger_node_id: str | None = None
     active_task_ids: set[str] = field(default_factory=set)
@@ -69,6 +70,7 @@ class WorkflowRun:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error": self.error,
+            "error_code": self.error_code,
             "waiting_approvals": [node_id for node_id, state in self.node_states.items() if state.get("status") == "waiting"],
         }
 
@@ -539,6 +541,15 @@ class WorkflowManager:
         if harness is None:
             raise RuntimeError(f"智能体 {agent_id} 没有 Harness 配置")
         prompt = self._render(str(node.data.get("prompt") or node.data.get("description") or "{{input}}"), run, latest)
+        configured_inputs = node.data.get("inputs")
+        if configured_inputs is not None:
+            if not isinstance(configured_inputs, dict):
+                raise RuntimeError(f"节点 {node.id} 的 inputs 必须是对象")
+            rendered_inputs = {
+                str(key): self._render(value, run, latest) if isinstance(value, str) else value
+                for key, value in configured_inputs.items()
+            }
+            prompt = f"{prompt}\n\n输入数据：\n{json.dumps(rendered_inputs, ensure_ascii=False)}"
         return self._run_harness_task(run, node, harness, prompt)
 
     def _run_harness_task(self, run: WorkflowRun, node: WorkflowNode, harness: HarnessSpec, prompt: str) -> dict[str, Any]:
@@ -596,8 +607,15 @@ class WorkflowManager:
         if task.get("status") != "completed":
             error = task.get("error") if isinstance(task.get("error"), dict) else {}
             reason = error.get("message") or task.get("blocked_reason") or f"Harness 任务状态为 {task.get('status')}"
+            code = str(error.get("code") or task.get("error_code") or "task_failed")
             client.close()
-            raise RuntimeError(str(reason))
+            infrastructure_codes = {"setup_required", "agent_process_failed", "agent_timeout", "agent_permission_denied", "sandbox_unavailable", "sandbox_denied", "protocol_output_invalid"}
+            if code in infrastructure_codes:
+                run.error_code = code
+                if code == "setup_required":
+                    raise RuntimeError(str(reason))
+                raise RuntimeError(f"Harness 基础设施错误：code={code}；{reason}")
+            raise RuntimeError(f"Harness 任务错误（code={code}）：{reason}")
         try:
             logs_response = client.logs(task_id, cursor=0, limit=500)
             logs = logs_response.get("items", []) if isinstance(logs_response, dict) else []
@@ -654,7 +672,9 @@ class WorkflowManager:
                 value = _lookup(run.outputs, key[6:])
             else:
                 value = _lookup({"input": run.input, "latest": latest, "nodes": run.outputs}, key)
-            if key == "latest" or key.startswith("nodes."):
+                if value is None:
+                    value = _lookup_node_reference(run.outputs, key)
+            if key == "latest" or key.startswith("nodes.") or key.split(".", 1)[0] in run.outputs:
                 value = _display_harness_output(value)
             return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", replace, template)
@@ -708,6 +728,19 @@ def _lookup(value: Any, path: str) -> Any:
         else:
             return None
     return current
+
+
+def _lookup_node_reference(outputs: dict[str, Any], path: str) -> Any:
+    """Resolve generator-friendly ``node-id.field`` template references."""
+    node_id, separator, remainder = path.partition(".")
+    if not separator or node_id not in outputs:
+        return None
+    value = outputs[node_id]
+    if remainder in {"output", "text"}:
+        displayed = _display_harness_output(value)
+        if displayed is not value or remainder == "output":
+            return displayed
+    return _lookup(value, remainder)
 
 
 def _display_harness_output(value: Any) -> Any:

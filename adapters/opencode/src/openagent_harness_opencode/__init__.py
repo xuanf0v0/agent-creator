@@ -12,6 +12,19 @@ import tempfile
 from typing import Any, Mapping
 
 
+def emit_diagnostic(code: str, summary: str, *, phase: str = "agent", exit_code: int | None = None) -> None:
+    """Emit the optional framework-neutral Harness diagnostic envelope."""
+    allowed = {
+        "agent_process_failed", "agent_timeout", "agent_permission_denied",
+        "sandbox_unavailable", "sandbox_denied", "protocol_output_invalid",
+        "verification_failed", "setup_required",
+    }
+    payload: dict[str, Any] = {"code": code if code in allowed else "agent_process_failed", "phase": phase, "summary": str(summary)[-1000:]}
+    if exit_code is not None:
+        payload["exit_code"] = exit_code
+    print("AGENT_HARNESS_ERROR " + json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
 def build_prompt(payload: dict[str, Any]) -> str:
     task = payload.get("task", {})
     instructions = str(payload.get("instructions", "")).strip()
@@ -92,7 +105,7 @@ def extract_final_text(lines: list[str]) -> tuple[str, list[str]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run an Agent Harness task through the real OpenCode CLI")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--agent", default="build")
+    parser.add_argument("--agent", default="openagent-runtime-text")
     parser.add_argument("--binary", default=os.environ.get("OPENCODE_BIN", "opencode"))
     parser.add_argument("--env-file")
     args = parser.parse_args()
@@ -112,12 +125,17 @@ def main() -> int:
             Path(environment[key]).mkdir(parents=True, exist_ok=True)
         binary = resolve_executable(args.binary, environment)
     except (json.JSONDecodeError, ValueError, OSError) as exc:
+        emit_diagnostic("agent_process_failed", str(exc), phase="invocation")
         print(f"invalid Harness invocation: {exc}", file=sys.stderr, flush=True)
         return 2
     task = payload.get("task", {})
     command = [
         binary,
         "run",
+        "--pure",
+        "--print-logs",
+        "--log-level",
+        "WARN",
         "--format",
         "json",
         "--model",
@@ -148,11 +166,17 @@ def main() -> int:
         final_text, diagnostics = extract_final_text(lines)
         if code != 0:
             detail = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+            if not detail and diagnostics:
+                detail = diagnostics[-1]
+            lowered = detail.lower()
+            diagnostic_code = "agent_permission_denied" if "permission requested" in lowered or "external_directory" in lowered else "agent_process_failed"
+            emit_diagnostic(diagnostic_code, detail or "OpenCode process failed", phase="opencode", exit_code=code)
             if detail:
                 print(detail[-4000:], file=sys.stderr, flush=True)
             return code
         if not final_text:
             detail = diagnostics[-1] if diagnostics else "OpenCode 没有返回最终文本"
+            emit_diagnostic("protocol_output_invalid", detail, phase="protocol", exit_code=3)
             print(f"OpenCode 结果无效：{detail}", file=sys.stderr, flush=True)
             return 3
         sys.stdout.write(final_text)
@@ -160,5 +184,6 @@ def main() -> int:
         sys.stdout.flush()
         return 0
     except OSError as exc:
+        emit_diagnostic("agent_process_failed", str(exc), phase="launch", exit_code=127)
         print(f"cannot start OpenCode: {exc}", file=sys.stderr, flush=True)
         return 127

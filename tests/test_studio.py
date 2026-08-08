@@ -274,6 +274,27 @@ def test_generator_normalizes_workflow_name_and_config_alias():
     assert workflow.nodes[0].data["agent_id"] == "coding"
 
 
+def test_generator_normalizes_task_and_input_mapping_data_aliases():
+    raw = {
+        "id": "flow", "name": "代码审查",
+        "nodes": [
+            {"id": "agent", "type": "agent", "data": {
+                "agent_id": "coding", "description": "审查",
+                "task": "审查 {{input}}", "input_mapping": {"code": "{{input}}"},
+            }},
+            {"id": "done", "type": "output", "data": {
+                "input_mapping": {"conclusion": "{{agent.output}}"},
+            }},
+        ],
+        "edges": [{"source": "agent", "target": "done"}],
+    }
+    normalized = _normalize_workflow_result(raw, {"coding"})
+    workflow = ProjectSpec.model_validate({"version": "1", "name": "x", "workflows": [normalized]}).workflows[0]
+    assert workflow.nodes[0].data["prompt"] == "审查 {{input}}"
+    assert workflow.nodes[0].data["inputs"] == {"code": "{{input}}"}
+    assert workflow.nodes[1].data["template"] == "{{agent.output}}"
+
+
 def test_parse_result_extracts_largest_json_from_prose_and_fence():
     text = '示例：{"id":"short"}\n```json\n{"id":"flow","nodes":[],"edges":[]}\n```\n以上是结果。'
     assert _parse_result(text) == {"id": "flow", "nodes": [], "edges": []}
@@ -696,6 +717,44 @@ def test_workflow_runner_allows_intermediate_probe_without_output_node():
     run = manager.start(project, "flow", {"input": "probe"}, record=False, require_output=False)
     _wait_for(lambda: run.status == "completed")
     assert run.outputs["agent"]["text"] == "probe ok"
+
+
+def test_workflow_runner_renders_generator_node_references_and_agent_inputs():
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "生成器引用兼容",
+        "harness": [{"id": "coding", "name": "Coding", "agent_id": "coding"}],
+        "workflows": [{"id": "review", "name": "代码审查", "nodes": [
+            {"id": "manual-trigger", "type": "manual_trigger", "data": {}},
+            {"id": "code-review-agent", "type": "agent", "data": {
+                "agent_id": "coding", "prompt": "审查代码",
+                "inputs": {"code": "{{manual-trigger.code}}"},
+            }},
+            {"id": "review-output", "type": "output", "data": {
+                "template": "{{code-review-agent.output}}",
+            }},
+        ], "edges": [
+            {"source": "manual-trigger", "target": "code-review-agent"},
+            {"source": "code-review-agent", "target": "review-output"},
+        ]}],
+    })
+    calls = []
+
+    def handler(operation, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "submit":
+            return {"id": "task-1", "status": "completed"}
+        if operation == "logs":
+            return {"items": [], "next_cursor": 0}
+        if operation == "result":
+            return {"output": {"type": "text", "text": "总体结论：不通过"}}
+        raise AssertionError(operation)
+
+    manager = WorkflowManager(client_factory=lambda _backend_id: FakeHarnessClient(handler))
+    run = manager.start(project, "review", {"input": {"code": "result = total / 0"}})
+    _wait_for(lambda: run.status == "completed")
+    submitted = next(kwargs for operation, kwargs in calls if operation == "submit")
+    assert '"code": "result = total / 0"' in submitted["prompt"]
+    assert run.outputs["review-output"] == "总体结论：不通过"
 
 
 def test_workflow_runner_uses_backend_and_catalog_agent_after_spec_round_trip(tmp_path: Path):

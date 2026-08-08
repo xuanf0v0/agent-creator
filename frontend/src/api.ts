@@ -1,4 +1,4 @@
-import type { IntegrationsStatus, ProjectSpec, Workflow, WorkflowRun } from './types'
+import type { IntegrationsStatus, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
 
 export async function loadSpec(): Promise<{ etag: string; spec: ProjectSpec }> {
   const response = await fetch('/api/spec')
@@ -43,6 +43,10 @@ export function loadGeneratorStatus() {
 
 export function loadIntegrationsStatus() {
   return jsonRequest<IntegrationsStatus>('/api/integrations/status')
+}
+
+export function loadRuntimeStatus() {
+  return jsonRequest<RuntimeStatus>('/api/runtime/status')
 }
 
 export async function cancelGeneration(generationId: string) {

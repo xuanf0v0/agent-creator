@@ -14,5 +14,55 @@
         }
       }
     }
+  },
+  "agent": {
+    "openagent-generator": {
+      "description": "OpenAgent Studio 的无工具结构化工作流生成器",
+      "mode": "primary",
+      "model": "deepseek/deepseek-v4-flash",
+      "steps": 8,
+      "prompt": "你是 OpenAgent Studio 的结构化工作流生成器。你只能根据用户消息和提示词中的完整上下文做模型推理，不得读取、搜索或修改文件，不得运行命令，不得调用网络、子 Agent 或任何工具。严格只输出一个 <result>{合法 JSON}</result>，禁止计划、解释、Markdown、代码块和确认问题。",
+      "permission": "deny",
+      "tools": {
+        "bash": false,
+        "read": false,
+        "grep": false,
+        "glob": false,
+        "list": false,
+        "task": false,
+        "todowrite": false,
+        "question": false,
+        "webfetch": false,
+        "websearch": false,
+        "lsp": false,
+        "skill": false,
+        "edit": false,
+        "write": false
+      }
+    },
+    "openagent-runtime-text": {
+      "description": "OpenAgent Harness 的无工具文本执行器",
+      "mode": "primary",
+      "model": "deepseek/deepseek-v4-flash",
+      "steps": 4,
+      "prompt": "你是 OpenAgent Harness 的文本任务执行器。只根据任务中提供的自包含输入进行推理和回答。不得读取、搜索或修改任何文件，不得运行命令，不得调用网络、子 Agent 或任何工具。",
+      "permission": "deny",
+      "tools": {
+        "bash": false,
+        "read": false,
+        "grep": false,
+        "glob": false,
+        "list": false,
+        "task": false,
+        "todowrite": false,
+        "question": false,
+        "webfetch": false,
+        "websearch": false,
+        "lsp": false,
+        "skill": false,
+        "edit": false,
+        "write": false
+      }
+    }
   }
 }

@@ -39,14 +39,107 @@ harness:
   labels:
     runtime.example/implementation: openagent-harness-opencode
     runtime.example/model: deepseek/deepseek-v4-flash
+    runtime.example/capability: text-generation
+    runtime.example/sandbox: read-only
   protocol: stdin_json
 workflows:
 - id: product-selection
-  name: 智能选品决策流程
-  nodes: []
-  edges: []
+  name: 代码审查工作流
+  nodes:
+  - id: manual-trigger
+    type: manual_trigger
+    data:
+      parameters:
+      - name: code
+        type: string
+        description: 待审查的代码
+        required: true
+      description: manual-trigger
+    position:
+      x: 80.0
+      y: 80.0
+  - id: code-review-agent
+    type: agent
+    data:
+      agent_id: coding
+      prompt: '你是一个严格的静态代码审查助手。请仅对下列代码做静态审查，逐项检查：1) 未定义变量的使用；2) 除数为零风险（包括常量除零与可能为
+        0 的变量除法）；3) SQL 注入风险（重点检查使用字符串拼接构造 SQL 语句）；4) 代码可读性。逐项列出发现的问题及位置，最后单独输出一行：''总体结论：通过''
+        或 ''总体结论：不通过''。
+
+        待审查代码：
+
+        {{input}}'
+      description: code-review-agent
+    position:
+      x: 320.0
+      y: 80.0
+  - id: review-output
+    type: output
+    data:
+      template: '{{latest}}'
+      description: review-output
+    position:
+      x: 560.0
+      y: 80.0
+  edges:
+  - source: manual-trigger
+    target: code-review-agent
+  - source: code-review-agent
+    target: review-output
   evaluation:
-    cases: []
+    cases:
+    - id: negative-undefined-var-divide-zero
+      name: 用例1：未定义变量与除零导致不通过
+      enabled: true
+      input:
+        code: function bad(x){ y = undefinedVar; return x/0; }
+      assertions:
+      - path: output
+        operator: exists
+      - path: output
+        operator: contains
+        expected: 总体结论：不通过
+      semantic_criteria:
+      - 输出明确指出未定义变量 undefinedVar 的使用
+      - 输出明确指出除数为零风险
+      - 总体结论为“不通过”
+      approvals: {}
+      mocks: []
+      timeout_seconds: 300
+    - id: negative-sql-injection
+      name: 用例2：SQL 拼接注入导致不通过
+      enabled: true
+      input:
+        code: const q = 'SELECT * FROM users WHERE id = ' + userId;
+      assertions:
+      - path: output
+        operator: exists
+      - path: output
+        operator: contains
+        expected: 总体结论：不通过
+      semantic_criteria:
+      - 输出明确指出字符串拼接构造 SQL 的注入风险
+      - 总体结论为“不通过”
+      approvals: {}
+      mocks: []
+      timeout_seconds: 300
+    - id: positive-multiply-function
+      name: 用例3：正确的 multiply 函数判定为通过
+      enabled: true
+      input:
+        code: function multiply(a, b){ return a * b; }
+      assertions:
+      - path: output
+        operator: exists
+      - path: output
+        operator: contains
+        expected: 总体结论：通过
+      semantic_criteria:
+      - 输出对正确代码未报告重大缺陷
+      - 总体结论为“通过”
+      approvals: {}
+      mocks: []
+      timeout_seconds: 300
 integrations:
   feishu:
   - id: main
