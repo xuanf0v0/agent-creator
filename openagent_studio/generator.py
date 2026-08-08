@@ -96,20 +96,21 @@ timeout_seconds 必须是 1 到 1800 的整数，建议使用默认值 300，禁
 首次创建必须恰好生成 3 个覆盖正常、边界和失败风险的用例。已有用例时必须逐字保留其所有字段，不得删除、禁用或弱化，只能追加最多 3 个与本轮改动直接相关的新用例。
 候选会沿正式运行路径真实调用 Harness、模型、工具、HTTP 和子工作流；输入必须适合在当前环境真实执行。不要输出解释。"""
 
-INCREMENTAL_STEP_PROMPT = """你是 OpenAgent Studio 的增量工作流构建器。必须一次只处理一个节点，禁止一次输出完整替代工作流。
+INCREMENTAL_STEP_PROMPT = """你是 OpenAgent Studio 的增量工作流构建器。新增和更新必须一次只处理一个节点；删除请求必须把本轮确定要删除的所有节点合并为一个批次。
 只输出 <result>{{JSON}}</result>，action 只能是 add_node、update_node、delete_node 或 complete：
 - add_node：{{"action":"add_node","node":{{完整 WorkflowNode}},"edges":[{{"source":"...","target":"...","condition":"可选"}}],"workflow_name":"可选","probe_input":任意JSON,"probe_approvals":{{"审批节点id":true}},"summary":"本步目的"}}
 - update_node：字段同 add_node，但 node.id 必须已存在；node 是该节点的完整替换内容，edges 是该节点替换后的全部关联边。
-- delete_node：{{"action":"delete_node","node_id":"已有节点id","summary":"删除原因"}}
+- delete_node：{{"action":"delete_node","node_ids":["已有节点id", "已有节点id"],"summary":"批量删除原因"}}。必须一次列出本轮目标中的全部待删除节点；兼容单节点时也使用 node_ids 数组。
 - complete：{{"action":"complete","summary":"为什么当前图已经完整满足目标"}}
 硬约束：
-1. add/update 每次只能包含一个 node；本步 edges 必须全部与该 node 直接相连。禁止同时改其他节点。
+1. add/update 每次只能包含一个 node；本步 edges 必须全部与该 node 直接相连。禁止同时改其他节点。delete_node 是唯一例外，必须合并全部删除，系统会一次应用后再做整体验证，禁止逐节点删除和逐节点测试。
 2. 新增节点后必须立即接入当前图；除第一个节点外禁止孤立节点。创建分支时，每轮只创建分支中的一个节点并连接，下一轮再创建另一个。
 3. 优先保持当前已通过探测的节点不变。运行失败时必须先根据失败证据诊断原因，再使用 update_node 修复原节点的参数、提示词、输入映射或连线；失败重试阶段严禁 delete_node。只有用户本轮明确要求删除某个节点时才允许 delete_node。
-4. 节点必须使用合法具体 type；AI 节点必须填写可用 agent_id 和完整 prompt；结束时至少有一个 output 节点。
-5. 只有当前图已完整满足用户目标、包含必要分支和输出时才 complete。不要因为本层通过探测就提前 complete。
-6. probe_input 和 probe_approvals 必须让本次新增/修改的节点在本层真实探测中被执行，尤其要覆盖条件分支。
-7. 不得修改 evaluation；系统会在完整图上生成并锁定验收标准。
+4. 用户要求整体替换/重建时，严禁先删除全部当前节点或把图变成空图；必须先 add_node 逐步创建并连通新入口、分支、汇总和 output，确认新图可运行后，最后才可批量删除不再需要的旧节点。任何 delete_node 使当前图没有节点的操作都会被拒绝并回滚。
+5. 节点必须使用合法具体 type；AI 节点必须填写可用 agent_id 和完整 prompt；结束时至少有一个 output 节点。
+6. 只有当前图已完整满足用户目标、包含必要分支和输出时才 complete。不要因为本层通过探测就提前 complete。
+7. probe_input 和 probe_approvals 必须让本次新增/修改的节点在本层真实探测中被执行，尤其要覆盖条件分支。
+8. 不得修改 evaluation；系统会在完整图上生成并锁定验收标准。
 可用 Harness 智能体：{catalog}
 用户完整目标：{request}
 当前已接受工作流：{workflow}
@@ -369,12 +370,18 @@ class GeneratorManager:
                 feedback=json.dumps(failures[-5:], ensure_ascii=False),
                 layer=accepted_layers,
             )
-            if failures and not _explicit_delete_request(generation.prompt):
-                latest_failure = failures[-1]
+            latest_failure = failures[-1] if failures else {}
+            repairing_failed_delete = (
+                latest_failure.get("action") == "delete_node"
+                and latest_failure.get("phase") in {"structural_runtime", "runtime_probe"}
+            )
+            if failures and (not _explicit_delete_request(generation.prompt) or repairing_failed_delete):
                 failed_node = str(latest_failure.get("node_id") or "")
                 candidate_was_accepted = bool(latest_failure.get("candidate_accepted"))
                 if latest_failure.get("action") == "add_node" and not candidate_was_accepted and failed_node not in {node.id for node in current.nodes}:
                     repair_rule = f"该 add_node 候选已回滚，节点 {failed_node or '<unknown>'} 不在当前图中；必须使用 add_node 以相同合法 id 重新创建它。"
+                elif repairing_failed_delete:
+                    repair_rule = "删除候选已整体测试并回滚；必须使用 add_node 或 update_node 修复剩余图。"
                 else:
                     repair_rule = "失败节点已存在于当前 accepted graph；必须使用 update_node 修复其参数、prompt、输入映射或连线。"
                 prompt += f"\n本轮处于失败修复阶段。请先阅读最近失败证据并明确诊断原因；{repair_rule}禁止返回 delete_node，也不要用删除节点来规避运行错误。"
@@ -440,7 +447,7 @@ class GeneratorManager:
                 spec, current, candidate, action, touched_node_id,
                 require_output=action == "complete",
             )
-            if static_errors:
+            if static_errors and action != "delete_node":
                 failure = {
                     "phase": "connectivity", "errors": static_errors, "action": action,
                     "node_id": touched_node_id, "iteration": iteration, "candidate_accepted": False,
@@ -512,26 +519,30 @@ class GeneratorManager:
                 "node_id": touched_node_id, "iteration": iteration,
             })
             probe_errors = self._probe_incremental_workflow(
-                generation, spec, candidate, touched_node_id, probe_input, probe_approvals,
+                generation, spec, candidate,
+                None if action == "delete_node" else touched_node_id,
+                probe_input, probe_approvals,
                 evaluator,
             )
-            if probe_errors:
+            failure_errors = list(dict.fromkeys([*static_errors, *probe_errors])) if action == "delete_node" else probe_errors
+            if failure_errors:
+                failure_phase = "structural_runtime" if action == "delete_node" else "runtime_probe"
                 failure = {
-                    "phase": "runtime_probe", "errors": probe_errors, "action": action,
+                    "phase": failure_phase, "errors": failure_errors, "action": action,
                     "node_id": touched_node_id, "iteration": iteration, "candidate_accepted": False,
                 }
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
                     "phase": failure["phase"], "node_id": failure.get("node_id"),
-                    "message": "运行探测失败，下一轮将诊断 Harness/参数原因并修复原节点",
+                    "message": "删除后的整体结构与运行探测未通过，下一轮将重新连接或重建节点" if action == "delete_node" else "运行探测失败，下一轮将诊断 Harness/参数原因并修复原节点",
                     "strategy": "recreate_or_update_accepted_node",
                 })
                 generation.emit("workflow.preview", {
                     "workflow": current.model_dump(mode="json"),
                     "layer": accepted_layers,
                     "reverted": True,
-                    "reason": "runtime_probe",
+                    "reason": failure["phase"],
                 })
                 continue
             current = candidate
@@ -1405,13 +1416,29 @@ def _apply_incremental_step(
         draft["name"] = value["workflow_name"].strip()
     touched_node_id: str | None = None
     if action == "delete_node":
-        touched_node_id = str(value.get("node_id", "")).strip()
-        if not touched_node_id or not any(node["id"] == touched_node_id for node in draft["nodes"]):
-            raise RuntimeError(f"删除目标节点不存在：{touched_node_id or '<empty>'}")
-        draft["nodes"] = [node for node in draft["nodes"] if node["id"] != touched_node_id]
+        raw_node_ids = value.get("node_ids")
+        if raw_node_ids is None:
+            raw_node_ids = [value.get("node_id")]
+        if not isinstance(raw_node_ids, list):
+            raise RuntimeError("delete_node 的 node_ids 必须是节点 id 数组")
+        node_ids = list(dict.fromkeys(str(item or "").strip() for item in raw_node_ids))
+        if not node_ids or any(not item for item in node_ids):
+            raise RuntimeError("delete_node 必须包含至少一个非空节点 id")
+        existing_ids = {node["id"] for node in draft["nodes"]}
+        missing_ids = [node_id for node_id in node_ids if node_id not in existing_ids]
+        if missing_ids:
+            raise RuntimeError(f"删除目标节点不存在：{', '.join(missing_ids)}")
+        deleting_ids = set(node_ids)
+        if deleting_ids == existing_ids:
+            raise RuntimeError(
+                "不能删除全部当前节点：整体重建必须先 add_node 创建并连通新工作流，"
+                "确认新图可运行后才能批量删除旧节点；当前图不得变为空图"
+            )
+        touched_node_id = ",".join(node_ids)
+        draft["nodes"] = [node for node in draft["nodes"] if node["id"] not in deleting_ids]
         draft["edges"] = [
             edge for edge in draft["edges"]
-            if edge["source"] != touched_node_id and edge["target"] != touched_node_id
+            if edge["source"] not in deleting_ids and edge["target"] not in deleting_ids
         ]
     else:
         raw_node = value.get("node")

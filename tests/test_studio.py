@@ -1,7 +1,8 @@
 from pathlib import Path
+import pytest
 from fastapi.testclient import TestClient
 from openagent_studio.app import create_app
-from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _EmptyCompactionError, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _with_file_prompt
+from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _EmptyCompactionError, _apply_incremental_step, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _with_file_prompt
 from openagent_studio.store import SpecStore
 from openagent_studio.models import EvaluationAssertion, ProjectSpec, QQIntegrationSpec, WorkflowEvaluation, WorkflowSpec
 from openagent_studio.workflow_runner import EvaluationPolicy, WorkflowManager, validate_executable_workflow
@@ -293,6 +294,23 @@ def test_generator_normalizes_task_and_input_mapping_data_aliases():
     assert workflow.nodes[0].data["prompt"] == "审查 {{input}}"
     assert workflow.nodes[0].data["inputs"] == {"code": "{{input}}"}
     assert workflow.nodes[1].data["template"] == "{{agent.output}}"
+
+
+def test_incremental_rebuild_rejects_delete_all_nodes():
+    workflow = WorkflowSpec.model_validate({
+        "id": "flow", "name": "旧流程",
+        "nodes": [
+            {"id": "start", "type": "manual_trigger", "data": {}},
+            {"id": "done", "type": "output", "data": {}},
+        ],
+        "edges": [{"source": "start", "target": "done"}],
+    })
+    with pytest.raises(RuntimeError, match="不能删除全部当前节点"):
+        _apply_incremental_step(
+            workflow,
+            {"action": "delete_node", "node_ids": ["start", "done"]},
+            set(),
+        )
 
 
 def test_parse_result_extracts_largest_json_from_prose_and_fence():
@@ -1125,6 +1143,45 @@ def test_live_acceptance_uses_formal_harness_execution_path():
     assert run.id not in manager.runs
 
 
+def test_incremental_delete_batches_nodes_and_removes_incident_edges():
+    workflow = WorkflowSpec.model_validate({
+        "id": "flow", "name": "批量删除", "nodes": [
+            {"id": "start", "type": "manual_trigger", "data": {}},
+            {"id": "middle-a", "type": "prompt", "data": {"template": "a"}},
+            {"id": "middle-b", "type": "prompt", "data": {"template": "b"}},
+            {"id": "done", "type": "output", "data": {}},
+        ], "edges": [
+            {"source": "start", "target": "middle-a"},
+            {"source": "middle-a", "target": "middle-b"},
+            {"source": "middle-b", "target": "done"},
+        ],
+    })
+    candidate, action, touched, *_ = _apply_incremental_step(
+        workflow, {"action": "delete_node", "node_ids": ["middle-a", "middle-b"]}, set(),
+    )
+    assert action == "delete_node"
+    assert touched == "middle-a,middle-b"
+    assert [node.id for node in candidate.nodes] == ["start", "done"]
+    assert candidate.edges == []
+
+
+def test_incremental_delete_accepts_legacy_single_node_id():
+    workflow = WorkflowSpec.model_validate({
+        "id": "flow", "name": "删除", "nodes": [
+            {"id": "start", "type": "manual_trigger", "data": {}},
+            {"id": "done", "type": "output", "data": {}},
+        ], "edges": [{"source": "start", "target": "done"}],
+    })
+    candidate, action, touched, *_ = _apply_incremental_step(
+        workflow, {"action": "delete_node", "node_id": "done"}, set(),
+    )
+    assert action == "delete_node"
+    assert touched == "done"
+    assert [node.id for node in candidate.nodes] == ["start"]
+    assert candidate.edges == []
+
+
+
 def test_generator_builds_one_node_per_layer_and_saves_after_full_verification(tmp_path: Path):
     store = SpecStore(tmp_path / "project.yaml")
     project = ProjectSpec.model_validate({"version": "1", "name": "增量", "project_dir": str(tmp_path), "workflows": [{"id": "flow", "name": "原流程", "nodes": []}]})
@@ -1255,7 +1312,57 @@ def test_generator_retries_same_layer_after_runtime_probe_failure(tmp_path: Path
     assert len([item for item in generation.events if item["event"] == "generation.layer_completed"]) == 1
 
 
-def test_generator_repairs_failed_node_instead_of_deleting_it(tmp_path: Path):
+def test_generator_batch_delete_probes_once_then_repairs(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "批量删除探测", "project_dir": str(tmp_path),
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [
+            {"id": "start", "type": "manual_trigger", "data": {}},
+            {"id": "mid", "type": "prompt", "data": {"template": "处理中"}},
+            {"id": "done", "type": "output", "data": {}},
+        ], "edges": [
+            {"source": "start", "target": "mid"}, {"source": "mid", "target": "done"},
+        ]}],
+    })
+    store.save(project)
+    manager = GeneratorManager(store)
+    generation = Generation(
+        id="batch-delete-repair", workflow_id="flow", base_etag=store.etag(),
+        draft=project.workflows[0].model_dump(mode="json"), prompt="删除中间节点 mid", model="provider/model",
+    )
+    steps = iter([
+        {"action": "delete_node", "node_ids": ["mid"], "summary": "删除中间节点"},
+        {"action": "update_node", "node": {"id": "done", "type": "output", "data": {}}, "edges": [{"source": "mid", "target": "done"}, {"source": "start", "target": "done"}]},
+        {"action": "complete"},
+    ])
+    planning_prompts = []
+
+    def fake_invoke(generation, spec, command, workdir, prompt):
+        if "验收设计师" in prompt:
+            cases = [{"id": f"case-{i}", "name": "用例", "input": i, "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": ["有效"]} for i in range(3)]
+            return f"<result>{json.dumps({'cases': cases}, ensure_ascii=False)}</result>"
+        if "增量工作流构建器" in prompt:
+            planning_prompts.append(prompt)
+            return f"<result>{json.dumps(next(steps), ensure_ascii=False)}</result>"
+        return '<result>{"passed":true,"score":90,"issues":[]}</result>'
+
+    manager._invoke = fake_invoke
+    probe_calls = []
+    manager._probe_incremental_workflow = lambda *args: (probe_calls.append(args) or (["运行探测失败"] if len(probe_calls) == 1 else []))
+    manager._run(generation, project)
+
+    assert generation.events[-1]["event"] == "generation.completed", generation.events[-5:]
+    assert len(probe_calls) == 2
+    failures = [item for item in generation.events if item["event"] == "generation.layer_failed"]
+    assert failures[0]["data"]["phase"] == "structural_runtime"
+    assert any("未连通" in error for error in failures[0]["data"]["errors"])
+    assert "运行探测失败" in failures[0]["data"]["errors"]
+    assert "禁止返回 delete_node" in planning_prompts[1]
+    saved = store.load().workflows[0]
+    assert [(edge.source, edge.target) for edge in saved.edges] == [("start", "mid"), ("mid", "done"), ("start", "done")]
+
+
+
     store = SpecStore(tmp_path / "project.yaml")
     project = ProjectSpec.model_validate({
         "version": "1", "name": "原地修复", "project_dir": str(tmp_path),
