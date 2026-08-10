@@ -17,6 +17,7 @@ from .compiler import compile_opencode
 from .harness_client import DEFAULT_BACKEND_ID, create_harness_client
 from .models import ProjectSpec, WorkflowSpec
 from .store import SpecStore
+from .workflow_validation import workflow_delete_blockers
 from .generator import GeneratorManager
 from .workflow_runner import TERMINAL_RUN_STATES, WorkflowManager, validate_executable_workflow
 from .platform_integrations import PlatformIntegrationManager
@@ -113,6 +114,21 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"etag": etag, "workflow": workflow.model_dump(mode="json")}
+
+    @app.delete("/api/workflows/{workflow_id}")
+    def delete_workflow(workflow_id: str, if_match: str | None = Header(default=None)):
+        current = store.load()
+        if not any(item.id == workflow_id for item in current.workflows):
+            raise HTTPException(status_code=404, detail="找不到工作流")
+        blockers = workflow_delete_blockers(current, workflow_id)
+        if blockers:
+            raise HTTPException(status_code=409, detail="；".join(blockers))
+        current.workflows = [item for item in current.workflows if item.id != workflow_id]
+        try:
+            etag = store.save(current, if_match)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"etag": etag, "workflow_id": workflow_id}
 
     @app.post("/api/workflows/{workflow_id}/runs", status_code=202)
     def start_workflow_run(workflow_id: str, body: dict[str, object] | None = None):
@@ -245,6 +261,18 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
             return generator.status()
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post("/api/generator/workflows", status_code=202)
+    def create_generator_workflow(body: dict[str, str]):
+        message = body.get("message", "")
+        workflow_id = body.get("workflow_id", "")
+        try:
+            generation = generator.create(workflow_id=workflow_id, message=message, name=body.get("name"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"generation_id": generation.id, "workflow_id": workflow_id}
 
     @app.post("/api/generator/workflows/{workflow_id}/messages", status_code=202)
     def generator_message(workflow_id: str, body: dict[str, str]):

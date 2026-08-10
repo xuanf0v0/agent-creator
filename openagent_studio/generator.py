@@ -96,6 +96,25 @@ timeout_seconds 必须是 1 到 1800 的整数，建议使用默认值 300，禁
 首次创建必须恰好生成 3 个覆盖正常、边界和失败风险的用例。已有用例时必须逐字保留其所有字段，不得删除、禁用或弱化，只能追加最多 3 个与本轮改动直接相关的新用例。
 候选会沿正式运行路径真实调用 Harness、模型、工具、HTTP 和子工作流；输入必须适合在当前环境真实执行。不要输出解释。"""
 
+CREATION_STEP_PROMPT = """你是 OpenAgent Studio 的工作流创建器。服务端正在创建一个尚未保存的新工作流。
+只输出 <result>{{JSON}}</result>，action 只能是 add_node、revise_node 或 finish_creation：
+- add_node：{{"action":"add_node","node":{{完整 WorkflowNode}},"add_edges":[{{"source":"...","target":"...","condition":"可选"}}],"workflow_name":"可选","summary":"本步目的"}}
+- revise_node：{{"action":"revise_node","node":{{已有节点的完整替换}},"edges_mode":"preserve 或 patch","remove_edges":[],"add_edges":[],"summary":"修复原因"}}
+- finish_creation：{{"action":"finish_creation","summary":"图已完整的原因"}}
+硬约束：
+1. 每轮只创建或修复一个节点；创建阶段不得删除节点或工作流。
+2. 中间图允许暂时没有 output、分支尚未闭合或暂时不可执行；不要因此反复修改已接受节点。
+3. add_node 的 add_edges 只能连接本轮节点；除首个节点外，新节点必须连接到已有草稿。
+4. revise_node 默认保持全部连线；只有 edges_mode=patch 才应用明确的 remove_edges/add_edges，省略绝不表示删除。
+5. 节点使用合法具体 type；AI 节点必须填写可用 agent_id 和完整 prompt。
+6. 仅当入口、必要分支、汇总和 output 均完整时 finish_creation。最终严格运行检测由服务端统一执行。
+可用 Harness 智能体：{catalog}
+用户完整目标：{request}
+当前创建草稿：{workflow}
+最近完成后检测失败证据：{feedback}
+当前已接受层数：{layer}"""
+
+
 INCREMENTAL_STEP_PROMPT = """你是 OpenAgent Studio 的增量工作流构建器。新增和更新必须一次只处理一个节点；删除请求必须把本轮确定要删除的所有节点合并为一个批次。
 只输出 <result>{{JSON}}</result>，action 只能是 add_node、update_node、delete_node 或 complete：
 - add_node：{{"action":"add_node","node":{{完整 WorkflowNode}},"edges":[{{"source":"...","target":"...","condition":"可选"}}],"workflow_name":"可选","probe_input":任意JSON,"probe_approvals":{{"审批节点id":true}},"summary":"本步目的"}}
@@ -151,6 +170,7 @@ class Generation:
     optimize_only: bool = False
     chat_routing: bool = False
     compaction_disabled: bool = False
+    mode: str = "modify"
 
     def emit(self, event: str, data: dict[str, Any]) -> None:
         item = {"event": event, "data": data, "sequence": len(self.events), "timestamp": time.time()}
@@ -221,6 +241,38 @@ class GeneratorManager:
                     if key and not environment.get(key):
                         environment[key] = value
         return environment
+
+    def create(self, message: str, *, workflow_id: str, name: str | None = None) -> Generation:
+        message = message.strip()
+        if not message:
+            raise ValueError("请输入你想创建的工作流需求")
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", workflow_id):
+            raise ValueError("工作流编号只能包含小写字母、数字和短横线")
+        with self._lock:
+            active_id = self.active.get(workflow_id)
+            if active_id and not self.generations[active_id].completed:
+                raise RuntimeError("这个工作流正在生成，请先等待或停止当前生成")
+            spec = self.store.load()
+            if any(item.id == workflow_id for item in spec.workflows):
+                raise ValueError(f"工作流已存在：{workflow_id}")
+            model = self.ensure_ready(spec)["model"]
+            draft = WorkflowSpec(id=workflow_id, name=(name or workflow_id).strip() or workflow_id)
+            generation = Generation(
+                id=uuid.uuid4().hex,
+                workflow_id=workflow_id,
+                base_etag=self.store.etag(),
+                draft=draft.model_dump(mode="json"),
+                prompt=message,
+                messages=[{"role": "user", "content": message}],
+                harness_agent_ids={item.id for item in spec.harness},
+                model=model,
+                mode="create",
+            )
+            self.generations[generation.id] = generation
+            self.active[workflow_id] = generation.id
+            self.history.setdefault(workflow_id, []).append({"role": "user", "content": message})
+        threading.Thread(target=self._run, args=(generation, spec), daemon=True).start()
+        return generation
 
     def start(self, workflow_id: str, message: str, *, optimize_only: bool = False) -> Generation:
         message = message.strip()
@@ -317,15 +369,23 @@ class GeneratorManager:
                     generation.emit("chat.completed", {"message": answer})
                     return
                 generation.prompt = decision["request"]
-            if spec.harness:
-                generation.emit("generation.stage", {"stage": "checking_runtime"})
+            if spec.harness and generation.mode != "create":
+                generation.emit("generation.stage", {"stage": "checking_runtime", "operation": generation.mode, "validation_tier": "runtime_readiness"})
                 evaluator.ensure_harness_ready({item.backend_id for item in spec.harness})
-            winner = self._build_incrementally(
-                generation, spec, command, workdir, original, evaluator, catalog_json,
-            )
+            if generation.mode == "create":
+                winner = self._build_creation(
+                    generation, spec, command, workdir, original, evaluator, catalog_json,
+                )
+            else:
+                winner = self._build_incrementally(
+                    generation, spec, command, workdir, original, evaluator, catalog_json,
+                )
             generation.emit("generation.stage", {"stage": "saving"})
             generation.draft = winner.model_dump(mode="json")
-            summary = "已按你的要求逐节点构建工作流；每个节点和层级均通过连通探测，完整工作流也已通过真实验收。"
+            if generation.mode == "create":
+                summary = "已按你的要求逐节点创建并保存工作流；每层完成结构检查，完成时已通过完整静态校验与真实验收。"
+            else:
+                summary = "已按你的要求完成工作流增量调整；每步完成结构检查，并对受影响路径与整体结果完成探测与验收。"
             self._finalize(generation)
             if generation.events[-1]["event"] == "generation.completed":
                 generation.events[-1]["data"]["assistant_message"] = summary
@@ -335,6 +395,138 @@ class GeneratorManager:
                 return
             generation.completed = True
             generation.emit("generation.failed", {"message": str(exc)})
+
+    def _build_creation(
+        self,
+        generation: Generation,
+        spec: Any,
+        command: list[str],
+        workdir: Path,
+        original: WorkflowSpec,
+        evaluator: WorkflowEvaluator,
+        catalog_json: str,
+    ) -> WorkflowSpec:
+        current = original.model_copy(deep=True)
+        failures: list[dict[str, Any]] = []
+        accepted_layers = 0
+        iteration = 0
+        evaluation_locked = False
+        max_iterations = _incremental_max_iterations()
+        while True:
+            if generation.cancelled:
+                raise RuntimeError("生成已取消")
+            iteration += 1
+            if max_iterations and iteration > max_iterations:
+                raise RuntimeError(f"创建达到运维配置的最大迭代次数 {max_iterations}，新工作流未保存")
+            generation.emit("generation.stage", {
+                "stage": "planning_creation_layer", "operation": "create_workflow",
+                "validation_tier": "step_schema", "layer": accepted_layers + 1, "iteration": iteration,
+            })
+            raw = self._invoke_result(
+                generation, spec, command, workdir,
+                CREATION_STEP_PROMPT.format(
+                    catalog=catalog_json,
+                    request=generation.prompt,
+                    workflow=json.dumps(current.model_dump(mode="json"), ensure_ascii=False),
+                    feedback=json.dumps(failures[-5:], ensure_ascii=False),
+                    layer=accepted_layers,
+                ),
+                f"创建工作流第 {accepted_layers + 1} 层（迭代 {iteration}）",
+            )
+            try:
+                candidate, action, touched_node_id, summary = _apply_creation_step(
+                    current, raw, generation.harness_agent_ids,
+                )
+                static_errors = _creation_step_errors(current, candidate, action, touched_node_id)
+                if static_errors:
+                    raise RuntimeError("；".join(static_errors))
+            except (ValidationError, ValueError, RuntimeError) as exc:
+                failure = {
+                    "phase": "creation_step", "message": str(exc), "iteration": iteration,
+                    "action": raw.get("action") if isinstance(raw, dict) else None,
+                    "candidate_accepted": False,
+                }
+                failures.append(failure)
+                generation.emit("generation.layer_failed", failure)
+                generation.emit("workflow.preview", {
+                    "workflow": current.model_dump(mode="json"), "layer": accepted_layers,
+                    "reverted": True, "reason": "creation_step",
+                })
+                continue
+            generation.emit("workflow.preview", {
+                "workflow": candidate.model_dump(mode="json"), "layer": accepted_layers + 1,
+                "operation": "create_workflow", "validation_tier": "local_graph",
+                "action": action, "node_id": touched_node_id, "summary": summary,
+            })
+            if action != "finish_creation":
+                current = candidate
+                generation.draft = current.model_dump(mode="json")
+                accepted_layers += 1
+                failures.clear()
+                generation.emit("generation.layer_completed", {
+                    "layer": accepted_layers, "operation": "create_workflow",
+                    "validation_tier": "local_graph", "action": action,
+                    "node_id": touched_node_id, "summary": summary,
+                    "nodes": len(current.nodes), "edges": len(current.edges),
+                })
+                continue
+
+            generation.emit("generation.stage", {
+                "stage": "validating_complete_graph", "operation": "create_workflow",
+                "validation_tier": "full_static_graph", "iteration": iteration,
+            })
+            project = _project_with_workflow(spec, candidate)
+            full_errors = validate_executable_workflow(project, candidate, runtime=True, require_output=True)
+            if full_errors:
+                failures.append({
+                    "phase": "full_static_graph", "errors": full_errors, "iteration": iteration,
+                    "action": action, "candidate_accepted": False,
+                })
+                generation.emit("generation.layer_failed", failures[-1])
+                continue
+            if spec.harness:
+                generation.emit("generation.stage", {
+                    "stage": "checking_runtime", "operation": "create_workflow",
+                    "validation_tier": "runtime_readiness",
+                })
+                evaluator.ensure_harness_ready({item.backend_id for item in spec.harness})
+            if not evaluation_locked:
+                generation.emit("generation.stage", {
+                    "stage": "preparing_cases", "operation": "create_workflow",
+                    "validation_tier": "full_runtime_evaluation",
+                })
+                case_prompt = (
+                    f"{CASE_PROMPT}\n已有验收用例：{json.dumps(original.evaluation.model_dump(mode='json'), ensure_ascii=False)}"
+                    f"\n当前完整工作流：{json.dumps(candidate.model_dump(mode='json'), ensure_ascii=False)}"
+                    f"\n本轮目标：{generation.prompt}"
+                )
+                candidate.evaluation = self._generate_evaluation(
+                    generation, spec, command, workdir, case_prompt, original.evaluation,
+                )
+                current.evaluation = candidate.evaluation.model_copy(deep=True)
+                evaluation_locked = True
+            else:
+                candidate.evaluation = current.evaluation.model_copy(deep=True)
+            generation.emit("generation.stage", {
+                "stage": "full_evaluating", "operation": "create_workflow",
+                "validation_tier": "full_runtime_evaluation", "iteration": iteration,
+            })
+            result = evaluator.evaluate(_project_with_workflow(spec, candidate), candidate, iteration)
+            if result.passed:
+                generation.emit("generation.workflow_verified", {
+                    "operation": "create_workflow", "validation_tier": "full_runtime_evaluation",
+                    "layers": accepted_layers, "iterations": iteration,
+                })
+                return candidate
+            failures.append({
+                "phase": "full_evaluation", "feedback": self._result_feedback(result),
+                "iteration": iteration, "action": action, "candidate_accepted": False,
+            })
+            generation.emit("generation.layer_failed", failures[-1])
+            generation.emit("workflow.preview", {
+                "workflow": current.model_dump(mode="json"), "layer": accepted_layers,
+                "reverted": True, "reason": "full_evaluation",
+            })
 
     def _build_incrementally(
         self,
@@ -390,6 +582,18 @@ class GeneratorManager:
                 f"增量构建第 {accepted_layers + 1} 层（迭代 {iteration}）",
             )
             raw_action = raw.get("action") if isinstance(raw, dict) else None
+            if generation.optimize_only and raw_action == "delete_node":
+                failure = {
+                    "phase": "operation_policy",
+                    "message": "优化模式禁止删除节点；请使用 update_node 保持目标效果并优化现有图",
+                    "node_id": raw.get("node_id") or raw.get("id"),
+                    "iteration": iteration,
+                    "action": raw_action,
+                    "candidate_accepted": False,
+                }
+                failures.append(failure)
+                generation.emit("generation.layer_failed", failure)
+                continue
             if failures and raw_action == "delete_node" and not _explicit_delete_request(generation.prompt):
                 failure = {
                     "phase": "repair_policy",
@@ -411,6 +615,7 @@ class GeneratorManager:
             try:
                 candidate, action, touched_node_id, probe_input, probe_approvals, summary = _apply_incremental_step(
                     current, raw, generation.harness_agent_ids,
+                    allow_delete=_explicit_delete_request(generation.prompt) and not generation.optimize_only and not failures,
                 )
             except (ValidationError, ValueError, RuntimeError) as exc:
                 failure = {"phase": "step_contract", "message": str(exc), "iteration": iteration, "action": raw_action, "candidate_accepted": False}
@@ -1177,7 +1382,10 @@ class GeneratorManager:
             generation.completed = True
             generation.emit("generation.conflict", {"message": "工作流在生成期间被修改，请重新发送需求"})
             return
-        current.workflows = [workflow if item.id == workflow.id else item for item in current.workflows]
+        if generation.mode == "create":
+            current.workflows.append(workflow)
+        else:
+            current.workflows = [workflow if item.id == workflow.id else item for item in current.workflows]
         etag = self.store.save(current, generation.base_etag)
         generation.completed = True
         generation.emit("generation.completed", {"workflow": workflow.model_dump(mode="json"), "etag": etag})
@@ -1397,10 +1605,127 @@ def _normalize_workflow_result(
     return normalized
 
 
+def _project_with_workflow(project: Any, workflow: WorkflowSpec) -> Any:
+    candidate = project.model_copy(deep=True)
+    replaced = False
+    workflows = []
+    for item in candidate.workflows:
+        if item.id == workflow.id:
+            workflows.append(workflow)
+            replaced = True
+        else:
+            workflows.append(item)
+    if not replaced:
+        workflows.append(workflow)
+    candidate.workflows = workflows
+    return candidate
+
+
+def _edge_key(value: Any) -> tuple[str, str, str | None]:
+    if isinstance(value, dict):
+        return str(value.get("source", "")), str(value.get("target", "")), value.get("condition")
+    return value.source, value.target, value.condition
+
+
+def _apply_creation_step(
+    current: WorkflowSpec,
+    value: Any,
+    harness_agent_ids: set[str],
+) -> tuple[WorkflowSpec, str, str | None, str]:
+    if not isinstance(value, dict):
+        raise RuntimeError("创建步骤必须是 JSON 对象")
+    action = str(value.get("action", "")).strip()
+    if action not in {"add_node", "revise_node", "finish_creation"}:
+        raise RuntimeError("创建 action 必须是 add_node、revise_node 或 finish_creation")
+    summary = str(value.get("summary", "")).strip() or action
+    if action == "finish_creation":
+        return current.model_copy(deep=True), action, None, summary
+    raw_node = value.get("node")
+    if not isinstance(raw_node, dict):
+        raise RuntimeError(f"{action} 缺少完整 node 对象")
+    add_edges = value.get("add_edges", [])
+    remove_edges = value.get("remove_edges", [])
+    if not isinstance(add_edges, list) or not isinstance(remove_edges, list):
+        raise RuntimeError("add_edges 和 remove_edges 必须是数组")
+    normalized = _normalize_workflow_result({
+        "id": current.id,
+        "name": current.name,
+        "nodes": [raw_node],
+        "edges": add_edges,
+    }, harness_agent_ids, expected_workflow_id=current.id)
+    step = WorkflowSpec.model_validate(normalized)
+    node = step.nodes[0]
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", node.id):
+        raise RuntimeError(f"节点编号不合法：{node.id}")
+    if node.data.get("agent_id") and node.data["agent_id"] not in harness_agent_ids:
+        raise RuntimeError(f"不存在的 Harness 智能体：{node.data['agent_id']}")
+    draft = current.model_dump(mode="json")
+    existing_ids = {item["id"] for item in draft["nodes"]}
+    if action == "add_node":
+        if node.id in existing_ids:
+            raise RuntimeError(f"新增节点已存在：{node.id}")
+        if len(draft["nodes"]) >= 50:
+            raise RuntimeError("节点数量不能超过 50")
+        if remove_edges:
+            raise RuntimeError("add_node 不允许 remove_edges")
+        draft["nodes"].append(node.model_dump(mode="json"))
+    else:
+        if node.id not in existing_ids:
+            raise RuntimeError(f"修复目标节点不存在：{node.id}")
+        edges_mode = str(value.get("edges_mode", "preserve"))
+        if edges_mode not in {"preserve", "patch"}:
+            raise RuntimeError("revise_node 的 edges_mode 必须是 preserve 或 patch")
+        if edges_mode == "preserve" and (remove_edges or add_edges):
+            raise RuntimeError("edges_mode=preserve 时不能修改连线")
+        draft["nodes"] = [node.model_dump(mode="json") if item["id"] == node.id else item for item in draft["nodes"]]
+        if edges_mode == "patch":
+            remove_keys = {_edge_key(edge) for edge in remove_edges}
+            existing_keys = {_edge_key(edge) for edge in draft["edges"]}
+            missing = remove_keys - existing_keys
+            if missing:
+                raise RuntimeError(f"待删除连线不存在：{sorted(missing)}")
+            draft["edges"] = [edge for edge in draft["edges"] if _edge_key(edge) not in remove_keys]
+    for edge in step.edges:
+        if node.id not in {edge.source, edge.target}:
+            raise RuntimeError(f"创建步骤连线必须连接当前节点 {node.id}")
+        dumped = edge.model_dump(mode="json", exclude_none=True)
+        if dumped not in draft["edges"]:
+            draft["edges"].append(dumped)
+    if isinstance(value.get("workflow_name"), str) and value["workflow_name"].strip():
+        draft["name"] = value["workflow_name"].strip()
+    return WorkflowSpec.model_validate(draft), action, node.id, summary
+
+
+def _creation_step_errors(
+    previous: WorkflowSpec,
+    candidate: WorkflowSpec,
+    action: str,
+    touched_node_id: str | None,
+) -> list[str]:
+    errors: list[str] = []
+    node_ids = {node.id for node in candidate.nodes}
+    edge_keys = [_edge_key(edge) for edge in candidate.edges]
+    if len(edge_keys) != len(set(edge_keys)):
+        errors.append("工作流包含重复连线")
+    for edge in candidate.edges:
+        if edge.source not in node_ids or edge.target not in node_ids:
+            errors.append(f"连线引用不存在节点：{edge.source} → {edge.target}")
+        if edge.source == edge.target:
+            errors.append(f"不允许自环连线：{edge.source}")
+    if action == "add_node" and previous.nodes and touched_node_id:
+        if not any(touched_node_id in {edge.source, edge.target} for edge in candidate.edges):
+            errors.append(f"新增节点 {touched_node_id} 没有接入当前草稿")
+    if len(candidate.edges) > 100:
+        errors.append("连线数量不能超过 100")
+    return list(dict.fromkeys(errors))
+
+
 def _apply_incremental_step(
     current: WorkflowSpec,
     value: Any,
     harness_agent_ids: set[str],
+    *,
+    allow_delete: bool = True,
 ) -> tuple[WorkflowSpec, str, str | None, Any, dict[str, bool], str]:
     if not isinstance(value, dict):
         raise RuntimeError("增量构建结果必须是 JSON 对象")
@@ -1416,6 +1741,8 @@ def _apply_incremental_step(
         draft["name"] = value["workflow_name"].strip()
     touched_node_id: str | None = None
     if action == "delete_node":
+        if not allow_delete:
+            raise RuntimeError("当前操作不允许删除节点")
         raw_node_ids = value.get("node_ids")
         if raw_node_ids is None:
             raw_node_ids = [value.get("node_id")]
@@ -1542,7 +1869,15 @@ def _incremental_connectivity_errors(
 
 
 def _explicit_delete_request(prompt: str) -> bool:
-    return bool(re.search(r"(?:删除|移除|删掉|去掉|delete|remove)\s*[^。！？\n]{0,80}(?:节点|node)?", prompt, re.IGNORECASE))
+    normalized = re.sub(r"\s+", "", prompt.lower())
+    delete_verbs = r"(?:删除|移除|删掉|去掉|delete|remove)"
+    if re.search(rf"(?:不要|别|勿|禁止|不许|不能|不需|不用|无需|无须|莫)[要]?{delete_verbs}", normalized):
+        return False
+    targets = r"(?:节点|node|工作流|workflow)"
+    return bool(
+        re.search(rf"{delete_verbs}(?:[^。！？\n]{{0,80}}){targets}", prompt, re.IGNORECASE)
+        or re.search(rf"{targets}(?:[^。！？\n]{{0,80}}){delete_verbs}", prompt, re.IGNORECASE)
+    )
 
 
 def _incremental_trigger_for_node(workflow: WorkflowSpec, touched_node_id: str | None) -> str | None:

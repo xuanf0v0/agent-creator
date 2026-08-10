@@ -2,7 +2,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from openagent_studio.app import create_app
-from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _EmptyCompactionError, _apply_incremental_step, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _with_file_prompt
+from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _EmptyCompactionError, _apply_creation_step, _apply_incremental_step, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _creation_step_errors, _explicit_delete_request, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _with_file_prompt
 from openagent_studio.store import SpecStore
 from openagent_studio.models import EvaluationAssertion, ProjectSpec, QQIntegrationSpec, WorkflowEvaluation, WorkflowSpec
 from openagent_studio.workflow_runner import EvaluationPolicy, WorkflowManager, validate_executable_workflow
@@ -1512,3 +1512,257 @@ def test_qq_reply_uses_platform_specific_paths(monkeypatch):
     assert calls[0][1]["json"]["msg_type"] == 0
     assert calls[1][0].endswith("/channels/channel-1/messages")
     assert "msg_type" not in calls[1][1]["json"]
+
+
+# ---- 创建 / 修改 / 删除操作边界回归（意图路由 + 专用执行器）----
+
+
+def test_route_isolation_create_entry_and_existing_message_route(tmp_path: Path):
+    app = create_app(tmp_path / "project.yaml")
+    client = TestClient(app)
+    paths = {route.path for route in app.routes}
+    assert "/api/generator/workflows" in paths
+    assert "/api/generator/workflows/{workflow_id}/messages" in paths
+    # 创建入口：非法编号与空需求在调用模型前被拒绝（确定性 422）
+    invalid = client.post("/api/generator/workflows", json={"message": "创建入口流程", "workflow_id": "Bad_Id"})
+    assert invalid.status_code == 422
+    empty = client.post("/api/generator/workflows", json={"message": "", "workflow_id": "entry"})
+    assert empty.status_code == 422
+    # 已有 workflow 的消息入口仍然注册：空消息在 start() 中被拒绝为 422
+    store = SpecStore(tmp_path / "project.yaml")
+    store.save(ProjectSpec.model_validate({
+        "version": "1", "name": "路由", "project_dir": str(tmp_path),
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [{"id": "done", "type": "output", "data": {}}]}],
+    }))
+    existing = client.post("/api/generator/workflows/flow/messages", json={"message": ""})
+    assert existing.status_code == 422
+    # 同名工作流已存在时创建入口拒绝 422，而不是进入修改路径
+    duplicate = client.post("/api/generator/workflows", json={"message": "重复创建", "workflow_id": "flow"})
+    assert duplicate.status_code == 422
+    assert "已存在" in duplicate.json()["detail"]
+
+
+def test_generator_creation_skips_per_layer_probe_and_appends_once(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({"version": "1", "name": "创建", "project_dir": str(tmp_path)})
+    store.save(project)
+    manager = GeneratorManager(store)
+    generation = Generation(
+        id="create-flow", workflow_id="new-flow", base_etag=store.etag(),
+        draft=WorkflowSpec(id="new-flow", name="new-flow").model_dump(mode="json"),
+        prompt="创建一个先接收输入再输出结果的流程", model="provider/model", mode="create",
+    )
+    steps = iter([
+        {"action": "add_node", "node": {"id": "start", "type": "manual_trigger", "data": {"description": "接收输入"}}, "add_edges": [], "summary": "创建入口"},
+        {"action": "add_node", "node": {"id": "done", "type": "output", "data": {"description": "输出结果"}}, "add_edges": [{"source": "start", "target": "done"}], "summary": "创建出口"},
+        {"action": "finish_creation", "summary": "入口与出口已连通"},
+    ])
+    planning_prompts = []
+
+    def fake_invoke(generation, spec, command, workdir, prompt):
+        if "验收设计师" in prompt:
+            cases = [{"id": f"case-{i}", "name": "用例", "input": i, "assertions": [{"path": "output", "operator": "exists"}], "semantic_criteria": ["有效"]} for i in range(3)]
+            return f"<result>{json.dumps({'cases': cases}, ensure_ascii=False)}</result>"
+        if "工作流创建器" in prompt:
+            planning_prompts.append(prompt)
+            return f"<result>{json.dumps(next(steps), ensure_ascii=False)}</result>"
+        return '<result>{"passed":true,"score":90,"issues":[]}</result>'
+
+    manager._invoke = fake_invoke
+    probe_calls = []
+    manager._probe_incremental_workflow = lambda *args: (probe_calls.append(args) or [])
+    manager._run(generation, project)
+
+    assert generation.events[-1]["event"] == "generation.completed", generation.events[-5:]
+    assert probe_calls == []  # 创建中间层绝不允许逐层真实探测
+    assert len(planning_prompts) == 3
+    layers = [item for item in generation.events if item["event"] == "generation.layer_completed"]
+    assert len(layers) == 2
+    assert all(item["data"]["validation_tier"] == "local_graph" for item in layers)
+    stages = [item["data"]["stage"] for item in generation.events if item["event"] == "generation.stage"]
+    assert "validating_complete_graph" in stages
+    assert "full_evaluating" in stages
+    # 创建结果以 append 方式一次保存，且摘要准确描述结构检查与最终验收
+    saved = store.load().workflows
+    assert len(saved) == 1
+    assert saved[0].id == "new-flow"
+    assert [node.id for node in saved[0].nodes] == ["start", "done"]
+    assert [(edge.source, edge.target) for edge in saved[0].edges] == [("start", "done")]
+    assert len(saved[0].evaluation.cases) == 3
+    completed = generation.events[-1]["data"]
+    assert "逐节点创建" in completed["assistant_message"]
+
+
+def test_generator_creation_static_failure_never_saves_to_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # 完整静态校验持续失败时循环必须有界，否则会被误认为“无法修复”而无限重试
+    monkeypatch.setenv("OPENAGENT_INCREMENTAL_MAX_ITERATIONS", "5")
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({"version": "1", "name": "创建", "project_dir": str(tmp_path)})
+    store.save(project)
+    manager = GeneratorManager(store)
+    generation = Generation(
+        id="create-fail", workflow_id="broken-flow", base_etag=store.etag(),
+        draft=WorkflowSpec(id="broken-flow", name="broken-flow").model_dump(mode="json"),
+        prompt="创建一个无法闭合的流程", model="provider/model", mode="create",
+    )
+    creation_calls = []
+
+    def fake_invoke(generation, spec, command, workdir, prompt):
+        if "验收设计师" in prompt:
+            raise AssertionError("完整静态校验失败前不应生成验收用例")
+        if "工作流创建器" in prompt:
+            creation_calls.append(prompt)
+            if len(creation_calls) == 1:
+                return '<result>{"action":"add_node","node":{"id":"start","type":"manual_trigger","data":{}},"add_edges":[],"summary":"入口"}</result>'
+            return '<result>{"action":"finish_creation","summary":"只有入口"}</result>'
+        raise AssertionError(prompt)
+
+    manager._invoke = fake_invoke
+    manager._run(generation, project)
+
+    assert generation.events[-1]["event"] == "generation.failed", generation.events[-5:]
+    stages = [item["data"]["stage"] for item in generation.events if item["event"] == "generation.stage"]
+    assert "validating_complete_graph" in stages
+    assert "full_evaluating" not in stages  # 静态失败时绝不进入完整运行验收
+    assert not any(item.id == "broken-flow" for item in store.load().workflows)
+    assert store.load().workflows == []
+
+
+def test_incremental_update_preserves_undeclared_edges():
+    workflow = WorkflowSpec.model_validate({
+        "id": "flow", "name": "边保留", "nodes": [
+            {"id": "start", "type": "manual_trigger", "data": {}},
+            {"id": "mid", "type": "prompt", "data": {"template": "旧"}},
+            {"id": "done", "type": "output", "data": {}},
+        ], "edges": [
+            {"source": "start", "target": "mid"},
+            {"source": "mid", "target": "done"},
+        ],
+    })
+    # 未声明 edges 时入射/出射边必须原样保留
+    candidate, action, touched, *_ = _apply_incremental_step(
+        workflow, {"action": "update_node", "node": {"id": "mid", "type": "prompt", "data": {"template": "新"}}}, set(),
+    )
+    assert action == "update_node"
+    assert touched == "mid"
+    assert candidate.nodes[1].data["template"] == "新"
+    assert {(edge.source, edge.target) for edge in candidate.edges} == {("start", "mid"), ("mid", "done")}
+    # 显式声明 edges 时才按声明替换该节点的 incident 边
+    patched, *_ = _apply_incremental_step(
+        workflow, {"action": "update_node", "node": {"id": "done", "type": "output", "data": {}}, "edges": [{"source": "start", "target": "done"}]}, set(),
+    )
+    # done 的入射边 (mid→done) 被声明替换为 (start→done)，与 done 无关的 (start→mid) 原样保留
+    assert {(edge.source, edge.target) for edge in patched.edges} == {("start", "mid"), ("start", "done")}
+
+
+def test_creation_step_revise_edges_mode_and_add_connection_rule():
+    workflow = WorkflowSpec.model_validate({
+        "id": "flow", "name": "创建", "nodes": [
+            {"id": "start", "type": "manual_trigger", "data": {}},
+            {"id": "done", "type": "output", "data": {}},
+        ], "edges": [{"source": "start", "target": "done"}],
+    })
+    # revise_node 默认 preserve：边原样保留，只替换节点
+    revised, action, touched, _ = _apply_creation_step(
+        workflow, {"action": "revise_node", "node": {"id": "done", "type": "output", "data": {"description": "更新"}}, "summary": "补说明"}, set(),
+    )
+    assert action == "revise_node" and touched == "done"
+    assert revised.nodes[1].data["description"] == "更新"
+    assert [(edge.source, edge.target) for edge in revised.edges] == [("start", "done")]
+    # preserve 时提交边修改被拒绝
+    with pytest.raises(RuntimeError):
+        _apply_creation_step(workflow, {"action": "revise_node", "node": {"id": "done", "type": "output", "data": {}}, "add_edges": [{"source": "start", "target": "done"}]}, set())
+    # patch 只应用显式声明的 remove/add 边
+    patched, *_ = _apply_creation_step(
+        workflow, {"action": "revise_node", "node": {"id": "done", "type": "output", "data": {}},
+        "edges_mode": "patch", "remove_edges": [{"source": "start", "target": "done"}], "add_edges": [], "summary": "断开"}, set(),
+    )
+    assert patched.edges == []
+    # 删除不存在的边被拒绝
+    with pytest.raises(RuntimeError):
+        _apply_creation_step(workflow, {"action": "revise_node", "node": {"id": "done", "type": "output", "data": {}},
+            "edges_mode": "patch", "remove_edges": [{"source": "start", "target": "missing"}]}, set())
+    # 第一个节点可以独立存在，不要求接入已有图
+    solo, action, touched, _ = _apply_creation_step(
+        WorkflowSpec(id="flow", name="创建"),
+        {"action": "add_node", "node": {"id": "start", "type": "manual_trigger", "data": {}}, "add_edges": [], "summary": "入口"}, set(),
+    )
+    assert [node.id for node in solo.nodes] == ["start"]
+    assert _creation_step_errors(WorkflowSpec(id="flow", name="创建"), solo, action, touched) == []
+    # 已有节点时新增节点必须接入草稿
+    orphan, *_ = _apply_creation_step(
+        solo, {"action": "add_node", "node": {"id": "done", "type": "output", "data": {}}, "add_edges": [], "summary": "未接入"}, set(),
+    )
+    errors = _creation_step_errors(solo, orphan, "add_node", "done")
+    assert any("没有接入当前草稿" in error for error in errors)
+
+
+def test_delete_authorization_negation_and_scope():
+    assert _explicit_delete_request("删除节点 mid")
+    assert _explicit_delete_request("请删除 workflow report-flow")
+    assert _explicit_delete_request("把节点 old-step 移除掉")
+    assert not _explicit_delete_request("不要删除节点 mid")
+    assert not _explicit_delete_request("别删除工作流 report-flow")
+    assert not _explicit_delete_request("不能删除任何节点")
+    assert not _explicit_delete_request("请优化流程，不要动节点")
+
+
+def test_delete_workflow_route_lifecycle(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "生命周期", "project_dir": str(tmp_path),
+        "workflows": [
+            {"id": "flow", "name": "流程", "nodes": [{"id": "done", "type": "output", "data": {}}]},
+            {"id": "keep", "name": "保留", "nodes": [{"id": "done", "type": "output", "data": {}}]},
+        ],
+    })
+    store.save(project)
+    client = TestClient(create_app(tmp_path / "project.yaml"))
+    response = client.delete("/api/workflows/flow", headers={"If-Match": store.etag()})
+    assert response.status_code == 200
+    assert response.json()["workflow_id"] == "flow"
+    assert [item.id for item in store.load().workflows] == ["keep"]
+
+
+def test_delete_workflow_route_404_and_stale_etag(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "生命周期", "project_dir": str(tmp_path),
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [{"id": "done", "type": "output", "data": {}}]}],
+    })
+    store.save(project)
+    client = TestClient(create_app(tmp_path / "project.yaml"))
+    missing = client.delete("/api/workflows/nope")
+    assert missing.status_code == 404
+    stale = client.delete("/api/workflows/flow", headers={"If-Match": "stale-etag"})
+    assert stale.status_code == 409
+    assert [item.id for item in store.load().workflows] == ["flow"]  # 并发冲突不覆盖、不删除
+
+
+def test_delete_workflow_route_blockers(tmp_path: Path):
+    env_file = tmp_path / "platform.env"
+    env_file.write_text("FEISHU_APP_ID=app\nFEISHU_APP_SECRET=secret\nFEISHU_VERIFICATION_TOKEN=verify\n", encoding="utf-8")
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "生命周期", "project_dir": str(tmp_path),
+        "workflows": [
+            {"id": "bot-flow", "name": "机器人", "nodes": [{"id": "done", "type": "output", "data": {}}]},
+            {"id": "referenced", "name": "被引用", "nodes": [{"id": "done", "type": "output", "data": {}}]},
+            {"id": "parent", "name": "父流程", "nodes": [
+                {"id": "sub", "type": "subworkflow", "data": {"workflow_id": "referenced"}},
+                {"id": "done", "type": "output", "data": {}},
+            ], "edges": [{"source": "sub", "target": "done"}]},
+        ],
+        "integrations": {"feishu": [{"id": "main", "workflow_id": "bot-flow", "env_file": str(env_file), "auto_reply": False}]},
+    })
+    store.save(project)
+    client = TestClient(create_app(tmp_path / "project.yaml"))
+    etag = store.etag()
+    blocked = client.delete("/api/workflows/bot-flow", headers={"If-Match": etag})
+    assert blocked.status_code == 409
+    assert "飞书集成" in blocked.json()["detail"]
+    blocked_sub = client.delete("/api/workflows/referenced", headers={"If-Match": etag})
+    assert blocked_sub.status_code == 409
+    assert "子工作流" in blocked_sub.json()["detail"]
+    # blocker 失败后磁盘状态完全不变
+    assert [item.id for item in store.load().workflows] == ["bot-flow", "referenced", "parent"]
