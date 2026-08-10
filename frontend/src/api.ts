@@ -1,5 +1,12 @@
 import type { IntegrationsStatus, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
 
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 export async function loadSpec(): Promise<{ etag: string; spec: ProjectSpec }> {
   const response = await fetch('/api/spec')
   if (!response.ok) throw new Error('无法读取项目配置')
@@ -11,7 +18,7 @@ export async function saveWorkflow(workflow: Workflow, etag: string) {
     method: 'PUT', headers: { 'content-type': 'application/json', 'if-match': etag }, body: JSON.stringify(workflow),
   })
   const body = await response.json()
-  if (!response.ok) throw new Error(body.detail || '保存工作流失败')
+  if (!response.ok) throw new ApiError(body.detail || '保存工作流失败', response.status)
   return body as { etag: string; workflow: Workflow }
 }
 
@@ -34,7 +41,7 @@ export async function optimizeWorkflow(workflowId: string) {
 export async function loadGeneratorMessages(workflowId: string) {
   const response = await fetch(`/api/generator/workflows/${workflowId}/messages`)
   if (!response.ok) return []
-  return response.json() as Promise<Array<{ role: 'user' | 'assistant'; content: string }>>
+  return response.json() as Promise<Array<{ role: 'user' | 'assistant'; content: string; options?: string[] }>>
 }
 
 export function loadGeneratorStatus() {

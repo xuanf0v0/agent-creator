@@ -46,12 +46,13 @@ uv run uvicorn openagent_studio.app:app --host 127.0.0.1 --port 8787
 默认不会监听公网地址。`project.yaml` 是规范源文件；`/api/compile/opencode` 可以预览
 OpenCode 配置。Studio 始终连接独立运行的 Harness。
 
-仓库中的 `project.yaml` 已配置真实的 `deepseek/deepseek-v4-flash` OpenCode 代码智能体，以及一套
-可直接运行的选品决策工作流；不包含回声、固定响应或无模型 worker。选品流程中的需求整理、市场研究、
-竞品分析和利润评估节点都配置了独立的角色、目标、上下文、约束与输出格式提示词。
+仓库中的 `project.yaml` 已配置真实的 `deepseek/deepseek-v4-flash` OpenCode 代码智能体，默认打开的是
+空白工作流画布；不包含回声、固定响应或无模型 worker。你可以直接通过 OpenCode 创作助手从空白画布开始
+创建流程，也可以拖入节点后再进行增量修改。飞书和 QQ 集成默认仍引用 `product-selection` 工作流，
+需要启用机器人时请先在画布中完成并保存对应流程。
 
 Studio 固定依赖 [xuanf0v0/my-harness](https://github.com/xuanf0v0/my-harness)
-提交 `bea70fb812e98f530d262eeccb5a889b51dc821d` 的独立 Python SDK。所有任务只走
+提交 `d73a00704b98b343a36369989b299a3f71fc721c` 的独立 Python SDK。所有任务只走
 `/api/v1/tasks`、状态、日志、结果和取消接口，不再包含旧 `/api/tasks` 或服务代理兼容路径。
 `project.yaml` 的 Harness 项只保存逻辑 ID、`backend_id` 和 Harness Catalog 中的 `agent_id`。
 任务客户端还会通过 `/api/v1/task-agents`（仅需 Task Token）检查 Agent 的通用 labels、协议和 setup readiness；
@@ -71,10 +72,13 @@ Studio 不读取 `AGENT_HARNESS_MANAGEMENT_TOKEN`。管理 Token 只应存在于
 ### 安装并启动独立 Harness（Windows）
 
 ```powershell
-.\scripts\install-harness.ps1
-.\scripts\register-harness-agent.ps1
-.\scripts\start-studio.ps1
+.\scripts\start-all.ps1
 ```
+
+`start-all.ps1` 是 Windows 一键入口：检查并按固定提交安装/升级独立 Harness，必要时只停止
+确认属于 `HarnessRoot` 的旧 8765 监听进程，然后启动 Harness、注册并 setup coding Agent，最后
+在 8787 启动 Studio。React 生产前端由 Studio 直接托管，无需单独启动 Vite。重复执行时，版本
+未变化便不会重新安装。需要强制重装时使用 `.\scripts\start-all.ps1 -ForceInstall`。
 
 macOS 可使用同等的一键编排入口：
 
@@ -111,7 +115,7 @@ Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整
 真实运行完成后检查输出字段、值、类型或格式，不能代替真实执行。审批节点在无人值守验收时使用用例中的
 决策；其他节点不使用 Mock。增量层探测默认最多等待 `OPENAGENT_INCREMENTAL_PROBE_TIMEOUT=120` 秒；
 `OPENAGENT_INCREMENTAL_MAX_ITERATIONS` 可设置最大增量迭代次数，默认 `0` 表示不设上限，直到通过或用户点击停止生成。
-OpenCode 生成调用默认最多等待 120 秒（`OPENCODE_GENERATOR_CALL_TIMEOUT`，范围 30–1800）；
+OpenCode 生成调用默认最多等待 300 秒（`OPENCODE_GENERATOR_CALL_TIMEOUT`，范围 30–1800）；
 修复候选默认最多等待 60 秒（`OPENCODE_REPAIR_CALL_TIMEOUT`，范围 30–600），修复超时不会重复请求，
 以免多个候选串行等待造成无意义的长时间阻塞。
 每次 OpenCode 调用还会把用途、进程号、退出码、耗时、超时、诊断摘要和响应尾部写入

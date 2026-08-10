@@ -53,8 +53,12 @@ if ($Existing.id -contains "coding") {
     Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/v1/agents" -Headers $Headers -ContentType "application/json" -Body $Body | Out-Null
 }
 $sha = [Security.Cryptography.SHA256]::Create()
-$ManifestHash = [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Body))).ToLowerInvariant()
-$sha.Dispose()
+try {
+    $HashBytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Body))
+    $ManifestHash = -join ($HashBytes | ForEach-Object { $_.ToString("x2") })
+} finally {
+    $sha.Dispose()
+}
 $SetupHeaders = @{
     Authorization = "Bearer $($Secrets.AGENT_HARNESS_MANAGEMENT_TOKEN)"
     "Idempotency-Key" = "coding-setup-$ManifestHash"

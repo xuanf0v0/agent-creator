@@ -194,7 +194,7 @@ def test_generator_chat_reply_does_not_modify_workflow(monkeypatch, tmp_path: Pa
 
     def fake_invoke(*args, **_kwargs):
         prompts.append(args[4])
-        return '<result>{"action":"reply","answer":"输出节点负责定义工作流最终返回值。"}</result>'
+        return '<result>{"action":"reply","answer":"输出节点负责定义工作流最终返回值。","options":[]}</result>'
 
     manager._invoke = fake_invoke
     original_etag = store.etag()
@@ -208,6 +208,20 @@ def test_generator_chat_reply_does_not_modify_workflow(monkeypatch, tmp_path: Pa
     ]
     assert generation.events[-1]["data"]["message"] == "输出节点负责定义工作流最终返回值。"
     assert manager.history["flow"][-1] == {"role": "assistant", "content": "输出节点负责定义工作流最终返回值。"}
+
+
+def test_generator_chat_reply_exposes_three_clarification_options(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    workflow = WorkflowSpec.model_validate({"id": "flow", "name": "流程", "nodes": [], "edges": []})
+    generation = Generation(id="choices", workflow_id="flow", base_etag="etag", draft={}, prompt="帮我做一个流程", model="provider/model")
+    manager._invoke_result = lambda *_args, **_kwargs: {
+        "action": "reply", "answer": "你希望优先实现哪类流程？",
+        "options": ["内容生产流程", "数据分析流程", "审批自动化流程"],
+    }
+
+    decision = manager._route_chat_turn(generation, ProjectSpec(name="测试"), ["opencode"], tmp_path, workflow)
+
+    assert decision["options"] == ["内容生产流程", "数据分析流程", "审批自动化流程"]
 
 
 def test_generator_chat_router_can_return_complete_modify_request(tmp_path: Path):
@@ -537,6 +551,11 @@ def test_generator_call_timeout_is_bounded(monkeypatch):
     assert _invoke_timeout_seconds() == 30
     monkeypatch.setenv("OPENCODE_GENERATOR_CALL_TIMEOUT", "9999")
     assert _invoke_timeout_seconds() == 1800
+
+
+def test_generator_call_timeout_default_is_long_context_safe(monkeypatch):
+    monkeypatch.delenv("OPENCODE_GENERATOR_CALL_TIMEOUT", raising=False)
+    assert _invoke_timeout_seconds() == 300
 
 
 def test_generator_compaction_limits_are_bounded(monkeypatch):

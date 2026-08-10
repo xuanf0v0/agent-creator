@@ -75,11 +75,13 @@ disconnect_nodes: {"action":"disconnect_nodes","source":"来源节点","target":
 
 CHAT_ROUTER_PROMPT = """你是 OpenAgent Studio 中可连续对话的 OpenCode 创作助手。先判断用户这一轮是要聊天答复，还是明确要求修改当前工作流。
 只输出 <result>{JSON}</result>，JSON 只能是以下两种之一：
-1. {"action":"reply","answer":"直接给用户的完整中文答复或需要追问的澄清问题"}
+1. {"action":"reply","answer":"直接给用户的完整中文答复或需要追问的澄清问题","options":["选项一","选项二","选项三"]}
 2. {"action":"modify","request":"结合上下文补全后的、可独立执行的工作流修改要求"}
 判断规则：
 - 询问概念、当前画布、节点作用、设计建议、可行性、错误原因、如何操作、打招呼或普通交流，一律 reply，直接回答，不修改画布。
 - 用户意图不足以确定节点、数据流或期望效果时 reply，并提出最少且具体的澄清问题；不能擅自修改。
+- reply 确实需要用户选择或补充信息时，options 必须给出恰好 3 个互斥、具体、可直接作答的短选项；前端会另行提供第 4 个自定义输入框。
+- reply 只是回答问题、不需要用户继续选择时，options 必须是空数组。禁止把“其他”或“自定义输入”放进 options。
 - 只有用户明确要求创建、增加、删除、连接、调整或优化工作流时才 modify。
 - 若前文由你提出了澄清问题，本轮回答已补足修改要求，则 modify，并把多轮信息合并为完整 request。
 - reply 时不得声称已经修改画布；modify 时不要回答用户，只整理 request。
@@ -363,10 +365,14 @@ class GeneratorManager:
                 decision = self._route_chat_turn(generation, spec, command, workdir, original)
                 if decision["action"] == "reply":
                     answer = decision["answer"]
-                    self.history.setdefault(generation.workflow_id, []).append({"role": "assistant", "content": answer})
+                    options = decision.get("options", [])
+                    history_item: dict[str, Any] = {"role": "assistant", "content": answer}
+                    if options:
+                        history_item["options"] = options
+                    self.history.setdefault(generation.workflow_id, []).append(history_item)
                     generation.completed = True
                     generation.emit("chat.assistant.delta", {"text": answer})
-                    generation.emit("chat.completed", {"message": answer})
+                    generation.emit("chat.completed", {"message": answer, "options": options})
                     return
                 generation.prompt = decision["request"]
             if spec.harness and generation.mode != "create":
@@ -837,7 +843,7 @@ class GeneratorManager:
         command: list[str],
         workdir: Path,
         workflow: WorkflowSpec,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         history = self.history.get(generation.workflow_id, [])[-20:]
         if history and history[-1].get("role") == "user" and history[-1].get("content") == generation.prompt:
             history = history[:-1]
@@ -855,6 +861,13 @@ class GeneratorManager:
         text = str(raw.get(field, "")).strip()
         if not text:
             raise RuntimeError(f"OpenCode 对话结果缺少非空 {field}")
+        if action == "reply":
+            raw_options = raw.get("options", [])
+            options = [str(item).strip() for item in raw_options] if isinstance(raw_options, list) else []
+            options = [item for item in options if item and len(item) <= 120]
+            if len(options) != 3 or len(set(options)) != 3:
+                options = []
+            return {"action": action, field: text, "options": options}
         return {"action": action, field: text}
 
     def _compact_prompt(
@@ -1458,9 +1471,9 @@ def _invoke_timeout_seconds() -> int:
     try:
         # Bound each incremental planning call; the outer build loop continues
         # until verification passes, cancellation, or an infrastructure error.
-        return max(30, min(int(os.environ.get("OPENCODE_GENERATOR_CALL_TIMEOUT", "120")), 1800))
+        return max(30, min(int(os.environ.get("OPENCODE_GENERATOR_CALL_TIMEOUT", "300")), 1800))
     except ValueError:
-        return 120
+        return 300
 
 
 def _repair_timeout_seconds() -> int:

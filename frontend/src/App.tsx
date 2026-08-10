@@ -4,7 +4,7 @@ import {
   SelectionMode, addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
   type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange,
 } from '@xyflow/react'
-import { cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadRuntimeStatus, loadSpec, optimizeWorkflow, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
+import { ApiError, cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadRuntimeStatus, loadSpec, optimizeWorkflow, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
 import type { EvaluationCase, IntegrationsStatus, NodeKind, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
 
 type CatalogItem = { type: NodeKind; category: string; label: string; icon: string; description: string }
@@ -49,7 +49,7 @@ const harnessNodeKinds: NodeKind[] = ['llm', 'agent', 'tool', 'code', 'validator
 
 type CanvasData = { label: string; description: string; kind: NodeKind; agent_id?: string; [key: string]: unknown }
 type CanvasNode = Node<CanvasData>
-type ChatMessage = { role: 'user' | 'assistant' | 'system'; content: string }
+type ChatMessage = { role: 'user' | 'assistant' | 'system'; content: string; options?: string[] }
 
 const nodeStyle = { background: 'rgba(255,255,255,.055)', color: 'rgba(255,255,255,.92)', border: 'none', borderRadius: 16, width: 200, boxShadow: '0 12px 32px rgba(0,0,0,.42), inset 0 1px 1px rgba(255,255,255,.12)', fontSize: 12 }
 
@@ -212,7 +212,37 @@ function StudioCanvas() {
       setSpec({ ...spec, workflows: spec.workflows.map((item) => item.id === workflow.id ? result.workflow : item) })
       setMessage('工作流已保存')
       return true
-    } catch (error) { setMessage(error instanceof Error ? error.message : '保存失败'); return false }
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        try {
+          const latest = await loadSpec()
+          const serverWorkflow = latest.spec.workflows.find((item) => item.id === workflow.id)
+          if (serverWorkflow && JSON.stringify(serverWorkflow) === JSON.stringify(payload)) {
+            setSpec(latest.spec); setEtag(latest.etag); setMessage('服务端已包含当前画布，版本已同步')
+            return true
+          }
+          if (serverWorkflow && JSON.stringify(serverWorkflow) === JSON.stringify(workflow)) {
+            const retried = await saveWorkflow(payload, latest.etag)
+            setEtag(retried.etag)
+            setSpec({ ...latest.spec, workflows: latest.spec.workflows.map((item) => item.id === workflow.id ? retried.workflow : item) })
+            setMessage('检测到其他配置更新，已同步版本并保存当前工作流')
+            return true
+          }
+          if (serverWorkflow) {
+            const view = toCanvas(serverWorkflow)
+            setNodes(view.nodes); setEdges(view.edges)
+          }
+          setSpec(latest.spec); setEtag(latest.etag)
+          setMessage('服务端工作流已发生并发修改，已载入最新版本；请确认后重新发送')
+          return false
+        } catch (refreshError) {
+          setMessage(refreshError instanceof Error ? refreshError.message : '刷新工作流版本失败')
+          return false
+        }
+      }
+      setMessage(error instanceof Error ? error.message : '保存失败')
+      return false
+    }
     finally { setSaving(false) }
   }
 
@@ -264,7 +294,13 @@ function StudioCanvas() {
       if (last?.role === 'assistant') return [...items.slice(0, -1), { ...last, content: last.content + text }]
       return [...items, { role: 'assistant', content: text }]
     }))
-    listen('chat.completed', () => {
+    listen('chat.completed', ({ options }) => {
+      if (Array.isArray(options) && options.length === 3) {
+        setChatMessages((items) => {
+          const last = items[items.length - 1]
+          return last?.role === 'assistant' ? [...items.slice(0, -1), { ...last, options }] : items
+        })
+      }
       setGenerationId(null); setMessage('OpenCode 已回复'); source.close()
     })
     listen('generation.completed', ({ workflow: completed, etag: tag, assistant_message }) => {
@@ -272,21 +308,41 @@ function StudioCanvas() {
       if (assistant_message) setChatMessages((items) => [...items, { role: 'assistant', content: assistant_message }])
       setGenerationId(null); setMessage(successMessage); source.close()
     })
-    const finishError = (text: string) => { setGenerationId(null); setMessage(text); setChatMessages((items) => [...items, { role: 'system', content: text }]); source.close() }
-    listen('generation.failed', ({ message: text }) => finishError(`优化失败：${text}`))
-    listen('generation.conflict', ({ message: text }) => finishError(text))
-    listen('generation.cancelled', () => finishError('已停止本轮优化，原工作流未改变'))
+    const finishError = async (text: string) => {
+      source.close()
+      setMessage(`${text}；正在恢复服务端稳定版本…`)
+      setChatMessages((items) => [...items, { role: 'system', content: text }])
+      try {
+        const latest = await loadSpec()
+        const stable = latest.spec.workflows.find((item) => item.id === workflowId)
+        setSpec(latest.spec); setEtag(latest.etag)
+        if (stable) {
+          const view = toCanvas(stable)
+          setNodes(view.nodes); setEdges(view.edges)
+          setTimeout(() => fitView({ padding: 0.22 }), 40)
+        }
+        setMessage(text)
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : '无法刷新项目配置'
+        setMessage(`${text}；恢复服务端版本失败：${detail}`)
+      } finally {
+        setGenerationId(null)
+      }
+    }
+    listen('generation.failed', ({ message: text }) => { void finishError(`优化失败：${text}`) })
+    listen('generation.conflict', ({ message: text }) => { void finishError(text) })
+    listen('generation.cancelled', () => { void finishError('已停止本轮优化，原工作流未改变') })
     source.onerror = () => { if (source.readyState === EventSource.CLOSED) setGenerationId(null) }
   }
 
-  async function generateFromChat() {
-    const text = chatInput.trim()
+  async function generateFromChat(selectedOption?: string) {
+    const text = (selectedOption ?? chatInput).trim()
     if (!text || !workflowId || generationId) return
     try {
       setMessage('正在同步完整画布给 OpenCode…')
       if (!await persist()) return
       setChatInput('')
-      setChatMessages((items) => [...items, { role: 'user', content: text }])
+      setChatMessages((items) => [...items.map((item) => item.options ? { ...item, options: undefined } : item), { role: 'user', content: text }])
       setMessage(`OpenCode 正在读取 ${nodes.length} 个节点和 ${edges.length} 条连线…`)
       const started = await sendGeneratorMessage(workflowId, text)
       followGeneration(started, '工作流已通过验收并自动采用最佳方案')
@@ -387,11 +443,11 @@ function StudioCanvas() {
         <div className="generator-title"><span className="ai-orb">✦</span><div><strong>OpenCode 创作助手</strong><small>真实模型：{generatorModel}</small></div></div>
         <div className="chat-messages">
           {chatMessages.length === 0 && <div className="chat-empty"><p>你可以这样说：</p><button onClick={() => setChatInput('创建一个代码审查流程，先分析代码，再人工审批，最后运行测试')}>创建代码审查流程</button><button onClick={() => setChatInput('在当前流程的验证前增加一个人工审批节点')}>增量修改当前流程</button></div>}
-          {chatMessages.map((item, index) => <div key={index} className={`chat-message ${item.role}`}><span>{item.role === 'user' ? '你' : item.role === 'assistant' ? 'AI' : '!'}</span><p>{item.content}</p></div>)}
+          {chatMessages.map((item, index) => <div key={index} className={`chat-message ${item.role}`}><span>{item.role === 'user' ? '你' : item.role === 'assistant' ? 'AI' : '!'}</span><div className="chat-message-body"><p>{item.content}</p>{item.options?.length === 3 && index === chatMessages.length - 1 && <div className="chat-options">{item.options.map((option) => <button key={option} disabled={!!generationId} onClick={() => void generateFromChat(option)}>{option}</button>)}<small>或在下方输入你的自定义答案</small></div>}</div></div>)}
           {generationId && <div className="thinking"><i/><i/><i/><span>OpenCode 正在思考…</span></div>}
         </div>
-        <div className="chat-composer"><textarea autoFocus value={chatInput} disabled={!!generationId} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); generateFromChat() } }} placeholder="可以询问当前工作流，也可以要求创建、修改或优化节点…"/>
-          {generationId ? <button className="stop" onClick={stopGeneration}>停止生成</button> : <button className="send" onClick={generateFromChat} disabled={!chatInput.trim()}>发送并构建工作流</button>}
+        <div className="chat-composer"><textarea autoFocus value={chatInput} disabled={!!generationId} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void generateFromChat() } }} placeholder={chatMessages.at(-1)?.options?.length === 3 ? '自定义输入（第 4 个选项）…' : '可以询问当前工作流，也可以要求创建、修改或优化节点…'}/>
+          {generationId ? <button className="stop" onClick={stopGeneration}>停止生成</button> : <button className="send" onClick={() => void generateFromChat()} disabled={!chatInput.trim()}>发送并构建工作流</button>}
         </div>
       </div> : rightTab === 'evaluation' ? <div className="run-panel evaluation-panel">
         <div className="panel-title"><strong>验收标准</strong><span>OpenCode 会保留旧用例，并为改动追加最多 3 个</span></div>

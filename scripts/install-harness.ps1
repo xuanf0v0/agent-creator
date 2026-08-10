@@ -3,7 +3,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$PinnedRef = "bea70fb812e98f530d262eeccb5a889b51dc821d"
+$VersionScript = Join-Path $PSScriptRoot "harness-version.ps1"
+. $VersionScript
+$PinnedRef = $HarnessPinnedRef
 $RuntimePackage = "agent-harness @ https://github.com/xuanf0v0/my-harness/archive/$PinnedRef.zip"
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $AdapterPath = Join-Path $ProjectRoot "adapters\opencode"
@@ -20,6 +22,13 @@ if (-not (Test-Path -LiteralPath $PythonPath)) {
     uv venv $VenvPath --python 3.11
 }
 uv pip install --python $PythonPath --link-mode copy $RuntimePackage $AdapterPath
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Harness ZIP 下载/安装失败，改用同一提交的 Git 传输重试"
+    $GitRuntimePackage = "agent-harness @ git+https://github.com/xuanf0v0/my-harness.git@$PinnedRef"
+    uv pip install --python $PythonPath --link-mode copy $GitRuntimePackage $AdapterPath
+    if ($LASTEXITCODE -ne 0) { throw "Harness 安装失败（ZIP 与 Git 传输均失败，exit=$LASTEXITCODE）" }
+}
+$PinnedRef | Set-Content -LiteralPath (Join-Path $HarnessRoot ".installed-ref") -Encoding ascii
 
 if (-not (Test-Path -LiteralPath $RuntimeEnv)) {
     function New-SecureToken {
@@ -37,4 +46,4 @@ if (-not (Test-Path -LiteralPath $RuntimeEnv)) {
 }
 
 Write-Host "Harness 已安装到 $HarnessRoot"
-Write-Host "下一步：运行 scripts\start-harness.ps1，再运行 scripts\register-harness-agent.ps1"
+Write-Host "Harness 版本：$PinnedRef"
