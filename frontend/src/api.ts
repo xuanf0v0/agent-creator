@@ -71,6 +71,10 @@ export function startWorkflowRun(workflowId: string, input: string) {
   return jsonRequest<WorkflowRun>(`/api/workflows/${workflowId}/runs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ input }) })
 }
 
+export function loadWorkflowRun(runId: string) {
+  return jsonRequest<WorkflowRun>(`/api/workflow-runs/${runId}`)
+}
+
 export function cancelWorkflowRun(runId: string) {
   return jsonRequest<WorkflowRun>(`/api/workflow-runs/${runId}/cancel`, { method: 'POST' })
 }

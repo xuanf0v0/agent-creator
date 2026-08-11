@@ -15,3 +15,4 @@ frontend/dist/
 .harness/PROGRESS.md
 .harness/agent-harness/
 .openagent-logs/
+.claude/worktrees/

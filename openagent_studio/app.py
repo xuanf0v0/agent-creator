@@ -102,7 +102,7 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
     def put_workflow(workflow_id: str, workflow: WorkflowSpec, if_match: str | None = Header(default=None)):
         if workflow.id != workflow_id:
             raise HTTPException(status_code=422, detail="工作流编号不一致")
-        current = store.load()
+        current = store.load().model_copy(deep=True)
         if not any(item.id == workflow_id for item in current.workflows):
             raise HTTPException(status_code=404, detail="找不到工作流")
         node_ids = {node.id for node in workflow.nodes}
@@ -117,7 +117,7 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
 
     @app.delete("/api/workflows/{workflow_id}")
     def delete_workflow(workflow_id: str, if_match: str | None = Header(default=None)):
-        current = store.load()
+        current = store.load().model_copy(deep=True)
         if not any(item.id == workflow_id for item in current.workflows):
             raise HTTPException(status_code=404, detail="找不到工作流")
         blockers = workflow_delete_blockers(current, workflow_id)
@@ -211,25 +211,46 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="找不到工作流运行记录") from exc
 
     @app.get("/api/workflow-runs/{run_id}/events")
-    def workflow_run_events(run_id: str):
+    def workflow_run_events(run_id: str, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")):
         try:
             run = workflows.require(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="找不到工作流运行记录") from exc
 
         def stream():
-            cursor = 0
+            try:
+                cursor = int(last_event_id) + 1 if last_event_id is not None else None
+            except ValueError:
+                cursor = None
             while True:
+                reset = None
                 with run.event_signal:
-                    if cursor >= len(run.events) and run.status not in TERMINAL_RUN_STATES:
-                        run.event_signal.wait(timeout=15)
-                    events = run.events[cursor:]
-                    cursor = len(run.events)
+                    first_sequence = run.events[0]["sequence"] if run.events else run.next_event_sequence
+                    if cursor is None:
+                        cursor = first_sequence
+                    elif cursor < first_sequence:
+                        reset = {"reason": "events_expired", "next_sequence": first_sequence}
+                        cursor = first_sequence
+                    events = [item for item in run.events if item["sequence"] >= cursor]
+                    if not events and run.status not in TERMINAL_RUN_STATES:
+                        notified = run.event_signal.wait(timeout=15)
+                        first_sequence = run.events[0]["sequence"] if run.events else run.next_event_sequence
+                        if cursor < first_sequence:
+                            reset = {"reason": "events_expired", "next_sequence": first_sequence}
+                            cursor = first_sequence
+                        events = [item for item in run.events if item["sequence"] >= cursor]
+                    else:
+                        notified = True
+                    if events:
+                        cursor = events[-1]["sequence"] + 1
+                    completed = run.status in TERMINAL_RUN_STATES and cursor >= run.next_event_sequence
+                if reset:
+                    yield f"event: stream.reset\ndata: {json.dumps(reset, ensure_ascii=False)}\n\n"
                 for item in events:
-                    yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-                if run.status in TERMINAL_RUN_STATES and cursor >= len(run.events):
+                    yield f"id: {item['sequence']}\nevent: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
+                if completed:
                     return
-                if not events:
+                if not events and not notified:
                     yield ": heartbeat\n\n"
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -297,7 +318,7 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
         return {"generation_id": generation.id, "workflow_id": workflow_id}
 
     @app.get("/api/generator/generations/{generation_id}/events")
-    def generator_events(generation_id: str):
+    def generator_events(generation_id: str, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")):
         try:
             generation = generator.require(generation_id)
         except KeyError:
@@ -320,17 +341,39 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
             )
 
         def stream():
-            cursor = 0
+            try:
+                cursor = int(last_event_id) + 1 if last_event_id is not None else None
+            except ValueError:
+                cursor = None
             while True:
-                while cursor < len(generation.events):
-                    item = generation.events[cursor]
-                    cursor += 1
-                    yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-                if generation.completed and cursor >= len(generation.events):
+                reset = None
+                with generation.event_signal:
+                    first_sequence = generation.events[0]["sequence"] if generation.events else generation.next_event_sequence
+                    if cursor is None:
+                        cursor = first_sequence
+                    elif cursor < first_sequence:
+                        reset = {"reason": "events_expired", "next_sequence": first_sequence}
+                        cursor = first_sequence
+                    events = [item for item in generation.events if item["sequence"] >= cursor]
+                    if not events and not generation.completed:
+                        notified = generation.event_signal.wait(timeout=15)
+                        first_sequence = generation.events[0]["sequence"] if generation.events else generation.next_event_sequence
+                        if cursor < first_sequence:
+                            reset = {"reason": "events_expired", "next_sequence": first_sequence}
+                            cursor = first_sequence
+                        events = [item for item in generation.events if item["sequence"] >= cursor]
+                    else:
+                        notified = True
+                    if events:
+                        cursor = events[-1]["sequence"] + 1
+                    completed = generation.completed and cursor >= generation.next_event_sequence
+                if reset:
+                    yield f"event: stream.reset\ndata: {json.dumps(reset, ensure_ascii=False)}\n\n"
+                for item in events:
+                    yield f"id: {item['sequence']}\nevent: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
+                if completed:
                     return
-                try:
-                    generation.event_queue.get(timeout=15)
-                except Exception:
+                if not events and not notified:
                     yield ": heartbeat\n\n"
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

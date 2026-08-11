@@ -43,6 +43,7 @@ class WorkflowRun:
     node_states: dict[str, dict[str, Any]] = field(default_factory=dict)
     outputs: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
+    next_event_sequence: int = 0
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     completed_at: float | None = None
@@ -90,6 +91,15 @@ class WorkflowManager:
         poll_interval: float = 0.5,
         max_workers: int = 8,
         client_factory: Callable[[str], HarnessClient] | None = None,
+        max_retained_runs: int = 200,
+        max_run_events: int = 1000,
+        max_http_response_bytes: int = 5 * 1024 * 1024,
+        max_concurrent_runs: int = 8,
+        max_harness_log_items: int = 500,
+        max_harness_log_bytes: int = 2 * 1024 * 1024,
+        max_harness_log_line_bytes: int = 64 * 1024,
+        max_harness_result_bytes: int = 2 * 1024 * 1024,
+        max_harness_text_bytes: int = 1024 * 1024,
     ) -> None:
         self.base_url = base_url.rstrip("/") if base_url else None
         self.client_factory = client_factory or (
@@ -100,8 +110,21 @@ class WorkflowManager:
         )
         self.poll_interval = poll_interval
         self.max_workers = max_workers
+        self.max_retained_runs = max(1, max_retained_runs)
+        self.max_run_events = max(1, max_run_events)
+        self.max_http_response_bytes = max(1, max_http_response_bytes)
+        self.max_concurrent_runs = max(1, max_concurrent_runs)
+        self.max_harness_log_items = max(1, max_harness_log_items)
+        self.max_harness_log_bytes = max(1, max_harness_log_bytes)
+        self.max_harness_log_line_bytes = max(1, max_harness_log_line_bytes)
+        self.max_harness_result_bytes = max(1, max_harness_result_bytes)
+        self.max_harness_text_bytes = max(1, max_harness_text_bytes)
         self.runs: dict[str, WorkflowRun] = {}
         self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="workflow-node")
+        self._run_executor = ThreadPoolExecutor(max_workers=self.max_concurrent_runs, thread_name_prefix="workflow-run")
+        self._run_slots = threading.BoundedSemaphore(self.max_concurrent_runs)
+        self._http_client = httpx.Client(follow_redirects=False)
         self._schedule_stop = threading.Event()
         self._schedule_thread: threading.Thread | None = None
         self._schedule_last: dict[str, str] = {}
@@ -117,6 +140,9 @@ class WorkflowManager:
         self._schedule_stop.set()
         if self._schedule_thread:
             self._schedule_thread.join(timeout=2)
+        self._run_executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._http_client.close()
 
     def _schedule_loop(self, project_loader: Any) -> None:
         while not self._schedule_stop.wait(1):
@@ -149,6 +175,7 @@ class WorkflowManager:
         policy: EvaluationPolicy | None = None,
         record: bool = True,
         require_output: bool = True,
+        _inline: bool = False,
     ) -> WorkflowRun:
         workflow = next((item for item in project.workflows if item.id == workflow_id), None)
         if workflow is None:
@@ -156,23 +183,47 @@ class WorkflowManager:
         errors = validate_executable_workflow(project, workflow, runtime=True, require_output=require_output)
         if errors:
             raise ValueError("；".join(errors))
+        slot_acquired = False
+        if not _inline:
+            slot_acquired = self._run_slots.acquire(blocking=False)
+            if not slot_acquired:
+                raise RuntimeError(f"工作流运行已达到 {self.max_concurrent_runs} 个并发上限，请稍后重试")
         body = body or {}
-        run = WorkflowRun(
-            id=uuid4().hex,
-            workflow_id=workflow_id,
-            input=body.get("input", ""),
-            relative_path=str(body.get("relative_path", ".")),
-            depth=int(body.get("_depth", 0)),
-            trigger_node_id=str(body["_trigger_node_id"]) if body.get("_trigger_node_id") else None,
-            node_states={node.id: {"status": "pending"} for node in workflow.nodes},
-            policy=policy,
+        try:
+            run = WorkflowRun(
+                id=uuid4().hex,
+                workflow_id=workflow_id,
+                input=body.get("input", ""),
+                relative_path=str(body.get("relative_path", ".")),
+                depth=int(body.get("_depth", 0)),
+                trigger_node_id=str(body["_trigger_node_id"]) if body.get("_trigger_node_id") else None,
+                node_states={node.id: {"status": "pending"} for node in workflow.nodes},
+                policy=policy,
+            )
+            if record:
+                with self._lock:
+                    self.runs[run.id] = run
+                    self._trim_runs_locked()
+            self._emit(run, "run.queued", {"run": run.payload()})
+            if _inline:
+                self._execute(run, project, workflow)
+            else:
+                self._run_executor.submit(self._execute_coordinated, run, project, workflow)
+            return run
+        except BaseException:
+            if slot_acquired:
+                self._run_slots.release()
+            raise
+
+    def _trim_runs_locked(self) -> None:
+        if len(self.runs) <= self.max_retained_runs:
+            return
+        terminal = sorted(
+            (run for run in self.runs.values() if run.status in TERMINAL_RUN_STATES),
+            key=lambda run: run.completed_at or run.created_at,
         )
-        if record:
-            with self._lock:
-                self.runs[run.id] = run
-        self._emit(run, "run.queued", {"run": run.payload()})
-        threading.Thread(target=self._execute, args=(run, project, workflow), daemon=True).start()
-        return run
+        for run in terminal[:max(0, len(self.runs) - self.max_retained_runs)]:
+            self.runs.pop(run.id, None)
 
     def require(self, run_id: str) -> WorkflowRun:
         with self._lock:
@@ -210,6 +261,12 @@ class WorkflowManager:
         signal.set()
         return run
 
+    def _execute_coordinated(self, run: WorkflowRun, project: ProjectSpec, workflow: WorkflowSpec) -> None:
+        try:
+            self._execute(run, project, workflow)
+        finally:
+            self._run_slots.release()
+
     def _execute(self, run: WorkflowRun, project: ProjectSpec, workflow: WorkflowSpec) -> None:
         run.status, run.started_at = "running", time.time()
         self._emit(run, "run.started", {"run": run.payload()})
@@ -225,8 +282,8 @@ class WorkflowManager:
         scheduled: set[str] = set()
 
         try:
-            with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix=f"workflow-{run.id[:6]}") as pool:
-                while len(completed) < len(nodes):
+            pool = None if run.depth else self._executor
+            while len(completed) < len(nodes):
                     self._check_cancelled(run)
                     progressed = False
                     for node_id, node in nodes.items():
@@ -253,7 +310,15 @@ class WorkflowManager:
                             progressed = True
                             continue
                         scheduled.add(node_id)
-                        futures[pool.submit(self._run_node, run, project, node, incoming[node_id], workflow.edges, edge_states)] = node_id
+                        if run.depth:
+                            future: Future[Any] = Future()
+                            try:
+                                future.set_result(self._run_node(run, project, node, incoming[node_id], workflow.edges, edge_states))
+                            except BaseException as exc:
+                                future.set_exception(exc)
+                        else:
+                            future = pool.submit(self._run_node, run, project, node, incoming[node_id], workflow.edges, edge_states)
+                        futures[future] = node_id
                         progressed = True
 
                     if not futures:
@@ -290,6 +355,9 @@ class WorkflowManager:
         except Exception as exc:
             run.status, run.error, run.completed_at = "failed", str(exc), time.time()
             self._emit(run, "run.failed", {"run": run.payload(), "message": str(exc)})
+        finally:
+            with self._lock:
+                self._trim_runs_locked()
 
     def _run_node(
         self,
@@ -436,17 +504,40 @@ class WorkflowManager:
                 body = rendered
         timeout = max(1.0, min(float(node.data.get("timeout_seconds", 30)), 120.0))
         try:
-            response = httpx.request(method, url, headers=rendered_headers, json=body if not isinstance(body, str) else None, content=body if isinstance(body, str) else None, timeout=timeout, follow_redirects=False)
+            with self._http_client.stream(
+                method,
+                url,
+                headers=rendered_headers,
+                json=body if not isinstance(body, str) else None,
+                content=body if isinstance(body, str) else None,
+                timeout=timeout,
+            ) as response:
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        if int(content_length) > self.max_http_response_bytes:
+                            raise RuntimeError(f"HTTP 响应超过 {self.max_http_response_bytes} 字节限制")
+                    except ValueError:
+                        pass
+                raw_buffer = bytearray()
+                for chunk in response.iter_bytes():
+                    if len(raw_buffer) + len(chunk) > self.max_http_response_bytes:
+                        raise RuntimeError(f"HTTP 响应超过 {self.max_http_response_bytes} 字节限制")
+                    raw_buffer.extend(chunk)
+                raw = bytes(raw_buffer)
+                status_code = response.status_code
+                response_headers = dict(response.headers)
+                encoding = response.encoding or "utf-8"
         except httpx.HTTPError as exc:
             raise RuntimeError(f"HTTP 请求失败：{exc}") from exc
-        content_type = response.headers.get("content-type", "")
+        content_type = response_headers.get("content-type", "")
         try:
-            result: Any = response.json() if "json" in content_type else response.text
-        except ValueError:
-            result = response.text
-        payload = {"status": response.status_code, "headers": dict(response.headers), "body": result}
-        if bool(node.data.get("fail_on_error", True)) and response.status_code >= 400:
-            raise RuntimeError(f"HTTP 请求返回 {response.status_code}：{str(result)[:500]}")
+            result: Any = json.loads(raw) if "json" in content_type else raw.decode(encoding, errors="replace")
+        except (ValueError, UnicodeError):
+            result = raw.decode(encoding, errors="replace")
+        payload = {"status": status_code, "headers": response_headers, "body": result}
+        if bool(node.data.get("fail_on_error", True)) and status_code >= 400:
+            raise RuntimeError(f"HTTP 请求返回 {status_code}：{str(result)[:500]}")
         return payload
 
     @staticmethod
@@ -516,12 +607,10 @@ class WorkflowManager:
         child = self.start(
             project, workflow_id,
             {"input": child_input, "relative_path": run.relative_path, "_depth": run.depth + 1},
-            policy=run.policy, record=run.policy is None,
+            policy=run.policy, record=run.policy is None, _inline=True,
         )
-        while child.status not in TERMINAL_RUN_STATES:
-            if run.cancel_event.wait(0.2):
-                self.cancel(child.id)
-                raise RunCancelled()
+        if run.cancel_event.is_set():
+            raise RunCancelled()
         if child.status != "completed":
             raise RuntimeError(f"子工作流 {workflow_id} 执行失败：{child.error or child.status}")
         return child.outputs
@@ -617,20 +706,73 @@ class WorkflowManager:
                 raise RuntimeError(f"Harness 基础设施错误：code={code}；{reason}")
             raise RuntimeError(f"Harness 任务错误（code={code}）：{reason}")
         try:
-            logs_response = client.logs(task_id, cursor=0, limit=500)
-            logs = logs_response.get("items", []) if isinstance(logs_response, dict) else []
+            logs_response = client.logs(task_id, cursor=0, limit=self.max_harness_log_items)
+            raw_logs = logs_response.get("items", []) if isinstance(logs_response, dict) else []
+            logs, logs_truncated = self._bounded_harness_logs(raw_logs)
             result = client.result(task_id)
             output = result.get("output") if isinstance(result, dict) else None
-            text = output.get("text", "") if isinstance(output, dict) and output.get("type") == "text" else ""
+            raw_text = output.get("text", "") if isinstance(output, dict) and output.get("type") == "text" else ""
+            text, text_truncated = self._truncate_utf8(str(raw_text), self.max_harness_text_bytes)
             if not text:
-                text = "\n".join(str(item.get("line", "")) for item in logs)
-            return {"task": task, "result": result, "logs": logs, "text": text}
+                text, fallback_truncated = self._truncate_utf8(
+                    "\n".join(str(item.get("line", "")) for item in logs),
+                    self.max_harness_text_bytes,
+                )
+                text_truncated = text_truncated or fallback_truncated
+            bounded_result = self._bounded_json_value(result, self.max_harness_result_bytes)
+            return {
+                "task": self._bounded_json_value(task, self.max_harness_result_bytes),
+                "result": bounded_result,
+                "logs": logs,
+                "text": text,
+                "truncated": {
+                    "logs": logs_truncated,
+                    "result": bounded_result is not result,
+                    "text": text_truncated,
+                },
+            }
         except HarnessAPIError as exc:
             raise RuntimeError(f"Harness 基础设施错误：{exc}") from exc
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Harness 不可用：{exc}") from exc
         finally:
             client.close()
+
+    @staticmethod
+    def _truncate_utf8(value: str, limit: int) -> tuple[str, bool]:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= limit:
+            return value, False
+        return encoded[:limit].decode("utf-8", errors="ignore"), True
+
+    def _bounded_harness_logs(self, raw_logs: Any) -> tuple[list[dict[str, Any]], bool]:
+        if not isinstance(raw_logs, list):
+            return [], bool(raw_logs)
+        bounded: list[dict[str, Any]] = []
+        used = 0
+        truncated = len(raw_logs) > self.max_harness_log_items
+        for raw_item in raw_logs[:self.max_harness_log_items]:
+            item = dict(raw_item) if isinstance(raw_item, dict) else {"line": str(raw_item)}
+            line, line_truncated = self._truncate_utf8(str(item.get("line", "")), self.max_harness_log_line_bytes)
+            item["line"] = line
+            encoded = json.dumps(item, ensure_ascii=False, default=str).encode("utf-8")
+            if used + len(encoded) > self.max_harness_log_bytes:
+                truncated = True
+                break
+            if line_truncated:
+                item["truncated"] = True
+                truncated = True
+            bounded.append(item)
+            used += len(encoded)
+        return bounded, truncated
+
+    @staticmethod
+    def _bounded_json_value(value: Any, limit: int) -> Any:
+        encoded = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+        if len(encoded) <= limit:
+            return value
+        preview = encoded[:limit].decode("utf-8", errors="ignore")
+        return {"truncated": True, "size_bytes": len(encoded), "preview": preview}
 
     def _wait_for_approval(self, run: WorkflowRun, node: WorkflowNode, latest: Any) -> Any:
         signal = threading.Event()
@@ -652,9 +794,12 @@ class WorkflowManager:
         self._emit(run, "node.status", {"run_id": run.id, "node_id": node_id, "state": run.node_states[node_id]})
 
     def _emit(self, run: WorkflowRun, event: str, data: dict[str, Any]) -> None:
-        item = {"event": event, "data": data, "created_at": time.time()}
         with run.event_signal:
+            item = {"event": event, "data": data, "sequence": run.next_event_sequence, "created_at": time.time()}
+            run.next_event_sequence += 1
             run.events.append(item)
+            if len(run.events) > self.max_run_events:
+                del run.events[:len(run.events) - self.max_run_events]
             run.event_signal.notify_all()
 
     @staticmethod

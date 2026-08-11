@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from openagent_studio.app import create_app
 from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _EmptyCompactionError, _apply_creation_step, _apply_incremental_step, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _creation_step_errors, _explicit_delete_request, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _with_file_prompt
 from openagent_studio.store import SpecStore
-from openagent_studio.models import EvaluationAssertion, ProjectSpec, QQIntegrationSpec, WorkflowEvaluation, WorkflowSpec
+from openagent_studio.models import EvaluationAssertion, ProjectSpec, QQIntegrationSpec, WorkflowEvaluation, WorkflowNode, WorkflowSpec
 from openagent_studio.workflow_runner import EvaluationPolicy, WorkflowManager, validate_executable_workflow
 from openagent_studio.evaluation import CandidateResult, HarnessInfrastructureError, SemanticVerdict, WorkflowEvaluator, check_assertion, complexity_metrics
 from openagent_studio.workflow_runner import _cron_matches, _cron_valid
@@ -1030,6 +1030,22 @@ def test_knowledge_retrieval_and_subworkflow():
     assert child_outputs["result"]["matches"][0]["content"] == "露营 户外 帐篷"
 
 
+def test_nested_subworkflows_do_not_starve_shared_executor():
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "嵌套",
+        "workflows": [
+            {"id": "leaf", "name": "叶子", "nodes": [{"id": "result", "type": "output", "data": {"template": "{{input}}"}}]},
+            {"id": "middle", "name": "中间", "nodes": [{"id": "child", "type": "subworkflow", "data": {"workflow_id": "leaf"}}, {"id": "result", "type": "output", "data": {}}], "edges": [{"source": "child", "target": "result"}]},
+            {"id": "parent", "name": "父级", "nodes": [{"id": "left", "type": "subworkflow", "data": {"workflow_id": "middle"}}, {"id": "right", "type": "subworkflow", "data": {"workflow_id": "middle"}}, {"id": "result", "type": "output", "data": {}}], "edges": [{"source": "left", "target": "result"}, {"source": "right", "target": "result"}]},
+        ],
+    })
+    manager = WorkflowManager(max_workers=2)
+    run = manager.start(project, "parent", {"input": "ok"})
+    _wait_for(lambda: run.status in {"completed", "failed"})
+    assert run.status == "completed"
+    manager.stop_scheduler()
+
+
 def test_http_node_rejects_private_address_before_request():
     try:
         WorkflowManager._validate_http_url("https://127.0.0.1/admin", allow_private=False)
@@ -1037,6 +1053,167 @@ def test_http_node_rejects_private_address_before_request():
         assert "禁止访问私网" in str(exc)
     else:
         raise AssertionError("private address should be rejected")
+
+
+def test_http_node_streaming_response_limit():
+    class ChunkStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"1234"
+            yield b"5678"
+
+    class StreamingClient:
+        def stream(self, *_args, **_kwargs):
+            request = httpx.Request("GET", "https://example.com/data")
+
+            class ResponseContext:
+                def __enter__(self):
+                    self.response = httpx.Response(
+                        200,
+                        headers={"content-type": "text/plain"},
+                        stream=ChunkStream(),
+                        request=request,
+                    )
+                    return self.response
+
+                def __exit__(self, *_exc):
+                    self.response.close()
+
+            return ResponseContext()
+
+        def close(self):
+            pass
+
+    manager = WorkflowManager(max_http_response_bytes=6)
+    manager._http_client.close()
+    manager._http_client = StreamingClient()
+    workflow_run = type("Run", (), {"input": "", "outputs": {}})()
+    node = WorkflowNode(id="http", type="http_request", data={"url": "https://example.com/data"})
+    manager._validate_http_url = lambda *_args: None
+    with pytest.raises(RuntimeError, match="超过 6 字节限制"):
+        manager._http_request(workflow_run, node, "")
+    manager.stop_scheduler()
+
+
+def test_workflow_and_generation_events_are_bounded():
+    manager = WorkflowManager(max_retained_runs=1, max_run_events=2)
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "边界",
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [{"id": "done", "type": "output", "data": {}}]}],
+    })
+    first = manager.start(project, "flow")
+    _wait_for(lambda: first.status == "completed")
+    second = manager.start(project, "flow")
+    _wait_for(lambda: second.status == "completed")
+    assert len(first.events) == 2
+    assert [item["sequence"] for item in first.events] == [first.next_event_sequence - 2, first.next_event_sequence - 1]
+    assert list(manager.runs) == [second.id]
+    generation = Generation(id="bounded", workflow_id="flow", base_etag="etag", draft={}, prompt="x", max_events=2)
+    for index in range(4):
+        generation.emit("tick", {"index": index})
+    assert [item["sequence"] for item in generation.events] == [2, 3]
+    manager.stop_scheduler()
+
+
+def test_harness_payloads_are_bounded():
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "有界 Harness",
+        "harness": [{"id": "coding", "name": "Coding", "agent_id": "coding"}],
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [
+            {"id": "agent", "type": "agent", "data": {"agent_id": "coding", "prompt": "run"}},
+            {"id": "output", "type": "output", "data": {}},
+        ], "edges": [{"source": "agent", "target": "output"}]}],
+    })
+
+    def handler(operation, **kwargs):
+        if operation == "submit":
+            return {"id": "large", "status": "completed"}
+        if operation == "logs":
+            return {"items": [{"line": "日志" * 20}, {"line": "尾部"}]}
+        if operation == "result":
+            return {"output": {"type": "text", "text": "结果" * 30}, "extra": "x" * 200}
+        raise AssertionError(operation)
+
+    manager = WorkflowManager(
+        client_factory=lambda _backend: FakeHarnessClient(handler),
+        max_harness_log_items=1,
+        max_harness_log_bytes=100,
+        max_harness_log_line_bytes=12,
+        max_harness_result_bytes=80,
+        max_harness_text_bytes=15,
+    )
+    run = manager.start(project, "flow")
+    _wait_for(lambda: run.status == "completed")
+    output = run.outputs["agent"]
+    assert output["truncated"] == {"logs": True, "result": True, "text": True}
+    assert len(output["logs"]) == 1
+    assert output["logs"][0]["truncated"] is True
+    assert output["result"]["truncated"] is True
+    assert len(output["text"].encode("utf-8")) <= 15
+    manager.stop_scheduler()
+
+
+def test_workflow_run_concurrency_limit_rejects_excess_runs():
+    manager = WorkflowManager(max_concurrent_runs=1)
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "并发",
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [
+            {"id": "approval", "type": "approval", "data": {}},
+            {"id": "output", "type": "output", "data": {}},
+        ], "edges": [{"source": "approval", "target": "output"}]}],
+    })
+    first = manager.start(project, "flow")
+    _wait_for(lambda: first.node_states["approval"]["status"] == "waiting")
+    with pytest.raises(RuntimeError, match="并发上限"):
+        manager.start(project, "flow")
+    manager.cancel(first.id)
+    _wait_for(lambda: first.status == "cancelled")
+    manager.stop_scheduler()
+
+
+def test_workflow_sse_resumes_by_sequence(tmp_path: Path):
+    app = create_app(tmp_path / "project.yaml")
+    manager = app.state.workflow_manager
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "恢复",
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [{"id": "done", "type": "output", "data": {}}]}],
+    })
+    run = manager.start(project, "flow")
+    _wait_for(lambda: run.status == "completed")
+    response = TestClient(app).get(
+        f"/api/workflow-runs/{run.id}/events",
+        headers={"Last-Event-ID": "0"},
+    )
+    assert "id: 1" in response.text
+    assert "id: 0" not in response.text
+
+
+def test_spec_store_cache_invalidates_after_external_write(tmp_path: Path):
+    path = tmp_path / "project.yaml"
+    first = SpecStore(path)
+    second = SpecStore(path)
+    first.save(ProjectSpec(name="初始"))
+    assert first.etag() == second.etag()
+    assert first.load().name == "初始"
+    second.save(ProjectSpec(name="外部更新"), expected=second.etag())
+    assert first.load().name == "外部更新"
+    assert first.etag() == second.etag()
+
+
+def test_generator_retention_and_history_are_bounded(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"), max_generations=1, max_history_messages=2)
+    old = Generation(id="old", workflow_id="flow", base_etag="x", draft={}, prompt="x", completed=True)
+    old.emit("generation.completed", {})
+    current = Generation(id="current", workflow_id="flow", base_etag="x", draft={}, prompt="x", completed=True)
+    current.emit("generation.completed", {})
+    manager.generations = {old.id: old, current.id: current}
+    manager.active["flow"] = current.id
+    manager.history["flow"] = [{"role": "user", "content": str(index)} for index in range(3)]
+    manager.history["flow"] = manager.history["flow"][-manager.max_history_messages:]
+    with manager._lock:
+        manager._trim_generations_locked()
+    assert list(manager.generations) == [current.id]
+    assert [item["content"] for item in manager.history["flow"]] == ["1", "2"]
+
 
 
 def test_generator_supplies_new_node_defaults(tmp_path: Path):
@@ -1756,6 +1933,7 @@ def test_delete_workflow_route_404_and_stale_etag(tmp_path: Path):
     stale = client.delete("/api/workflows/flow", headers={"If-Match": "stale-etag"})
     assert stale.status_code == 409
     assert [item.id for item in store.load().workflows] == ["flow"]  # 并发冲突不覆盖、不删除
+    assert [item["id"] for item in client.get("/api/workflows").json()] == ["flow"]
 
 
 def test_delete_workflow_route_blockers(tmp_path: Path):

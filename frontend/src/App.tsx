@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Background, BaseEdge, Controls, EdgeLabelRenderer, MiniMap, Panel, ReactFlow, ReactFlowProvider,
   SelectionMode, addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
   type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange,
 } from '@xyflow/react'
-import { ApiError, cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadRuntimeStatus, loadSpec, optimizeWorkflow, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
+import { ApiError, cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadRuntimeStatus, loadSpec, loadWorkflowRun, optimizeWorkflow, resolveApproval, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
 import type { EvaluationCase, IntegrationsStatus, NodeKind, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
 
 type CatalogItem = { type: NodeKind; category: string; label: string; icon: string; description: string }
@@ -84,6 +84,21 @@ function toCanvas(workflow: Workflow): { nodes: CanvasNode[]; edges: Edge[] } {
   }
 }
 
+function runtimeStatusClass(status?: string) {
+  return status ? `run-state-${status}` : ''
+}
+
+function formatRuntimeDuration(state?: { started_at?: number; completed_at?: number }) {
+  if (!state?.started_at) return ''
+  const end = state.completed_at ?? Date.now() / 1000
+  const seconds = Math.max(0, end - state.started_at)
+  return seconds < 1 ? `${Math.round(seconds * 1000)} ms` : `${seconds.toFixed(1)} s`
+}
+
+const runtimeStatusLabels: Record<string, string> = {
+  pending: '待运行', running: '运行中', waiting: '等待审批', completed: '已完成', failed: '失败', skipped: '已跳过',
+}
+
 function StudioCanvas() {
   const [spec, setSpec] = useState<ProjectSpec | null>(null)
   const [etag, setEtag] = useState('')
@@ -105,11 +120,22 @@ function StudioCanvas() {
   const [libraryQuery, setLibraryQuery] = useState('')
   const [integrations, setIntegrations] = useState<IntegrationsStatus>({ feishu: [], qq: [] })
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null)
+  const generationSource = useRef<EventSource | null>(null)
+  const runSource = useRef<EventSource | null>(null)
+  const chatDeltaFrame = useRef<number | null>(null)
+  const pendingChatDelta = useRef('')
+  const previewFrame = useRef<number | null>(null)
+  const pendingPreview = useRef<{ workflow: Workflow; reverted: boolean } | null>(null)
+  const runFrame = useRef<number | null>(null)
+  const pendingRunEvents = useRef<string[]>([])
+  const pendingRun = useRef<WorkflowRun | null>(null)
+  const pendingNodeStates = useRef<Record<string, any>>({})
   const { screenToFlowPosition, fitView } = useReactFlow()
 
   const workflow = useMemo(() => spec?.workflows.find((item) => item.id === workflowId), [spec, workflowId])
   const selectedNode = nodes.find((item) => item.id === selected)
   const selectedHarness = spec?.harness.find((item) => item.id === selectedNode?.data.agent_id)
+  const selectedNodeRun = selectedNode && run?.node_states[selectedNode.id]
   const currentEdge = edges.find((item) => item.id === selectedEdge)
   const selectedNodeCount = nodes.filter((item) => item.selected).length
   const selectedEdgeCount = edges.filter((item) => item.selected).length
@@ -140,6 +166,28 @@ function StudioCanvas() {
   useEffect(() => { loadGeneratorStatus().then((status) => setGeneratorModel(status.ready ? status.model : `${status.model}（缺少 ${status.credential_env}）`)).catch((error: Error) => setGeneratorModel(error.message)) }, [])
   useEffect(() => { loadIntegrationsStatus().then(setIntegrations).catch(() => setIntegrations({ feishu: [], qq: [] })) }, [])
   useEffect(() => { loadRuntimeStatus().then(setRuntimeStatus).catch(() => setRuntimeStatus(null)) }, [])
+  useEffect(() => () => {
+    generationSource.current?.close()
+    runSource.current?.close()
+    if (chatDeltaFrame.current != null) cancelAnimationFrame(chatDeltaFrame.current)
+    if (previewFrame.current != null) cancelAnimationFrame(previewFrame.current)
+    if (runFrame.current != null) cancelAnimationFrame(runFrame.current)
+  }, [])
+
+  // Project the live run state onto the canvas without persisting it as workflow data.
+  useEffect(() => {
+    const states = run?.node_states || {}
+    setNodes((items) => items.map((node) => ({
+      ...node,
+      className: runtimeStatusClass(states[node.id]?.status),
+    })))
+    setEdges((items) => items.map((edge) => {
+      const source = states[edge.source]?.status
+      const target = states[edge.target]?.status
+      const active = source === 'completed' && (target === 'running' || target === 'waiting')
+      return { ...edge, className: active ? 'run-edge-active' : '' }
+    }))
+  }, [run?.node_states])
 
   const onNodesChange = useCallback((changes: NodeChange<CanvasNode>[]) => setNodes((items) => applyNodeChanges(changes, items)), [])
   const onEdgesChange = useCallback((changes: EdgeChange[]) => setEdges((items) => applyEdgeChanges(changes, items)), [])
@@ -259,9 +307,32 @@ function StudioCanvas() {
   }
 
   function followGeneration(started: { generation_id: string }, successMessage: string) {
+    generationSource.current?.close()
     setGenerationId(started.generation_id)
     const source = new EventSource(`/api/generator/generations/${started.generation_id}/events`)
+    generationSource.current = source
+    const closeSource = () => {
+      source.close()
+      if (generationSource.current === source) generationSource.current = null
+    }
     const listen = (name: string, handler: (data: any) => void) => source.addEventListener(name, (event) => handler(JSON.parse((event as MessageEvent).data)))
+    const flushChatDelta = () => {
+      if (chatDeltaFrame.current != null) cancelAnimationFrame(chatDeltaFrame.current)
+      chatDeltaFrame.current = null
+      const delta = pendingChatDelta.current
+      pendingChatDelta.current = ''
+      if (!delta) return
+      setChatMessages((items) => {
+        const last = items[items.length - 1]
+        if (last?.role === 'assistant') return [...items.slice(0, -1), { ...last, content: last.content + delta }]
+        return [...items, { role: 'assistant', content: delta }]
+      })
+    }
+    const discardPreview = () => {
+      if (previewFrame.current != null) cancelAnimationFrame(previewFrame.current)
+      previewFrame.current = null
+      pendingPreview.current = null
+    }
     const stages: Record<string, string> = {
       understanding: 'OpenCode 正在理解问题和判断是否需要修改画布…',
       checking_runtime: '正在检查 Harness 验收运行时…',
@@ -281,35 +352,48 @@ function StudioCanvas() {
     listen('generation.repairing', ({ message: repairMessage, node_id }) => setMessage(`${repairMessage}${node_id ? `（节点 ${node_id}）` : ''}`))
     const applyStreamingWorkflow = (workflow: Workflow, reverted = false) => {
       if (!workflow || workflow.id !== workflowId) return
-      const view = toCanvas(workflow)
-      setNodes(view.nodes); setEdges(view.edges)
-      setSpec((project) => project ? { ...project, workflows: project.workflows.map((item) => item.id === workflow.id ? workflow : item) } : project)
-      setMessage(reverted ? '本步探测未通过，已恢复上一个稳定版本' : `正在实时渲染：${workflow.nodes.length} 个节点、${workflow.edges.length} 条连线…`)
-      setTimeout(() => fitView({ padding: 0.22 }), 40)
+      pendingPreview.current = { workflow, reverted }
+      if (previewFrame.current != null) return
+      previewFrame.current = requestAnimationFrame(() => {
+        previewFrame.current = null
+        const pending = pendingPreview.current
+        pendingPreview.current = null
+        if (!pending) return
+        const view = toCanvas(pending.workflow)
+        setNodes(view.nodes); setEdges(view.edges)
+        setSpec((project) => project ? { ...project, workflows: project.workflows.map((item) => item.id === pending.workflow.id ? pending.workflow : item) } : project)
+        setMessage(pending.reverted ? '本步探测未通过，已恢复上一个稳定版本' : `正在实时渲染：${pending.workflow.nodes.length} 个节点、${pending.workflow.edges.length} 条连线…`)
+      })
     }
     listen('workflow.preview', ({ workflow, reverted }) => applyStreamingWorkflow(workflow, reverted))
     listen('workflow.updated', ({ workflow }) => applyStreamingWorkflow(workflow))
-    listen('chat.assistant.delta', ({ text }) => setChatMessages((items) => {
-      const last = items[items.length - 1]
-      if (last?.role === 'assistant') return [...items.slice(0, -1), { ...last, content: last.content + text }]
-      return [...items, { role: 'assistant', content: text }]
-    }))
+    listen('chat.assistant.delta', ({ text }) => {
+      pendingChatDelta.current += text
+      if (chatDeltaFrame.current != null) return
+      chatDeltaFrame.current = requestAnimationFrame(flushChatDelta)
+    })
     listen('chat.completed', ({ options }) => {
+      flushChatDelta()
+      discardPreview()
       if (Array.isArray(options) && options.length === 3) {
         setChatMessages((items) => {
           const last = items[items.length - 1]
           return last?.role === 'assistant' ? [...items.slice(0, -1), { ...last, options }] : items
         })
       }
-      setGenerationId(null); setMessage('OpenCode 已回复'); source.close()
+      setGenerationId(null); setMessage('OpenCode 已回复'); closeSource()
     })
     listen('generation.completed', ({ workflow: completed, etag: tag, assistant_message }) => {
+      flushChatDelta()
+      discardPreview()
       applyCompletedWorkflow(completed, tag)
       if (assistant_message) setChatMessages((items) => [...items, { role: 'assistant', content: assistant_message }])
-      setGenerationId(null); setMessage(successMessage); source.close()
+      setGenerationId(null); setMessage(successMessage); closeSource()
     })
     const finishError = async (text: string) => {
-      source.close()
+      flushChatDelta()
+      discardPreview()
+      closeSource()
       setMessage(`${text}；正在恢复服务端稳定版本…`)
       setChatMessages((items) => [...items, { role: 'system', content: text }])
       try {
@@ -329,10 +413,11 @@ function StudioCanvas() {
         setGenerationId(null)
       }
     }
+    listen('stream.reset', () => { void finishError('生成事件已过期，正在重新同步稳定版本') })
     listen('generation.failed', ({ message: text }) => { void finishError(`优化失败：${text}`) })
     listen('generation.conflict', ({ message: text }) => { void finishError(text) })
     listen('generation.cancelled', () => { void finishError('已停止本轮优化，原工作流未改变') })
-    source.onerror = () => { if (source.readyState === EventSource.CLOSED) setGenerationId(null) }
+    source.onerror = () => { if (source.readyState === EventSource.CLOSED) { closeSource(); setGenerationId(null) } }
   }
 
   async function generateFromChat(selectedOption?: string) {
@@ -368,16 +453,44 @@ function StudioCanvas() {
   }
 
   function followRun(started: WorkflowRun) {
+    runSource.current?.close()
     setRun(started); setRightTab('run'); setRunEvents([])
     const source = new EventSource(`/api/workflow-runs/${started.id}/events`)
+    runSource.current = source
+    const closeSource = () => {
+      source.close()
+      if (runSource.current === source) runSource.current = null
+    }
+    const flush = () => {
+      runFrame.current = null
+      const events = pendingRunEvents.current.splice(0)
+      const nextRun = pendingRun.current
+      pendingRun.current = null
+      const states = pendingNodeStates.current
+      pendingNodeStates.current = {}
+      if (events.length) setRunEvents((items) => [...items, ...events].slice(-100))
+      if (nextRun) setRun({ ...nextRun, node_states: { ...nextRun.node_states, ...states } })
+      else if (Object.keys(states).length) {
+        setRun((current) => current ? { ...current, node_states: { ...current.node_states, ...states } } : current)
+      }
+    }
+    const scheduleFlush = () => { if (runFrame.current == null) runFrame.current = requestAnimationFrame(flush) }
     const names = ['run.started', 'node.status', 'node.harness_task', 'node.progress', 'node.approval_required', 'node.approval_resolved', 'run.completed', 'run.failed', 'run.cancelled']
     names.forEach((name) => source.addEventListener(name, (event) => {
       const data = JSON.parse((event as MessageEvent).data)
-      setRunEvents((items) => [...items.slice(-99), `${name} · ${data.node_id || data.message || data.status || ''}`])
-      if (data.run) setRun(data.run)
-      else setRun((current) => current && data.node_id && data.state ? { ...current, node_states: { ...current.node_states, [data.node_id]: data.state } } : current)
-      if (name === 'run.completed' || name === 'run.failed' || name === 'run.cancelled') source.close()
+      pendingRunEvents.current.push(`${name} · ${data.node_id || data.message || data.status || ''}`)
+      if (data.run) pendingRun.current = data.run
+      else if (data.node_id && data.state) pendingNodeStates.current[data.node_id] = data.state
+      scheduleFlush()
+      if (name === 'run.completed' || name === 'run.failed' || name === 'run.cancelled') { flush(); closeSource() }
     }))
+    source.addEventListener('stream.reset', () => {
+      setMessage('部分运行事件已过期，正在同步真实运行快照…')
+      void loadWorkflowRun(started.id).then((latest) => {
+        setRun(latest)
+        setMessage('运行快照已同步，继续接收实时事件')
+      }).catch((error: Error) => setMessage(`运行快照同步失败：${error.message}`))
+    })
   }
 
   async function executeWorkflow() {
@@ -467,7 +580,7 @@ function StudioCanvas() {
         <div className="panel-title"><strong>Harness 工作流</strong><span>{run ? `运行 ${run.id.slice(0, 8)} · ${run.status}` : '输入任务后开始执行'}</span></div>
         <label>工作流输入<textarea value={runInput} onChange={(event) => setRunInput(event.target.value)} disabled={!!run && ['queued', 'running'].includes(run.status)} placeholder="输入要交给工作流处理的任务…"/></label>
         {!run || !['queued', 'running'].includes(run.status) ? <button className="run-wide" onClick={executeWorkflow}>▶ 开始运行</button> : <button className="stop-wide" onClick={stopRun}>■ 取消运行</button>}
-        {run && <div className="run-summary"><strong>{run.status}</strong>{run.error && <p>{run.error}</p>}{Object.entries(run.node_states).map(([id, state]) => <div className={`node-run ${state.status}`} key={id}><span>{id}</span><em>{state.status}</em>{state.status === 'waiting' && <span className="approval-actions"><button onClick={() => decide(id, true)}>通过</button><button onClick={() => decide(id, false)}>拒绝</button></span>}</div>)}</div>}
+        {run && <div className="run-summary"><strong>{run.status}</strong>{run.error && <p>{run.error}</p>}{Object.entries(run.node_states).map(([id, state]) => <div className={`node-run ${state.status}`} key={id} onClick={() => { setSelected(id); setSelectedEdge(null); setRightTab('node') }}><span>{nodes.find((node) => node.id === id)?.data.label || id}</span><em>{runtimeStatusLabels[state.status] || state.status}</em>{state.status === 'waiting' && <span className="approval-actions"><button onClick={(event) => { event.stopPropagation(); void decide(id, true) }}>通过</button><button onClick={(event) => { event.stopPropagation(); void decide(id, false) }}>拒绝</button></span>}</div>)}</div>}
         <div className="run-events">{runEvents.map((item, index) => <code key={index}>{item}</code>)}</div>
       </div> : rightTab === 'edge' ? <>
         <div className="panel-title"><strong>连线设置</strong><span>控制条件分支</span></div>
@@ -481,6 +594,7 @@ function StudioCanvas() {
       </> : <>
         <div className="panel-title"><strong>节点设置</strong><span>{selectedNode ? nodeLabel(selectedNode.data.kind) : '请选择一个节点'}</span></div>
         {selectedNode ? <div className="form-stack">
+          {selectedNodeRun && <div className={`node-runtime-card ${selectedNodeRun.status}`}><strong>本次运行：{runtimeStatusLabels[selectedNodeRun.status] || selectedNodeRun.status}</strong>{formatRuntimeDuration(selectedNodeRun) && <small>耗时 {formatRuntimeDuration(selectedNodeRun)}</small>}{selectedNodeRun.warning && <pre>{selectedNodeRun.warning}</pre>}{selectedNodeRun.error && <pre>{selectedNodeRun.error}</pre>}{selectedNodeRun.input !== undefined && <details><summary>输入</summary><pre>{JSON.stringify(selectedNodeRun.input, null, 2)}</pre></details>}{selectedNodeRun.output !== undefined && <details><summary>输出</summary><pre>{JSON.stringify(selectedNodeRun.output, null, 2)}</pre></details>}</div>}
           <label>节点名称<input value={selectedNode.data.description} onChange={(event) => updateSelected('description', event.target.value)}/></label>
           <label>节点类型<input value={nodeLabel(selectedNode.data.kind)} disabled/></label>
           {harnessNodeKinds.includes(selectedNode.data.kind) && <label>Harness 智能体<select value={selectedNode.data.agent_id || ''} onChange={(event) => updateSelected('agent_id', event.target.value)}><option value="">{selectedNode.data.kind === 'validator' ? '复用上一步 Harness 验证' : '请选择'}</option>{spec?.harness.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>}

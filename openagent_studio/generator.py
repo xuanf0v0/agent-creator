@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
-import queue
 import re
 import subprocess
 import threading
@@ -161,7 +160,9 @@ class Generation:
     prompt: str
     events: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, str]] = field(default_factory=list)
-    event_queue: queue.Queue = field(default_factory=queue.Queue)
+    event_signal: threading.Condition = field(default_factory=threading.Condition, repr=False)
+    next_event_sequence: int = 0
+    max_events: int = 1000
     process: subprocess.Popen | None = None
     cancelled: bool = False
     completed: bool = False
@@ -175,20 +176,29 @@ class Generation:
     mode: str = "modify"
 
     def emit(self, event: str, data: dict[str, Any]) -> None:
-        item = {"event": event, "data": data, "sequence": len(self.events), "timestamp": time.time()}
-        self.events.append(item)
-        self.event_queue.put(item)
+        with self.event_signal:
+            item = {"event": event, "data": data, "sequence": self.next_event_sequence, "timestamp": time.time()}
+            self.next_event_sequence += 1
+            self.events.append(item)
+            if len(self.events) > self.max_events:
+                del self.events[:len(self.events) - self.max_events]
+            self.event_signal.notify_all()
 
 
 class GeneratorManager:
-    def __init__(self, store: SpecStore):
+    def __init__(self, store: SpecStore, max_generations: int = 100, max_history_messages: int = 100, max_generation_events: int = 1000, max_concurrent_generations: int = 4):
         self.store = store
+        self.max_concurrent_generations = max(1, max_concurrent_generations)
+        self.max_generations = max(1, max_generations)
+        self.max_history_messages = max(1, max_history_messages)
+        self.max_generation_events = max(1, max_generation_events)
         self.generations: dict[str, Generation] = {}
         self.active: dict[str, str] = {}
         self.sessions: dict[str, str] = {}
         self.session_models: dict[str, str] = {}
         self.history: dict[str, list[dict[str, str]]] = {}
         self._lock = threading.RLock()
+        self._generation_slots = threading.BoundedSemaphore(self.max_concurrent_generations)
 
     def model(self, spec: Any | None = None) -> str:
         project = spec or self.store.load()
@@ -261,6 +271,7 @@ class GeneratorManager:
             draft = WorkflowSpec(id=workflow_id, name=(name or workflow_id).strip() or workflow_id)
             generation = Generation(
                 id=uuid.uuid4().hex,
+                max_events=self.max_generation_events,
                 workflow_id=workflow_id,
                 base_etag=self.store.etag(),
                 draft=draft.model_dump(mode="json"),
@@ -272,8 +283,11 @@ class GeneratorManager:
             )
             self.generations[generation.id] = generation
             self.active[workflow_id] = generation.id
-            self.history.setdefault(workflow_id, []).append({"role": "user", "content": message})
-        threading.Thread(target=self._run, args=(generation, spec), daemon=True).start()
+            history = self.history.setdefault(workflow_id, [])
+            history.append({"role": "user", "content": message})
+            del history[:-self.max_history_messages]
+            self._trim_generations_locked()
+        self._launch(generation, spec)
         return generation
 
     def start(self, workflow_id: str, message: str, *, optimize_only: bool = False) -> Generation:
@@ -291,6 +305,7 @@ class GeneratorManager:
                 raise KeyError(workflow_id)
             generation = Generation(
                 id=uuid.uuid4().hex,
+                max_events=self.max_generation_events,
                 workflow_id=workflow_id,
                 base_etag=self.store.etag(),
                 draft=workflow.model_dump(mode="json"),
@@ -304,8 +319,11 @@ class GeneratorManager:
             )
             self.generations[generation.id] = generation
             self.active[workflow_id] = generation.id
-            self.history.setdefault(workflow_id, []).append({"role": "user", "content": message})
-        threading.Thread(target=self._run, args=(generation, spec), daemon=True).start()
+            history = self.history.setdefault(workflow_id, [])
+            history.append({"role": "user", "content": message})
+            del history[:-self.max_history_messages]
+            self._trim_generations_locked()
+        self._launch(generation, spec)
         return generation
 
     def optimize(self, workflow_id: str) -> Generation:
@@ -318,6 +336,8 @@ class GeneratorManager:
             _terminate_process_tree(generation.process)
         generation.completed = True
         generation.emit("generation.cancelled", {"generation_id": generation.id})
+        with self._lock:
+            self._trim_generations_locked()
         return generation
 
     def require(self, generation_id: str) -> Generation:
@@ -325,6 +345,33 @@ class GeneratorManager:
         if generation is None:
             raise KeyError(generation_id)
         return generation
+
+    def _trim_generations_locked(self) -> None:
+        if len(self.generations) <= self.max_generations:
+            return
+        completed = sorted(
+            (item for item in self.generations.values() if item.completed),
+            key=lambda item: item.events[-1].get("timestamp", 0) if item.events else 0,
+        )
+        for generation in completed[:max(0, len(self.generations) - self.max_generations)]:
+            self.generations.pop(generation.id, None)
+            if self.active.get(generation.workflow_id) == generation.id:
+                self.active.pop(generation.workflow_id, None)
+
+    def _launch(self, generation: Generation, spec: Any) -> None:
+        if not self._generation_slots.acquire(blocking=False):
+            with self._lock:
+                self.generations.pop(generation.id, None)
+                if self.active.get(generation.workflow_id) == generation.id:
+                    self.active.pop(generation.workflow_id, None)
+            raise RuntimeError(f"生成任务已达到 {self.max_concurrent_generations} 个并发上限，请稍后重试")
+        threading.Thread(target=self._run_with_slot, args=(generation, spec), daemon=True, name="generator-run").start()
+
+    def _run_with_slot(self, generation: Generation, spec: Any) -> None:
+        try:
+            self._run(generation, spec)
+        finally:
+            self._generation_slots.release()
 
     def _run(self, generation: Generation, spec: Any) -> None:
         generation.emit("generation.started", {"generation_id": generation.id, "workflow_id": generation.workflow_id})
@@ -370,6 +417,7 @@ class GeneratorManager:
                     if options:
                         history_item["options"] = options
                     self.history.setdefault(generation.workflow_id, []).append(history_item)
+                    self.history[generation.workflow_id] = self.history[generation.workflow_id][-self.max_history_messages:]
                     generation.completed = True
                     generation.emit("chat.assistant.delta", {"text": answer})
                     generation.emit("chat.completed", {"message": answer, "options": options})
@@ -396,11 +444,15 @@ class GeneratorManager:
             if generation.events[-1]["event"] == "generation.completed":
                 generation.events[-1]["data"]["assistant_message"] = summary
                 self.history.setdefault(generation.workflow_id, []).append({"role": "assistant", "content": summary})
+                self.history[generation.workflow_id] = self.history[generation.workflow_id][-self.max_history_messages:]
         except Exception as exc:
             if generation.cancelled:
                 return
             generation.completed = True
             generation.emit("generation.failed", {"message": str(exc)})
+        finally:
+            with self._lock:
+                self._trim_generations_locked()
 
     def _build_creation(
         self,
@@ -797,44 +849,47 @@ class GeneratorManager:
             live_execution=True,
         )
         try:
-            # Incremental layers are intentionally probed before an output
-            # node exists. The final `complete` path is still required to
-            # contain an output node by the strict connectivity checks.
-            run = manager.start(
-                project,
-                workflow.id,
-                body,
-                policy=policy,
-                record=False,
-                require_output=False,
-            )
-        except (RuntimeError, ValueError) as exc:
-            message = str(exc)
-            if _is_harness_infrastructure_message(message):
-                raise HarnessInfrastructureError(
-                    f"Harness 增量层探测基础设施失败：{message}。当前层未进入无效重建。"
-                ) from exc
-            return [message]
-        deadline = time.monotonic() + _incremental_probe_timeout_seconds()
-        while run.status not in TERMINAL_RUN_STATES and time.monotonic() < deadline:
-            if generation.cancelled:
-                run.cancel_event.set()
-                raise RuntimeError("生成已取消")
-            time.sleep(0.02)
-        if run.status not in TERMINAL_RUN_STATES:
-            run.cancel_event.set()
-            return [f"第 {touched_node_id or '当前'} 层真实探测超时"]
-        if run.status != "completed":
-            if run.error_code or _is_harness_infrastructure_message(run.error):
-                raise HarnessInfrastructureError(
-                    f"Harness 增量层探测基础设施失败（code={run.error_code or 'unknown'}）：{run.error}。当前层未进入无效重建。"
+            try:
+                # Incremental layers are intentionally probed before an output
+                # node exists. The final `complete` path is still required to
+                # contain an output node by the strict connectivity checks.
+                run = manager.start(
+                    project,
+                    workflow.id,
+                    body,
+                    policy=policy,
+                    record=False,
+                    require_output=False,
                 )
-            return [run.error or f"增量层状态为 {run.status}"]
-        if touched_node_id and touched_node_id in run.node_states:
-            status = str(run.node_states[touched_node_id].get("status", ""))
-            if status != "completed":
-                return [f"本层节点 {touched_node_id} 未被真实执行，状态为 {status or 'unknown'}；请调整探测输入或连线"]
-        return []
+            except (RuntimeError, ValueError) as exc:
+                message = str(exc)
+                if _is_harness_infrastructure_message(message):
+                    raise HarnessInfrastructureError(
+                        f"Harness 增量层探测基础设施失败：{message}。当前层未进入无效重建。"
+                    ) from exc
+                return [message]
+            deadline = time.monotonic() + _incremental_probe_timeout_seconds()
+            while run.status not in TERMINAL_RUN_STATES and time.monotonic() < deadline:
+                if generation.cancelled:
+                    run.cancel_event.set()
+                    raise RuntimeError("生成已取消")
+                time.sleep(0.02)
+            if run.status not in TERMINAL_RUN_STATES:
+                run.cancel_event.set()
+                return [f"第 {touched_node_id or '当前'} 层真实探测超时"]
+            if run.status != "completed":
+                if run.error_code or _is_harness_infrastructure_message(run.error):
+                    raise HarnessInfrastructureError(
+                        f"Harness 增量层探测基础设施失败（code={run.error_code or 'unknown'}）：{run.error}。当前层未进入无效重建。"
+                    )
+                return [run.error or f"增量层状态为 {run.status}"]
+            if touched_node_id and touched_node_id in run.node_states:
+                status = str(run.node_states[touched_node_id].get("status", ""))
+                if status != "completed":
+                    return [f"本层节点 {touched_node_id} 未被真实执行，状态为 {status or 'unknown'}；请调整探测输入或连线"]
+            return []
+        finally:
+            manager.stop_scheduler()
 
     def _route_chat_turn(
         self,
