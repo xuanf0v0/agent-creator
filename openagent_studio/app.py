@@ -317,6 +317,18 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"generation_id": generation.id, "workflow_id": workflow_id}
 
+    @app.post("/api/generator/generations/{generation_id}/resume", status_code=202)
+    def generator_resume(generation_id: str, body: dict[str, str]):
+        try:
+            generation = generator.resume(generation_id, body.get("message", ""))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到生成任务") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"generation_id": generation.id, "workflow_id": generation.workflow_id}
+
     @app.get("/api/generator/generations/{generation_id}/events")
     def generator_events(generation_id: str, last_event_id: str | None = Header(default=None, alias="Last-Event-ID")):
         try:

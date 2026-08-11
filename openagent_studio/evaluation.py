@@ -206,16 +206,27 @@ class WorkflowEvaluator:
         if any(labels.get(key) != value for key, value in expected_labels.items()):
             raise HarnessInfrastructureError(f"Harness 后端 {backend_id} 的任务 Agent 身份标签不匹配；请更新注册配置")
 
-    def evaluate(self, project: ProjectSpec, workflow: WorkflowSpec, index: int) -> CandidateResult:
+    def evaluate(
+        self,
+        project: ProjectSpec,
+        workflow: WorkflowSpec,
+        index: int,
+        *,
+        case_ids: set[str] | None = None,
+    ) -> CandidateResult:
         validation = validate_executable_workflow(project, workflow, runtime=True)
         if validation:
             return CandidateResult(index, workflow, False, [], complexity_metrics(workflow, 0, index), validation)
         self.ensure_runtime_ready(project, workflow)
         case_results: list[CaseResult] = []
         started = time.monotonic()
-        cases = [case for case in workflow.evaluation.cases if case.enabled]
+        cases = [
+            case for case in workflow.evaluation.cases
+            if case.enabled and (case_ids is None or case.id in case_ids)
+        ]
         if not cases:
-            return CandidateResult(index, workflow, False, [], complexity_metrics(workflow, 0, index), ["没有启用的验收用例"])
+            message = "没有匹配的失败验收用例" if case_ids is not None else "没有启用的验收用例"
+            return CandidateResult(index, workflow, False, [], complexity_metrics(workflow, 0, index), [message])
         for case in cases:
             case_started = time.monotonic()
             manager = WorkflowManager(base_url=self.harness_base_url, poll_interval=0.1 if self.live_execution else 0.01)

@@ -967,6 +967,14 @@ def validate_executable_workflow(
             errors.append(f"连线引用了不存在的节点：{edge.source} → {edge.target}")
         if edge.source == edge.target:
             errors.append(f"节点不能连接到自身：{edge.source}")
+        source_node = nodes.get(edge.source)
+        if source_node is not None and source_node.type == "condition":
+            condition = str(edge.condition or "").strip()
+            if condition not in {"true", "false"}:
+                errors.append(
+                    f"条件节点 {edge.source} 的出边 {edge.target} 必须使用 true 或 false，"
+                    f"不能使用 {edge.condition or '空条件'}"
+                )
     agent_ids = {item.id for item in project.harness}
     workflow_ids = {item.id for item in project.workflows}
     inbound_ids = {edge.target for edge in workflow.edges}
@@ -999,6 +1007,8 @@ def validate_executable_workflow(
             errors.append(f"HTTP 节点 {node.id} 缺少 URL")
         if node.type == "subworkflow" and node.data.get("workflow_id") not in workflow_ids:
             errors.append(f"子工作流节点 {node.id} 未选择有效工作流")
+        if node.type == "condition" and not str(node.data.get("expression") or "").strip():
+            errors.append(f"条件节点 {node.id} 缺少 expression")
         if node.type in {"iteration", "loop"}:
             try:
                 count = int(node.data.get("iterations", 1))
@@ -1052,4 +1062,17 @@ def validate_executable_workflow(
             missing = sorted(set(nodes) - reaches_output)
             if missing:
                 errors.append(f"节点无法到达 output：{', '.join(missing)}")
+        for node_id, node in nodes.items():
+            if node.type != "condition":
+                continue
+            branch_conditions = {
+                str(edge.condition or "").strip()
+                for edge in workflow.edges if edge.source == node_id
+            }
+            missing_conditions = {"true", "false"} - branch_conditions
+            if missing_conditions:
+                errors.append(
+                    f"完整工作流中的条件节点 {node_id} 缺少分支："
+                    f"{', '.join(sorted(missing_conditions))}"
+                )
     return errors

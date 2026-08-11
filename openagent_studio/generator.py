@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,10 @@ class _CompactionTimeoutError(RuntimeError):
 
 class _EmptyCompactionError(RuntimeError):
     pass
+
+
+class _GenerationStalled(RuntimeError):
+    """Generation paused with its last accepted draft kept in memory."""
 
 
 _OPENCODE_LOG_LOCK = threading.Lock()
@@ -99,8 +104,8 @@ timeout_seconds 必须是 1 到 1800 的整数，建议使用默认值 300，禁
 
 CREATION_STEP_PROMPT = """你是 OpenAgent Studio 的工作流创建器。服务端正在创建一个尚未保存的新工作流。
 只输出 <result>{{JSON}}</result>，action 只能是 add_node、revise_node 或 finish_creation：
-- add_node：{{"action":"add_node","node":{{完整 WorkflowNode}},"add_edges":[{{"source":"...","target":"...","condition":"可选"}}],"workflow_name":"可选","summary":"本步目的"}}
-- revise_node：{{"action":"revise_node","node":{{已有节点的完整替换}},"edges_mode":"preserve 或 patch","remove_edges":[],"add_edges":[],"summary":"修复原因"}}
+- add_node：{{"action":"add_node","node":{{完整 WorkflowNode}},"add_edges":[{{"source":"...","target":"...","condition":"可选"}}],"workflow_name":"可选","probe_input":任意JSON,"probe_approvals":{{"审批节点id":true}},"summary":"本步目的"}}
+- revise_node：{{"action":"revise_node","node":{{已有节点的完整替换}},"edges_mode":"preserve 或 patch","remove_edges":[],"add_edges":[],"probe_input":任意JSON,"probe_approvals":{{"审批节点id":true}},"summary":"修复原因"}}
 - finish_creation：{{"action":"finish_creation","summary":"图已完整的原因"}}
 硬约束：
 1. 每轮只创建或修复一个节点；创建阶段不得删除节点或工作流。
@@ -108,7 +113,9 @@ CREATION_STEP_PROMPT = """你是 OpenAgent Studio 的工作流创建器。服务
 3. add_node 的 add_edges 只能连接本轮节点；除首个节点外，新节点必须连接到已有草稿。
 4. revise_node 默认保持全部连线；只有 edges_mode=patch 才应用明确的 remove_edges/add_edges，省略绝不表示删除。
 5. 节点使用合法具体 type；AI 节点必须填写可用 agent_id 和完整 prompt。
-6. 仅当入口、必要分支、汇总和 output 均完整时 finish_creation。最终严格运行检测由服务端统一执行。
+6. condition 节点必须填写可执行 expression；其出边 condition 只能使用字符串 true 或 false，禁止使用“通过/拒绝”等展示文案。
+7. 仅当入口、必要分支、汇总和 output 均完整时 finish_creation。最终严格运行检测由服务端统一执行。
+8. probe_input 和 probe_approvals 必须让 AI、工具、HTTP、审批、条件、循环、子工作流及条件连线变更在本层真实探测中被执行。
 可用 Harness 智能体：{catalog}
 用户完整目标：{request}
 当前创建草稿：{workflow}
@@ -131,6 +138,7 @@ INCREMENTAL_STEP_PROMPT = """你是 OpenAgent Studio 的增量工作流构建器
 6. 只有当前图已完整满足用户目标、包含必要分支和输出时才 complete。不要因为本层通过探测就提前 complete。
 7. probe_input 和 probe_approvals 必须让本次新增/修改的节点在本层真实探测中被执行，尤其要覆盖条件分支。
 8. 不得修改 evaluation；系统会在完整图上生成并锁定验收标准。
+9. condition 节点必须填写可执行 expression；其出边 condition 只能使用字符串 true 或 false。approval 的输出是包含 approved 布尔值的对象，禁止使用“通过/拒绝”等展示文案作为分支条件。
 可用 Harness 智能体：{catalog}
 用户完整目标：{request}
 当前已接受工作流：{workflow}
@@ -174,6 +182,9 @@ class Generation:
     chat_routing: bool = False
     compaction_disabled: bool = False
     mode: str = "modify"
+    stalled: bool = False
+    last_failure: dict[str, Any] | None = None
+    initial_failures: list[dict[str, Any]] = field(default_factory=list)
 
     def emit(self, event: str, data: dict[str, Any]) -> None:
         with self.event_signal:
@@ -183,6 +194,69 @@ class Generation:
             if len(self.events) > self.max_events:
                 del self.events[:len(self.events) - self.max_events]
             self.event_signal.notify_all()
+
+
+@dataclass
+class _BuildProgressGuard:
+    accepted_fingerprints: set[str]
+    current_fingerprint: str
+    rejected_proposals: set[str] = field(default_factory=set)
+    last_failure_signature: str | None = None
+    consecutive_failures: int = 0
+
+    @classmethod
+    def from_workflow(cls, workflow: WorkflowSpec) -> "_BuildProgressGuard":
+        fingerprint = _workflow_semantic_fingerprint(workflow)
+        return cls({fingerprint}, fingerprint)
+
+    def cycle_kind(self, workflow: WorkflowSpec) -> str | None:
+        fingerprint = _workflow_semantic_fingerprint(workflow)
+        if fingerprint == self.current_fingerprint:
+            return "unchanged"
+        if fingerprint in self.accepted_fingerprints:
+            return "history"
+        return None
+
+    def record_failure(
+        self,
+        workflow: WorkflowSpec,
+        proposal: Any,
+        failure: dict[str, Any],
+        candidate: WorkflowSpec | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        graph_fingerprint = _workflow_semantic_fingerprint(workflow)
+        proposal_fingerprint = _proposal_semantic_fingerprint(proposal)
+        failure_signature = _failure_semantic_signature(graph_fingerprint, failure)
+        duplicate_proposal = proposal_fingerprint in self.rejected_proposals
+        self.rejected_proposals.add(proposal_fingerprint)
+        if failure_signature == self.last_failure_signature:
+            self.consecutive_failures += 1
+        else:
+            self.last_failure_signature = failure_signature
+            self.consecutive_failures = 1
+        decorated = {
+            **failure,
+            "attempts": self.consecutive_failures,
+            "duplicate_proposal": duplicate_proposal,
+            "graph_fingerprint": graph_fingerprint,
+            "proposal_fingerprint": proposal_fingerprint,
+            "candidate_fingerprint": (
+                _workflow_semantic_fingerprint(candidate) if candidate is not None
+                else proposal_fingerprint
+            ),
+        }
+        return decorated, self.consecutive_failures >= 2
+
+    def accept(self, workflow: WorkflowSpec) -> bool:
+        fingerprint = _workflow_semantic_fingerprint(workflow)
+        if fingerprint in self.accepted_fingerprints:
+            return False
+        self.accepted_fingerprints.add(fingerprint)
+        self.current_fingerprint = fingerprint
+        self.rejected_proposals.clear()
+        self.last_failure_signature = None
+        self.consecutive_failures = 0
+        return True
 
 
 class GeneratorManager:
@@ -326,6 +400,51 @@ class GeneratorManager:
         self._launch(generation, spec)
         return generation
 
+    def resume(self, generation_id: str, message: str) -> Generation:
+        if not isinstance(message, str):
+            raise ValueError("继续修复的 message 必须是非空字符串")
+        message = message.strip()
+        if not message:
+            raise ValueError("请输入继续修复所需的补充说明")
+        with self._lock:
+            previous = self.require(generation_id)
+            if not previous.stalled or previous.last_failure is None:
+                raise ValueError("这个生成任务不处于可继续修复状态")
+            if self.store.etag() != previous.base_etag:
+                raise RuntimeError("工作流在暂停期间已被修改，不能继续旧草稿；请重新发起生成")
+            active_id = self.active.get(previous.workflow_id)
+            if active_id and active_id != generation_id:
+                active = self.generations.get(active_id)
+                if active is not None and not active.completed:
+                    raise RuntimeError("这个工作流正在生成，请先等待或停止当前生成")
+            spec = self.store.load()
+            model = self.ensure_ready(spec)["model"]
+            prompt = f"{previous.prompt}\n\n用户针对暂停错误补充的修复要求：{message}"
+            generation = Generation(
+                id=uuid.uuid4().hex,
+                max_events=self.max_generation_events,
+                workflow_id=previous.workflow_id,
+                base_etag=previous.base_etag,
+                draft=json.loads(json.dumps(previous.draft, ensure_ascii=False)),
+                prompt=prompt,
+                messages=[{"role": "user", "content": message}],
+                session_id=previous.session_id if previous.model == model else None,
+                harness_agent_ids={item.id for item in spec.harness},
+                model=model,
+                optimize_only=previous.optimize_only,
+                chat_routing=False,
+                mode=previous.mode,
+                initial_failures=[json.loads(json.dumps(previous.last_failure, ensure_ascii=False))],
+            )
+            self.generations[generation.id] = generation
+            self.active[generation.workflow_id] = generation.id
+            history = self.history.setdefault(generation.workflow_id, [])
+            history.append({"role": "user", "content": message})
+            del history[:-self.max_history_messages]
+            self._trim_generations_locked()
+        self._launch(generation, spec)
+        return generation
+
     def optimize(self, workflow_id: str) -> Generation:
         return self.start(workflow_id, "在不改变目标效果和验收标准的前提下，选出最短、最清晰、效果最好的工作流。", optimize_only=True)
 
@@ -335,6 +454,7 @@ class GeneratorManager:
         if generation.process and generation.process.poll() is None:
             _terminate_process_tree(generation.process)
         generation.completed = True
+        generation.stalled = False
         generation.emit("generation.cancelled", {"generation_id": generation.id})
         with self._lock:
             self._trim_generations_locked()
@@ -350,7 +470,7 @@ class GeneratorManager:
         if len(self.generations) <= self.max_generations:
             return
         completed = sorted(
-            (item for item in self.generations.values() if item.completed),
+            (item for item in self.generations.values() if item.completed and not item.stalled),
             key=lambda item: item.events[-1].get("timestamp", 0) if item.events else 0,
         )
         for generation in completed[:max(0, len(self.generations) - self.max_generations)]:
@@ -445,6 +565,8 @@ class GeneratorManager:
                 generation.events[-1]["data"]["assistant_message"] = summary
                 self.history.setdefault(generation.workflow_id, []).append({"role": "assistant", "content": summary})
                 self.history[generation.workflow_id] = self.history[generation.workflow_id][-self.max_history_messages:]
+        except _GenerationStalled:
+            return
         except Exception as exc:
             if generation.cancelled:
                 return
@@ -453,6 +575,66 @@ class GeneratorManager:
         finally:
             with self._lock:
                 self._trim_generations_locked()
+
+    @staticmethod
+    def _stall(
+        generation: Generation,
+        current: WorkflowSpec,
+        failure: dict[str, Any],
+        *,
+        accepted_layers: int,
+        iteration: int,
+    ) -> None:
+        generation.draft = current.model_dump(mode="json")
+        generation.last_failure = json.loads(json.dumps(failure, ensure_ascii=False))
+        generation.stalled = True
+        generation.completed = True
+        node_id = failure.get("node_id")
+        message = (
+            f"第 {accepted_layers + 1} 层连续 {failure.get('attempts', 2)} 次没有取得进展"
+            f"{f'（节点 {node_id}）' if node_id else ''}；已暂停并保留最后通过的内存草稿。"
+            "请补充修复要求后继续。"
+        )
+        generation.emit("generation.stalled", {
+            "reason": "no_progress",
+            "message": message,
+            "layer": accepted_layers + 1,
+            "iteration": iteration,
+            "node_id": node_id,
+            "attempts": failure.get("attempts", 2),
+            "last_failure": generation.last_failure,
+            "workflow": generation.draft,
+        })
+        raise _GenerationStalled(message)
+
+    @staticmethod
+    def _evaluate_failed_cases_first(
+        generation: Generation,
+        evaluator: WorkflowEvaluator,
+        project: Any,
+        candidate: WorkflowSpec,
+        iteration: int,
+        failed_case_ids: set[str],
+    ) -> tuple[CandidateResult, set[str]]:
+        if failed_case_ids:
+            generation.emit("generation.stage", {
+                "stage": "retrying_failed_cases",
+                "iteration": iteration,
+                "case_ids": sorted(failed_case_ids),
+            })
+            focused = evaluator.evaluate(
+                project, candidate, iteration, case_ids=set(failed_case_ids),
+            )
+            if not focused.passed:
+                return focused, {
+                    case.case_id for case in focused.cases if not case.passed
+                } or set(failed_case_ids)
+            generation.emit("generation.stage", {
+                "stage": "final_regression",
+                "iteration": iteration,
+            })
+        result = evaluator.evaluate(project, candidate, iteration)
+        return result, {case.case_id for case in result.cases if not case.passed}
 
     def _build_creation(
         self,
@@ -465,10 +647,12 @@ class GeneratorManager:
         catalog_json: str,
     ) -> WorkflowSpec:
         current = original.model_copy(deep=True)
-        failures: list[dict[str, Any]] = []
+        failures = [json.loads(json.dumps(item, ensure_ascii=False)) for item in generation.initial_failures]
         accepted_layers = 0
         iteration = 0
         evaluation_locked = False
+        failed_case_ids: set[str] = set()
+        progress = _BuildProgressGuard.from_workflow(current)
         max_iterations = _incremental_max_iterations()
         while True:
             if generation.cancelled:
@@ -490,12 +674,19 @@ class GeneratorManager:
                     layer=accepted_layers,
                 ),
                 f"创建工作流第 {accepted_layers + 1} 层（迭代 {iteration}）",
+                timeout_seconds=_repair_timeout_seconds() if failures else _planning_timeout_seconds(),
             )
             try:
                 candidate, action, touched_node_id, summary = _apply_creation_step(
                     current, raw, generation.harness_agent_ids,
                 )
                 static_errors = _creation_step_errors(current, candidate, action, touched_node_id)
+                if action != "finish_creation":
+                    static_errors.extend(validate_executable_workflow(
+                        _project_with_workflow(spec, candidate), candidate,
+                        runtime=True, require_output=False,
+                    ))
+                    static_errors = list(dict.fromkeys(static_errors))
                 if static_errors:
                     raise RuntimeError("；".join(static_errors))
             except (ValidationError, ValueError, RuntimeError) as exc:
@@ -504,12 +695,19 @@ class GeneratorManager:
                     "action": raw.get("action") if isinstance(raw, dict) else None,
                     "candidate_accepted": False,
                 }
+                failure["node_id"] = _proposal_node_id(raw)
+                failure, stalled = progress.record_failure(current, raw, failure)
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("workflow.preview", {
                     "workflow": current.model_dump(mode="json"), "layer": accepted_layers,
                     "reverted": True, "reason": "creation_step",
                 })
+                if stalled:
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
                 continue
             generation.emit("workflow.preview", {
                 "workflow": candidate.model_dump(mode="json"), "layer": accepted_layers + 1,
@@ -517,13 +715,88 @@ class GeneratorManager:
                 "action": action, "node_id": touched_node_id, "summary": summary,
             })
             if action != "finish_creation":
+                cycle_kind = progress.cycle_kind(candidate)
+                if cycle_kind == "unchanged":
+                    failure = {
+                        "phase": "progress_unchanged",
+                        "reason": "same_graph",
+                        "message": "候选只改变位置、摘要或其他非语义字段，稳定图没有变化",
+                        "iteration": iteration, "action": action, "node_id": touched_node_id,
+                        "candidate_accepted": False,
+                    }
+                    failure, stalled = progress.record_failure(current, raw, failure, candidate)
+                    failures.append(failure)
+                    generation.emit("generation.layer_failed", failure)
+                    generation.emit("workflow.preview", {
+                        "workflow": current.model_dump(mode="json"), "layer": accepted_layers,
+                        "reverted": True, "reason": "progress_unchanged",
+                    })
+                    if stalled:
+                        self._stall(
+                            generation, current, failure,
+                            accepted_layers=accepted_layers, iteration=iteration,
+                        )
+                    continue
+                if cycle_kind == "history":
+                    failure = {
+                        "phase": "progress_cycle", "message": "候选会回到已接受过的工作流状态",
+                        "reason": "accepted_graph_cycle",
+                        "iteration": iteration, "action": action, "node_id": touched_node_id,
+                        "candidate_accepted": False, "attempts": 2,
+                    }
+                    generation.emit("generation.layer_failed", failure)
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
+                validation_tier = "static_only"
+                if _step_requires_runtime_probe(current, candidate, action, touched_node_id):
+                    generation.emit("generation.stage", {
+                        "stage": "probing_layer", "operation": "create_workflow",
+                        "layer": accepted_layers + 1, "node_id": touched_node_id,
+                        "iteration": iteration, "validation_tier": "runtime_probe",
+                    })
+                    probe_errors = self._probe_incremental_workflow(
+                        generation, spec, candidate, touched_node_id,
+                        raw.get("probe_input") if isinstance(raw, dict) else None,
+                        raw.get("probe_approvals", {}) if isinstance(raw, dict) and isinstance(raw.get("probe_approvals", {}), dict) else {},
+                        evaluator,
+                    )
+                    if probe_errors:
+                        failure = {
+                            "phase": "runtime_probe", "errors": probe_errors,
+                            "iteration": iteration, "action": action, "node_id": touched_node_id,
+                            "candidate_accepted": False,
+                        }
+                        failure, stalled = progress.record_failure(current, raw, failure, candidate)
+                        failures.append(failure)
+                        generation.emit("generation.layer_failed", failure)
+                        generation.emit("workflow.preview", {
+                            "workflow": current.model_dump(mode="json"), "layer": accepted_layers,
+                            "reverted": True, "reason": "runtime_probe",
+                        })
+                        if stalled:
+                            self._stall(
+                                generation, current, failure,
+                                accepted_layers=accepted_layers, iteration=iteration,
+                            )
+                        continue
+                    validation_tier = "runtime_probe"
+                else:
+                    generation.emit("generation.stage", {
+                        "stage": "static_layer_accepted", "operation": "create_workflow",
+                        "layer": accepted_layers + 1, "node_id": touched_node_id,
+                        "iteration": iteration, "validation_tier": "static_only",
+                    })
+                if not progress.accept(candidate):
+                    raise RuntimeError("内部进展状态不一致：候选图已被接受")
                 current = candidate
                 generation.draft = current.model_dump(mode="json")
                 accepted_layers += 1
                 failures.clear()
                 generation.emit("generation.layer_completed", {
                     "layer": accepted_layers, "operation": "create_workflow",
-                    "validation_tier": "local_graph", "action": action,
+                    "validation_tier": validation_tier, "action": action,
                     "node_id": touched_node_id, "summary": summary,
                     "nodes": len(current.nodes), "edges": len(current.edges),
                 })
@@ -536,11 +809,18 @@ class GeneratorManager:
             project = _project_with_workflow(spec, candidate)
             full_errors = validate_executable_workflow(project, candidate, runtime=True, require_output=True)
             if full_errors:
-                failures.append({
+                failure = {
                     "phase": "full_static_graph", "errors": full_errors, "iteration": iteration,
                     "action": action, "candidate_accepted": False,
-                })
-                generation.emit("generation.layer_failed", failures[-1])
+                }
+                failure, stalled = progress.record_failure(current, raw, failure, candidate)
+                failures.append(failure)
+                generation.emit("generation.layer_failed", failure)
+                if stalled:
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
                 continue
             if spec.harness:
                 generation.emit("generation.stage", {
@@ -569,22 +849,32 @@ class GeneratorManager:
                 "stage": "full_evaluating", "operation": "create_workflow",
                 "validation_tier": "full_runtime_evaluation", "iteration": iteration,
             })
-            result = evaluator.evaluate(_project_with_workflow(spec, candidate), candidate, iteration)
+            result, failed_case_ids = self._evaluate_failed_cases_first(
+                generation, evaluator, _project_with_workflow(spec, candidate),
+                candidate, iteration, failed_case_ids,
+            )
             if result.passed:
                 generation.emit("generation.workflow_verified", {
                     "operation": "create_workflow", "validation_tier": "full_runtime_evaluation",
                     "layers": accepted_layers, "iterations": iteration,
                 })
                 return candidate
-            failures.append({
+            failure = {
                 "phase": "full_evaluation", "feedback": self._result_feedback(result),
                 "iteration": iteration, "action": action, "candidate_accepted": False,
-            })
-            generation.emit("generation.layer_failed", failures[-1])
+            }
+            failure, stalled = progress.record_failure(current, raw, failure, candidate)
+            failures.append(failure)
+            generation.emit("generation.layer_failed", failure)
             generation.emit("workflow.preview", {
                 "workflow": current.model_dump(mode="json"), "layer": accepted_layers,
                 "reverted": True, "reason": "full_evaluation",
             })
+            if stalled:
+                self._stall(
+                    generation, current, failure,
+                    accepted_layers=accepted_layers, iteration=iteration,
+                )
 
     def _build_incrementally(
         self,
@@ -597,10 +887,12 @@ class GeneratorManager:
         catalog_json: str,
     ) -> WorkflowSpec:
         current = original.model_copy(deep=True)
-        failures: list[dict[str, Any]] = []
+        failures = [json.loads(json.dumps(item, ensure_ascii=False)) for item in generation.initial_failures]
         accepted_layers = 0
         iteration = 0
         evaluation_locked = False
+        failed_case_ids: set[str] = set()
+        progress = _BuildProgressGuard.from_workflow(current)
         max_iterations = _incremental_max_iterations()
         while True:
             if generation.cancelled:
@@ -638,6 +930,7 @@ class GeneratorManager:
             raw = self._invoke_result(
                 generation, spec, command, workdir, prompt,
                 f"增量构建第 {accepted_layers + 1} 层（迭代 {iteration}）",
+                timeout_seconds=_repair_timeout_seconds() if failures else _planning_timeout_seconds(),
             )
             raw_action = raw.get("action") if isinstance(raw, dict) else None
             if generation.optimize_only and raw_action == "delete_node":
@@ -649,8 +942,15 @@ class GeneratorManager:
                     "action": raw_action,
                     "candidate_accepted": False,
                 }
+                failure["node_id"] = failure.get("node_id") or _proposal_node_id(raw)
+                failure, stalled = progress.record_failure(current, raw, failure)
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
+                if stalled:
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
                 continue
             if failures and raw_action == "delete_node" and not _explicit_delete_request(generation.prompt):
                 failure = {
@@ -661,6 +961,8 @@ class GeneratorManager:
                     "action": raw_action,
                     "candidate_accepted": False,
                 }
+                failure["node_id"] = failure.get("node_id") or _proposal_node_id(raw)
+                failure, stalled = progress.record_failure(current, raw, failure)
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
@@ -669,6 +971,11 @@ class GeneratorManager:
                     "message": failure["message"],
                     "strategy": "recreate_or_update_accepted_node",
                 })
+                if stalled:
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
                 continue
             try:
                 candidate, action, touched_node_id, probe_input, probe_approvals, summary = _apply_incremental_step(
@@ -676,7 +983,12 @@ class GeneratorManager:
                     allow_delete=_explicit_delete_request(generation.prompt) and not generation.optimize_only and not failures,
                 )
             except (ValidationError, ValueError, RuntimeError) as exc:
-                failure = {"phase": "step_contract", "message": str(exc), "iteration": iteration, "action": raw_action, "candidate_accepted": False}
+                failure = {
+                    "phase": "step_contract", "message": str(exc), "iteration": iteration,
+                    "action": raw_action, "node_id": _proposal_node_id(raw),
+                    "candidate_accepted": False,
+                }
+                failure, stalled = progress.record_failure(current, raw, failure)
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
@@ -684,6 +996,11 @@ class GeneratorManager:
                     "message": failure.get("message") or "已收集失败证据，下一轮将诊断并修复原节点",
                     "strategy": "recreate_or_update_accepted_node",
                 })
+                if stalled:
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
                 continue
 
             # Expose the model's validated incremental result immediately so
@@ -715,6 +1032,7 @@ class GeneratorManager:
                     "phase": "connectivity", "errors": static_errors, "action": action,
                     "node_id": touched_node_id, "iteration": iteration, "candidate_accepted": False,
                 }
+                failure, stalled = progress.record_failure(current, raw, failure, candidate)
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
@@ -728,7 +1046,54 @@ class GeneratorManager:
                     "reverted": True,
                     "reason": "connectivity",
                 })
+                if stalled:
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
                 continue
+
+            if action != "complete":
+                cycle_kind = progress.cycle_kind(candidate)
+                if cycle_kind == "unchanged":
+                    failure = {
+                        "phase": "progress_unchanged",
+                        "reason": "same_graph",
+                        "message": "候选只改变位置、摘要或其他非语义字段，稳定图没有变化",
+                        "iteration": iteration, "action": action, "node_id": touched_node_id,
+                        "candidate_accepted": False,
+                    }
+                    failure, stalled = progress.record_failure(current, raw, failure, candidate)
+                    failures.append(failure)
+                    generation.emit("generation.layer_failed", failure)
+                    generation.emit("generation.repairing", {
+                        "phase": failure["phase"], "node_id": touched_node_id,
+                        "message": "本轮没有产生语义变化，下一轮必须修改节点参数或连线",
+                        "strategy": "semantic_change_required",
+                    })
+                    generation.emit("workflow.preview", {
+                        "workflow": current.model_dump(mode="json"),
+                        "layer": accepted_layers, "reverted": True,
+                        "reason": "progress_unchanged",
+                    })
+                    if stalled:
+                        self._stall(
+                            generation, current, failure,
+                            accepted_layers=accepted_layers, iteration=iteration,
+                        )
+                    continue
+                if cycle_kind == "history":
+                    failure = {
+                        "phase": "progress_cycle", "reason": "accepted_graph_cycle",
+                        "message": "候选会回到已接受过的工作流状态",
+                        "iteration": iteration, "action": action, "node_id": touched_node_id,
+                        "candidate_accepted": False, "attempts": 2,
+                    }
+                    generation.emit("generation.layer_failed", failure)
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
 
             if action == "complete":
                 if not evaluation_locked:
@@ -750,7 +1115,9 @@ class GeneratorManager:
                 })
                 project = spec.model_copy(deep=True)
                 project.workflows = [candidate if item.id == candidate.id else item for item in project.workflows]
-                result = evaluator.evaluate(project, candidate, iteration)
+                result, failed_case_ids = self._evaluate_failed_cases_first(
+                    generation, evaluator, project, candidate, iteration, failed_case_ids,
+                )
                 if result.passed:
                     generation.emit("generation.workflow_verified", {
                         "layers": accepted_layers, "iterations": iteration,
@@ -761,6 +1128,7 @@ class GeneratorManager:
                     "iteration": iteration, "action": action, "node_id": touched_node_id,
                     "candidate_accepted": False,
                 }
+                failure, stalled = progress.record_failure(current, raw, failure, candidate)
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
@@ -775,18 +1143,32 @@ class GeneratorManager:
                     "reverted": True,
                     "reason": "full_evaluation",
                 })
+                if stalled:
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
                 continue
 
-            generation.emit("generation.stage", {
-                "stage": "probing_layer", "layer": accepted_layers + 1,
-                "node_id": touched_node_id, "iteration": iteration,
-            })
-            probe_errors = self._probe_incremental_workflow(
-                generation, spec, candidate,
-                None if action == "delete_node" else touched_node_id,
-                probe_input, probe_approvals,
-                evaluator,
-            )
+            probe_errors: list[str] = []
+            if _step_requires_runtime_probe(current, candidate, action, touched_node_id):
+                generation.emit("generation.stage", {
+                    "stage": "probing_layer", "layer": accepted_layers + 1,
+                    "node_id": touched_node_id, "iteration": iteration,
+                    "validation_tier": "runtime_probe",
+                })
+                probe_errors = self._probe_incremental_workflow(
+                    generation, spec, candidate,
+                    None if action == "delete_node" else touched_node_id,
+                    probe_input, probe_approvals,
+                    evaluator,
+                )
+            else:
+                generation.emit("generation.stage", {
+                    "stage": "static_layer_accepted", "layer": accepted_layers + 1,
+                    "node_id": touched_node_id, "iteration": iteration,
+                    "validation_tier": "static_only",
+                })
             failure_errors = list(dict.fromkeys([*static_errors, *probe_errors])) if action == "delete_node" else probe_errors
             if failure_errors:
                 failure_phase = "structural_runtime" if action == "delete_node" else "runtime_probe"
@@ -794,6 +1176,7 @@ class GeneratorManager:
                     "phase": failure_phase, "errors": failure_errors, "action": action,
                     "node_id": touched_node_id, "iteration": iteration, "candidate_accepted": False,
                 }
+                failure, stalled = progress.record_failure(current, raw, failure, candidate)
                 failures.append(failure)
                 generation.emit("generation.layer_failed", failure)
                 generation.emit("generation.repairing", {
@@ -807,7 +1190,14 @@ class GeneratorManager:
                     "reverted": True,
                     "reason": failure["phase"],
                 })
+                if stalled:
+                    self._stall(
+                        generation, current, failure,
+                        accepted_layers=accepted_layers, iteration=iteration,
+                    )
                 continue
+            if not progress.accept(candidate):
+                raise RuntimeError("内部进展状态不一致：候选图已被接受")
             current = candidate
             generation.draft = current.model_dump(mode="json")
             accepted_layers += 1
@@ -834,8 +1224,9 @@ class GeneratorManager:
         probe_approvals: dict[str, bool],
         evaluator: WorkflowEvaluator,
     ) -> list[str]:
-        project = spec.model_copy(deep=True)
-        project.workflows = [workflow if item.id == workflow.id else item for item in project.workflows]
+        # Creation drafts are not present in the persisted project yet. Probe
+        # against an in-memory project containing the draft without saving it.
+        project = _project_with_workflow(spec, workflow)
         approvals = {node.id: True for node in workflow.nodes if node.type == "approval"}
         approvals.update(probe_approvals)
         body: dict[str, Any] = {"input": probe_input}
@@ -1524,11 +1915,14 @@ def _redact_log_value(value: Any) -> Any:
 
 def _invoke_timeout_seconds() -> int:
     try:
-        # Bound each incremental planning call; the outer build loop continues
-        # until verification passes, cancellation, or an infrastructure error.
-        return max(30, min(int(os.environ.get("OPENCODE_GENERATOR_CALL_TIMEOUT", "300")), 1800))
+        return max(30, min(int(os.environ.get("OPENCODE_GENERATOR_CALL_TIMEOUT", "120")), 1800))
     except ValueError:
-        return 300
+        return 120
+
+
+def _planning_timeout_seconds() -> int:
+    """Planning calls stay bounded; repair calls use separate shorter bound."""
+    return _invoke_timeout_seconds()
 
 
 def _repair_timeout_seconds() -> int:
@@ -1546,17 +1940,17 @@ def _repair_timeout_seconds() -> int:
 
 def _incremental_probe_timeout_seconds() -> int:
     try:
-        return max(30, min(int(os.environ.get("OPENAGENT_INCREMENTAL_PROBE_TIMEOUT", "300")), 1800))
+        return max(30, min(int(os.environ.get("OPENAGENT_INCREMENTAL_PROBE_TIMEOUT", "120")), 1800))
     except ValueError:
-        return 300
+        return 120
 
 
 def _incremental_max_iterations() -> int:
-    """Optional operator safety cap; zero keeps the user-requested loop unbounded."""
+    """Bound generation even if model never reaches completion."""
     try:
-        return max(0, min(int(os.environ.get("OPENAGENT_INCREMENTAL_MAX_ITERATIONS", "0")), 10000))
+        return max(1, min(int(os.environ.get("OPENAGENT_INCREMENTAL_MAX_ITERATIONS", "100")), 10000))
     except ValueError:
-        return 0
+        return 100
 
 
 def _compaction_timeout_seconds() -> int:
@@ -1647,8 +2041,15 @@ def _normalize_workflow_result(
                 )
             elif raw_type in {"human", "user_input", "input", "start", "begin", "trigger"}:
                 node["type"] = "manual_trigger"
+            elif raw_type in {"human_approval", "manual_approval", "approve"}:
+                node["type"] = "approval"
             elif raw_type in {"end", "finish", "terminal", "result", "final"}:
                 node["type"] = "output"
+            if node.get("type") not in WORKFLOW_NODE_TYPES:
+                legal = ", ".join(sorted(WORKFLOW_NODE_TYPES))
+                raise RuntimeError(
+                    f"不支持的节点类型：{raw_type or '<empty>'}；合法类型：{legal}"
+                )
             if node.get("type") == "output" and "template" not in data:
                 mapping = data.get("input_mapping")
                 if isinstance(mapping, dict) and len(mapping) == 1:
@@ -1689,6 +2090,100 @@ def _project_with_workflow(project: Any, workflow: WorkflowSpec) -> Any:
     return candidate
 
 
+_RUNTIME_PROBE_NODE_TYPES = {
+    "llm", "agent", "knowledge_retrieval", "tool", "http_request", "code",
+    "condition", "switch", "parallel", "iteration", "loop", "approval",
+    "validator", "subworkflow",
+}
+
+
+def _canonical_semantic_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_semantic_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if key not in {"position", "summary", "description", "label", "title"}
+        }
+    if isinstance(value, list):
+        return [_canonical_semantic_value(item) for item in value]
+    return value
+
+
+def _semantic_digest(value: Any) -> str:
+    encoded = json.dumps(
+        _canonical_semantic_value(value), ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _workflow_semantic_fingerprint(workflow: WorkflowSpec) -> str:
+    nodes = sorted(
+        ({"id": node.id, "type": node.type, "data": node.data} for node in workflow.nodes),
+        key=lambda item: item["id"],
+    )
+    edges = sorted(
+        (
+            {"source": edge.source, "target": edge.target, "condition": edge.condition}
+            for edge in workflow.edges
+        ),
+        key=lambda item: (item["source"], item["target"], str(item["condition"])),
+    )
+    return _semantic_digest({"id": workflow.id, "nodes": nodes, "edges": edges})
+
+
+def _proposal_semantic_fingerprint(proposal: Any) -> str:
+    return _semantic_digest(proposal)
+
+
+def _failure_semantic_signature(graph_fingerprint: str, failure: dict[str, Any]) -> str:
+    # Exact model/error wording is unstable. A no-progress streak is defined by
+    # the stable graph plus operation target and failure class, not prose.
+    signal = {
+        "phase": failure.get("phase"),
+        "reason": failure.get("reason"),
+        "action": failure.get("action"),
+        "node_id": failure.get("node_id"),
+    }
+    return _semantic_digest({"graph": graph_fingerprint, "failure": signal})
+
+
+def _proposal_node_id(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    raw_ids = value.get("node_ids")
+    if isinstance(raw_ids, list):
+        ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        return ",".join(ids) or None
+    node = value.get("node")
+    if isinstance(node, dict) and node.get("id") is not None:
+        return str(node["id"])
+    for key in ("node_id", "id"):
+        if value.get(key) is not None:
+            return str(value[key])
+    return None
+
+
+def _step_requires_runtime_probe(
+    previous: WorkflowSpec,
+    candidate: WorkflowSpec,
+    action: str,
+    touched_node_id: str | None,
+) -> bool:
+    if action == "delete_node":
+        return True
+    node = next((item for item in candidate.nodes if item.id == touched_node_id), None)
+    if node is not None and node.type in _RUNTIME_PROBE_NODE_TYPES:
+        return True
+    previous_conditions = {
+        (edge.source, edge.target, edge.condition) for edge in previous.edges if edge.condition
+    }
+    candidate_conditions = {
+        (edge.source, edge.target, edge.condition) for edge in candidate.edges if edge.condition
+    }
+    return previous_conditions != candidate_conditions
+
+
 def _edge_key(value: Any) -> tuple[str, str, str | None]:
     if isinstance(value, dict):
         return str(value.get("source", "")), str(value.get("target", "")), value.get("condition")
@@ -1708,6 +2203,8 @@ def _apply_creation_step(
     summary = str(value.get("summary", "")).strip() or action
     if action == "finish_creation":
         return current.model_copy(deep=True), action, None, summary
+    if not isinstance(value.get("probe_approvals", {}), dict):
+        raise RuntimeError("probe_approvals 必须是审批节点到布尔值的对象")
     raw_node = value.get("node")
     if not isinstance(raw_node, dict):
         raise RuntimeError(f"{action} 缺少完整 node 对象")
@@ -1785,6 +2282,16 @@ def _creation_step_errors(
             errors.append(f"新增节点 {touched_node_id} 没有接入当前草稿")
     if len(candidate.edges) > 100:
         errors.append("连线数量不能超过 100")
+    for node in candidate.nodes:
+        if node.type == "condition" and not str(node.data.get("expression") or "").strip():
+            errors.append(f"条件节点 {node.id} 缺少 expression")
+    node_types = {node.id: node.type for node in candidate.nodes}
+    for edge in candidate.edges:
+        if node_types.get(edge.source) == "condition" and str(edge.condition or "").strip() not in {"true", "false"}:
+            errors.append(
+                f"条件节点 {edge.source} 的出边 {edge.target} 必须使用 true 或 false，"
+                f"不能使用 {edge.condition or '空条件'}"
+            )
     return list(dict.fromkeys(errors))
 
 

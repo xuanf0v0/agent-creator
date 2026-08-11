@@ -60,6 +60,15 @@ export async function cancelGeneration(generationId: string) {
   await fetch(`/api/generator/generations/${generationId}/cancel`, { method: 'POST' })
 }
 
+export async function resumeGeneration(generationId: string, message: string) {
+  const response = await fetch(`/api/generator/generations/${generationId}/resume`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message }),
+  })
+  const body = await response.json()
+  if (!response.ok) throw new ApiError(body.detail || '无法继续修复生成任务', response.status)
+  return body as { generation_id: string; workflow_id: string }
+}
+
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init)
   const body = await response.json()
