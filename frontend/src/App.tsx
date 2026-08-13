@@ -1,55 +1,57 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Background, BaseEdge, Controls, EdgeLabelRenderer, MiniMap, Panel, ReactFlow, ReactFlowProvider,
+  Background, BaseEdge, Controls, EdgeLabelRenderer, Handle, MiniMap, Panel, Position, ReactFlow, ReactFlowProvider,
   SelectionMode, addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
-  type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange,
+  type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange, type NodeProps, type NodeTypes,
 } from '@xyflow/react'
-import { ApiError, cancelGeneration, cancelWorkflowRun, loadGeneratorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadRuntimeStatus, loadSpec, loadWorkflowRun, optimizeWorkflow, resolveApproval, resumeGeneration, saveWorkflow, sendGeneratorMessage, startWorkflowRun } from './api'
-import type { EvaluationCase, IntegrationsStatus, NodeKind, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
+import { ApiError, cancelCreatorGeneration, cancelWorkflowRun, loadCreatorAgents, loadCreatorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadNodeTypes, loadRuntimeStatus, loadSpec, loadWorkflowRun, resolveApproval, saveWorkflow, sendCreatorDecide, startWorkflowRun } from './api'
+import type { AgentCapability, EvaluationCase, IntegrationsStatus, NodeKind, NodeTypeInfo, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
 
-type CatalogItem = { type: NodeKind; category: string; label: string; icon: string; description: string }
-const nodeCatalog: CatalogItem[] = [
+type CanvasData = { label: string; description: string; kind: NodeKind; icon: string; typeLabel: string; category: string; agent_id?: string; [key: string]: unknown }
+type CanvasNode = Node<CanvasData>
+type ChatMessage = { role: 'user' | 'assistant' | 'system'; content: string; options?: string[] }
+type ConsoleLogEntry = { time: string; kind: string; text: string }
+type ModelStatus = { model: string; activeCall: string | null; outputChars: number; startedAt: number | null }
+
+// Default fallback node catalog (used before loading from backend)
+const defaultNodeCatalog: NodeTypeInfo[] = [
   { type: 'manual_trigger', category: '触发器', label: '手动触发', icon: '▶', description: '从表单或 API 输入启动流程' },
-  { type: 'webhook', category: '触发器', label: 'Webhook', icon: '⚡', description: '通过 HTTP Webhook 触发' },
-  { type: 'schedule', category: '触发器', label: '定时触发', icon: '◷', description: '使用 Cron 计划触发' },
-  { type: 'llm', category: 'AI', label: 'LLM', icon: '◆', description: '调用模型完成单轮生成' },
-  { type: 'agent', category: 'AI', label: '智能体', icon: '✦', description: '调用 Harness 智能体完成任务' },
-  { type: 'knowledge_retrieval', category: 'AI', label: '知识检索', icon: '⌕', description: '从知识文档召回相关内容' },
-  { type: 'tool', category: 'AI', label: '工具调用', icon: '⌘', description: '通过 Harness 执行受治理工具' },
-  { type: 'code', category: 'AI', label: '代码任务', icon: '</>', description: '通过 Harness Agent 执行代码任务' },
-  { type: 'prompt', category: '数据处理', label: '模板', icon: 'T', description: '组织提示词或文本模板' },
-  { type: 'variable_set', category: '数据处理', label: '变量赋值', icon: 'x=', description: '创建工作流变量对象' },
+  { type: 'webhook', category: '触发器', label: 'Webhook', icon: '⚡', description: '通过 HTTP Webhook 触发', default_data: { path: '/hooks/workflow', method: 'POST' } },
+  { type: 'schedule', category: '触发器', label: '定时触发', icon: '◷', description: '使用 Cron 计划触发', default_data: { cron: '0 9 * * *', timezone: 'Asia/Shanghai' } },
+  { type: 'llm', category: 'AI', label: 'LLM', icon: '◆', description: '调用模型完成单轮生成', requires_agent: true, default_data: { prompt: '请基于以下输入完成任务：\n{{latest}}' } },
+  { type: 'agent', category: 'AI', label: '智能体', icon: '✦', description: '调用 Harness 智能体完成任务', requires_agent: true, default_data: { prompt: '请完成以下任务：\n{{latest}}', relative_path: '.' } },
+  { type: 'knowledge_retrieval', category: 'AI', label: '知识检索', icon: '⌕', description: '从知识文档召回相关内容', requires_agent: true, default_data: { query: '{{latest}}', top_k: 3, documents: [] } },
+  { type: 'tool', category: 'AI', label: '工具调用', icon: '⌘', description: '通过 Harness 执行受治理工具', requires_agent: true, default_data: { prompt: '请调用合适的工具处理：\n{{latest}}' } },
+  { type: 'code', category: 'AI', label: '代码任务', icon: '</>', description: '通过 Harness Agent 执行代码任务', requires_agent: true, default_data: { prompt: '请完成代码任务并运行验证：\n{{latest}}', relative_path: '.' } },
+  { type: 'prompt', category: '数据处理', label: '模板', icon: 'T', description: '组织提示词或文本模板', default_data: { template: '{{latest}}' } },
+  { type: 'variable_set', category: '数据处理', label: '变量赋值', icon: 'x=', description: '创建工作流变量对象', default_data: { variables: {} } },
   { type: 'transform', category: '数据处理', label: '数据转换', icon: '⇄', description: '解析、提取、筛选或扁平化数据' },
   { type: 'merge', category: '数据处理', label: '合并', icon: '⋈', description: '合并多个上游分支结果' },
-  { type: 'http_request', category: '集成', label: 'HTTP 请求', icon: '◎', description: '调用 HTTPS API' },
-  { type: 'condition', category: '流程控制', label: 'IF/ELSE', icon: '◇', description: '根据布尔结果选择分支' },
-  { type: 'switch', category: '流程控制', label: '多路分支', icon: '⑂', description: '按多个条件路由到不同分支' },
+  { type: 'http_request', category: '集成', label: 'HTTP 请求', icon: '◎', description: '调用 HTTPS API', default_data: { method: 'GET', url: 'https://', headers: {}, body: {}, timeout_seconds: 30, fail_on_error: true } },
+  { type: 'condition', category: '流程控制', label: 'IF/ELSE', icon: '◇', description: '根据布尔结果选择分支', default_data: { expression: 'latest' } },
+  { type: 'switch', category: '流程控制', label: '多路分支', icon: '⑂', description: '按多个条件路由到不同分支', default_data: { cases: [], default_case: 'default' } },
   { type: 'parallel', category: '流程控制', label: '并行', icon: '⋮', description: '并行调度互不依赖的分支' },
-  { type: 'iteration', category: '流程控制', label: '迭代', icon: '↻', description: '遍历或按次数生成迭代项' },
-  { type: 'loop', category: '流程控制', label: '循环', icon: '⟳', description: '执行有限次数循环' },
-  { type: 'delay', category: '流程控制', label: '等待', icon: '◴', description: '延迟后继续执行' },
-  { type: 'approval', category: '人工与质量', label: '人工审批', icon: '✓', description: '暂停并等待人工决定' },
-  { type: 'validator', category: '人工与质量', label: '验证器', icon: '⌁', description: '验证任务终态或业务规则' },
-  { type: 'subworkflow', category: '编排', label: '子工作流', icon: '▣', description: '调用另一个工作流' },
+  { type: 'iteration', category: '流程控制', label: '迭代', icon: '↻', description: '遍历或按次数生成迭代项', default_data: { iterations: 3, template: '{{latest}}' } },
+  { type: 'loop', category: '流程控制', label: '循环', icon: '⟳', description: '执行有限次数循环', default_data: { iterations: 3, template: '{{latest}}' } },
+  { type: 'delay', category: '流程控制', label: '等待', icon: '◴', description: '延迟后继续执行', default_data: { seconds: 1 } },
+  { type: 'approval', category: '人工与质量', label: '人工审批', icon: '✓', description: '暂停并等待人工决定', default_data: { instructions: '请检查上游结果并决定是否继续' } },
+  { type: 'validator', category: '人工与质量', label: '验证器', icon: '⌁', description: '验证任务终态或业务规则', requires_agent: true },
+  { type: 'subworkflow', category: '编排', label: '子工作流', icon: '▣', description: '调用另一个工作流', default_data: { input_template: '{{latest}}' } },
   { type: 'output', category: '输出', label: '结束/输出', icon: '→', description: '定义工作流最终输出' },
 ]
 
-const nodeDefaults: Partial<Record<NodeKind, Record<string, unknown>>> = {
+// Default fallback node defaults
+const defaultNodeDefaults: Partial<Record<NodeKind, Record<string, unknown>>> = {
   webhook: { path: '/hooks/workflow', method: 'POST' }, schedule: { cron: '0 9 * * *', timezone: 'Asia/Shanghai' },
   llm: { prompt: '请基于以下输入完成任务：\n{{latest}}' }, agent: { prompt: '请完成以下任务：\n{{latest}}', relative_path: '.' },
   knowledge_retrieval: { query: '{{latest}}', top_k: 3, documents: [] }, tool: { prompt: '请调用合适的工具处理：\n{{latest}}' },
   code: { prompt: '请完成代码任务并运行验证：\n{{latest}}', relative_path: '.' }, prompt: { template: '{{latest}}' },
   variable_set: { variables: {} }, transform: { operation: 'json_stringify', path: '', fields: [] }, merge: { mode: 'array', separator: '\n' },
   http_request: { method: 'GET', url: 'https://', headers: {}, body: {}, timeout_seconds: 30, fail_on_error: true },
-  condition: { expression: 'latest' }, switch: { cases: [{ value: 'case-1', expression: 'latest == "value"' }], default_case: 'default' },
+  condition: { expression: 'latest' }, switch: { cases: [], default_case: 'default' },
   iteration: { iterations: 3, template: '{{latest}}' }, loop: { iterations: 3, template: '{{latest}}' }, delay: { seconds: 1 },
   approval: { instructions: '请检查上游结果并决定是否继续' }, validator: { expression: '' }, subworkflow: { input_template: '{{latest}}' }, output: { template: '' },
 }
-const harnessNodeKinds: NodeKind[] = ['llm', 'agent', 'tool', 'code', 'validator']
-
-type CanvasData = { label: string; description: string; kind: NodeKind; agent_id?: string; [key: string]: unknown }
-type CanvasNode = Node<CanvasData>
-type ChatMessage = { role: 'user' | 'assistant' | 'system'; content: string; options?: string[] }
 
 const nodeStyle = { background: 'rgba(255,255,255,.055)', color: 'rgba(255,255,255,.92)', border: 'none', borderRadius: 16, width: 200, boxShadow: '0 12px 32px rgba(0,0,0,.42), inset 0 1px 1px rgba(255,255,255,.12)', fontSize: 12 }
 
@@ -64,24 +66,51 @@ function WaterEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, tar
 
 const edgeTypes: EdgeTypes = { water: WaterEdge }
 
-function nodeLabel(kind: NodeKind) {
-  return nodeCatalog.find((item) => item.type === kind)?.label ?? kind
+function nodeLabel(kind: NodeKind, catalog: NodeTypeInfo[] = defaultNodeCatalog) {
+  return catalog.find((item) => item.type === kind)?.label ?? kind
 }
 
-function toCanvas(workflow: Workflow): { nodes: CanvasNode[]; edges: Edge[] } {
+function CustomNode({ data, selected }: NodeProps<CanvasNode>) {
+  return (
+    <div className={`custom-node ${data.kind} ${selected ? 'selected' : ''}`}>
+      <div className="custom-node-badge">
+        <span className="custom-node-icon">{data.icon}</span>
+        <span className="custom-node-type">{data.typeLabel}</span>
+      </div>
+      <div className="custom-node-label">{data.label}</div>
+      <Handle type="target" position={Position.Left} />
+      <Handle type="source" position={Position.Right} />
+    </div>
+  )
+}
+
+const nodeTypes: NodeTypes = { custom: CustomNode }
+
+function toCanvas(workflow: Workflow, catalog: NodeTypeInfo[] = defaultNodeCatalog): { nodes: CanvasNode[]; edges: Edge[] } {
   return {
-    nodes: workflow.nodes.map((item) => ({
-      id: item.id, type: 'default', position: item.position,
-      data: {
-        ...item.data,
-        label: String(item.data.description || nodeLabel(item.type)),
-        description: String(item.data.description || ''), kind: item.type,
-        agent_id: typeof item.data.agent_id === 'string' ? item.data.agent_id : undefined,
-      },
-      style: nodeStyle,
-    })),
+    nodes: workflow.nodes.map((item) => {
+      const meta = catalog.find((entry) => entry.type === item.type)
+      const name = item.data.title || item.data.description || nodeLabel(item.type, catalog)
+      return {
+        id: item.id, type: 'custom', position: item.position,
+        data: {
+          ...item.data,
+          label: String(name),
+          description: String(item.data.description || ''), kind: item.type,
+          icon: meta?.icon || '•', typeLabel: nodeLabel(item.type, catalog), category: meta?.category || '',
+          agent_id: typeof item.data.agent_id === 'string' ? item.data.agent_id : undefined,
+        },
+        style: nodeStyle,
+      }
+    }),
     edges: workflow.edges.map((item, index) => ({ id: `e-${index}-${item.source}-${item.target}`, source: item.source, target: item.target, label: item.condition || undefined, type: 'water' })),
   }
+}
+
+function upsertWorkflow(workflows: Workflow[], workflow: Workflow): Workflow[] {
+  return workflows.some((item) => item.id === workflow.id)
+    ? workflows.map((item) => item.id === workflow.id ? workflow : item)
+    : [...workflows, workflow]
 }
 
 function runtimeStatusClass(status?: string) {
@@ -93,6 +122,20 @@ function formatRuntimeDuration(state?: { started_at?: number; completed_at?: num
   const end = state.completed_at ?? Date.now() / 1000
   const seconds = Math.max(0, end - state.started_at)
   return seconds < 1 ? `${Math.round(seconds * 1000)} ms` : `${seconds.toFixed(1)} s`
+}
+
+function displayNodeOutput(value: unknown): string | null {
+  if (value === undefined || value === null) return null
+  if (typeof value === 'object' && value !== null && 'text' in value && typeof (value as { text?: unknown }).text === 'string' && 'task' in value) {
+    const text = (value as { text: string }).text
+    if (text) return text
+  }
+  if (typeof value === 'string') return value
+  try { return JSON.stringify(value, null, 2) } catch { return String(value) }
+}
+
+function truncateText(value: string, limit = 1200): string {
+  return value.length > limit ? `${value.slice(0, limit)}…（截断，共 ${value.length} 字）` : value
 }
 
 const runtimeStatusLabels: Record<string, string> = {
@@ -122,6 +165,13 @@ function StudioCanvas() {
   const [libraryQuery, setLibraryQuery] = useState('')
   const [integrations, setIntegrations] = useState<IntegrationsStatus>({ feishu: [], qq: [] })
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null)
+  // Creator Harness: dynamic node types and agent capabilities
+  const [nodeCatalog, setNodeCatalog] = useState<NodeTypeInfo[]>(defaultNodeCatalog)
+  const [nodeDefaults, setNodeDefaults] = useState<Partial<Record<NodeKind, Record<string, unknown>>>>(defaultNodeDefaults)
+  const [creatorAgents, setCreatorAgents] = useState<AgentCapability[]>([])
+  const [consoleOpen, setConsoleOpen] = useState(false)
+  const [generationLog, setGenerationLog] = useState<ConsoleLogEntry[]>([])
+  const [modelStatus, setModelStatus] = useState<ModelStatus>({ model: '', activeCall: null, outputChars: 0, startedAt: null })
   const generationSource = useRef<EventSource | null>(null)
   const runSource = useRef<EventSource | null>(null)
   const chatDeltaFrame = useRef<number | null>(null)
@@ -146,14 +196,17 @@ function StudioCanvas() {
     const query = libraryQuery.trim().toLowerCase()
     if (!query) return nodeCatalog
     return nodeCatalog.filter((item) => [item.label, item.type, item.category, item.description].some((value) => value.toLowerCase().includes(query)))
-  }, [libraryQuery])
+  }, [libraryQuery, nodeCatalog])
+
+  // Creator Harness: node types that require an agent
+  const harnessNodeKinds = useMemo(() => nodeCatalog.filter((n) => n.requires_agent).map((n) => n.type), [nodeCatalog])
 
   const openWorkflow = useCallback((project: ProjectSpec, id: string) => {
     const item = project.workflows.find((flow) => flow.id === id)
     if (!item) return
-    const view = toCanvas(item)
+    const view = toCanvas(item, nodeCatalog)
     setNodes(view.nodes); setEdges(view.edges); setWorkflowId(id); setSelected(null); setSelectedEdge(null); setRun(null)
-    loadGeneratorMessages(id).then((items) => setChatMessages(items)).catch(() => setChatMessages([]))
+    loadCreatorMessages(id).then((items) => setChatMessages(items)).catch(() => setChatMessages([]))
     setTimeout(() => fitView({ padding: 0.22 }), 40)
   }, [fitView])
 
@@ -168,6 +221,18 @@ function StudioCanvas() {
   useEffect(() => { loadGeneratorStatus().then((status) => setGeneratorModel(status.ready ? status.model : `${status.model}（缺少 ${status.credential_env}）`)).catch((error: Error) => setGeneratorModel(error.message)) }, [])
   useEffect(() => { loadIntegrationsStatus().then(setIntegrations).catch(() => setIntegrations({ feishu: [], qq: [] })) }, [])
   useEffect(() => { loadRuntimeStatus().then(setRuntimeStatus).catch(() => setRuntimeStatus(null)) }, [])
+  // Creator Harness: load dynamic node types and agent capabilities
+  useEffect(() => {
+    loadNodeTypes().then((result) => {
+      if (result.node_types?.length) {
+        setNodeCatalog(result.node_types)
+        const defaultsMap: Partial<Record<NodeKind, Record<string, unknown>>> = {}
+        result.node_types.forEach((nt) => { if (nt.default_data) defaultsMap[nt.type as NodeKind] = nt.default_data })
+        if (Object.keys(defaultsMap).length) setNodeDefaults(defaultsMap)
+      }
+    }).catch(() => { /* use fallback defaults */ })
+    loadCreatorAgents().then((result) => { if (result.agents?.length) setCreatorAgents(result.agents) }).catch(() => { /* use fallback */ })
+  }, [])
   useEffect(() => () => {
     generationSource.current?.close()
     runSource.current?.close()
@@ -230,14 +295,14 @@ function StudioCanvas() {
     const id = `${kind}-${crypto.randomUUID().slice(0, 8)}`
     const defaults = { ...nodeDefaults[kind], ...(kind === 'webhook' ? { path: `/hooks/${workflowId}/${id}` } : {}) }
     setNodes((items) => [...items, {
-      id, position, type: 'default', data: { kind, label: catalog.label, description: catalog.description, ...defaults },
+      id, position, type: 'custom', data: { kind, label: catalog.label, description: catalog.description, icon: catalog.icon, typeLabel: catalog.label, category: catalog.category, ...defaults },
       style: nodeStyle,
     }])
   }
 
   function updateSelected(field: string, value: unknown) {
     if (!selected) return
-    setNodes((items) => items.map((node) => node.id === selected ? { ...node, data: { ...node.data, [field]: value, ...(field === 'description' ? { label: String(value) || nodeLabel(node.data.kind) } : {}) } } : node))
+    setNodes((items) => items.map((node) => node.id === selected ? { ...node, data: { ...node.data, [field]: value, ...(field === 'description' ? { label: String(value) || nodeLabel(node.data.kind, nodeCatalog) } : {}) } } : node))
   }
 
   function updateSelectedJson(field: string, value: string) {
@@ -255,7 +320,7 @@ function StudioCanvas() {
     setSaving(true); setMessage('正在保存工作流…')
     const payload: Workflow = {
       ...workflow,
-      nodes: nodes.map((node) => { const { label: _label, kind: _kind, ...data } = node.data; return { id: node.id, type: node.data.kind, position: node.position, data } }),
+      nodes: nodes.map((node) => { const { label: _label, kind: _kind, icon: _icon, typeLabel: _typeLabel, category: _category, ...data } = node.data; return { id: node.id, type: node.data.kind, position: node.position, data } }),
       edges: edges.map((edge) => ({ source: edge.source, target: edge.target, ...(typeof edge.label === 'string' && edge.label ? { condition: edge.label } : {}) })),
     }
     try {
@@ -281,7 +346,7 @@ function StudioCanvas() {
             return true
           }
           if (serverWorkflow) {
-            const view = toCanvas(serverWorkflow)
+            const view = toCanvas(serverWorkflow, nodeCatalog)
             setNodes(view.nodes); setEdges(view.edges)
           }
           setSpec(latest.spec); setEtag(latest.etag)
@@ -304,22 +369,28 @@ function StudioCanvas() {
   }
 
   function applyCompletedWorkflow(completed: Workflow, tag: string) {
-    const view = toCanvas(completed)
-    setNodes(view.nodes); setEdges(view.edges); setEtag(tag)
-    setSpec((project) => project ? { ...project, workflows: project.workflows.map((item) => item.id === completed.id ? completed : item) } : project)
+    const view = toCanvas(completed, nodeCatalog)
+    setNodes(view.nodes); setEdges(view.edges); setEtag(tag); setWorkflowId(completed.id)
+    setSpec((project) => project ? { ...project, workflows: upsertWorkflow(project.workflows, completed) } : project)
     setTimeout(() => fitView({ padding: 0.22 }), 40)
   }
 
-  function followGeneration(started: { generation_id: string }, successMessage: string) {
+  function followGeneration(started: { generation_id: string; workflow_id?: string }, successMessage: string) {
+    const targetWorkflowId = started.workflow_id || workflowId
     generationSource.current?.close()
     setGenerationId(started.generation_id)
-    const source = new EventSource(`/api/generator/generations/${started.generation_id}/events`)
+    if (started.workflow_id) setWorkflowId(started.workflow_id)
+    const source = new EventSource(`/api/creator/generations/${started.generation_id}/events`)
     generationSource.current = source
     const closeSource = () => {
       source.close()
       if (generationSource.current === source) generationSource.current = null
     }
     const listen = (name: string, handler: (data: any) => void) => source.addEventListener(name, (event) => handler(JSON.parse((event as MessageEvent).data)))
+    const pushLog = (kind: string, text: string) => setGenerationLog((items) => [...items.slice(-199), { time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), kind, text }])
+    setModelStatus({ model: '', activeCall: null, outputChars: 0, startedAt: null })
+    setGenerationLog([])
+    setConsoleOpen(true)
     const flushChatDelta = () => {
       if (chatDeltaFrame.current != null) cancelAnimationFrame(chatDeltaFrame.current)
       chatDeltaFrame.current = null
@@ -348,14 +419,37 @@ function StudioCanvas() {
       probing_layer: '正在真实探测当前层节点…',
       static_layer_accepted: '当前层已通过静态校验…',
       full_evaluating: '正在完整验收当前工作流…',
+      evaluating_case: '正在完整验收当前工作流…',
       retrying_failed_cases: '正在优先复验上轮失败用例…',
       final_regression: '失败用例已通过，正在执行最终全量回归…',
       layer_failed: '当前层未通过，正在根据失败证据重建…',
       saving: '正在保存完整验收通过的工作流…',
     }
-    listen('generation.stage', ({ stage, round, layer, iteration }) => {
-      const detail = layer ? `（第 ${layer} 层${iteration ? `，迭代 ${iteration}` : ''}）` : round ? `（第 ${round} 轮）` : ''
-      setMessage(`${stages[stage] || '正在优化工作流…'}${detail}`)
+    listen('generation.stage', ({ stage, round, layer, iteration, case_index, case_total, case_id, case_name, case_phase, case_passed, case_duration_seconds }) => {
+      let detail = layer ? `（第 ${layer} 层${iteration ? `，迭代 ${iteration}` : ''}）` : round ? `（第 ${round} 轮）` : ''
+      if (stage === 'evaluating_case' && case_total) {
+        const progress = `验收用例 ${case_index}/${case_total}：${case_name || case_id || '未命名'}`
+        detail = case_phase === 'finished'
+          ? `${progress}${case_passed ? ' 已通过' : ' 未通过'}${case_duration_seconds != null ? `（${case_duration_seconds}s）` : ''}`
+          : `${progress}（正在真实执行工作流…）`
+      }
+      const text = `${stages[stage] || '正在优化工作流…'}${detail}`
+      setMessage(text)
+      pushLog('stage', text)
+    })
+    listen('generation.model_call', ({ phase, purpose, model, attempt, exit_code, duration_ms, output_tail, diagnostics }) => {
+      if (phase === 'started') {
+        setModelStatus((state) => ({ ...state, model: model || state.model, activeCall: purpose, outputChars: 0, startedAt: Date.now() }))
+        pushLog('model', `调用模型：${purpose}（第 ${attempt} 次 · ${model}）`)
+      } else {
+        setModelStatus((state) => ({ ...state, model: model || state.model, activeCall: null }))
+        const tail = output_tail ? ` → ${String(output_tail).slice(0, 240)}` : ''
+        const diag = exit_code !== 0 && Array.isArray(diagnostics) && diagnostics.length ? ` · 诊断：${diagnostics.join('；')}` : ''
+        pushLog('model', `完成（${duration_ms}ms，退出码 ${exit_code}）${tail}${diag}`)
+      }
+    })
+    listen('generation.model_activity', ({ output_chars }) => {
+      setModelStatus((state) => ({ ...state, outputChars: output_chars || 0 }))
     })
     listen('generation.context_compacting', ({ before_chars }) => setMessage(`上下文较长（${before_chars} 字），正在提炼重点…`))
     listen('generation.context_compaction_retry', () => setMessage('首次上下文提炼返回空内容，正在使用同一 OpenCode compaction Agent 严格重试…'))
@@ -369,25 +463,34 @@ function StudioCanvas() {
         attempts ? `第 ${attempts} 次尝试` : '',
         node_id ? `节点 ${node_id}` : '',
       ].filter(Boolean).join('，')
-      setMessage(`${context}：${details}`)
+      const text = `${context}：${details}`
+      setMessage(text)
+      pushLog('error', text)
     })
-    listen('generation.repairing', ({ message: repairMessage, node_id }) => setMessage(`${repairMessage}${node_id ? `（节点 ${node_id}）` : ''}`))
+    listen('generation.repairing', ({ message: repairMessage, node_id, phase, attempt, attempts }) => {
+      const retry = phase === 'model_timeout' && attempt ? `（${attempt}/${attempts || 2}）` : ''
+      const text = `${repairMessage}${retry}${node_id ? `（节点 ${node_id}）` : ''}`
+      setMessage(text)
+      pushLog('repair', text)
+    })
     listen('generation.stalled', ({ message: stalled, node_id, attempts, workflow: stable }) => {
-      if (stable?.id === workflowId) {
-        const view = toCanvas(stable)
+      if (stable?.id === targetWorkflowId) {
+        const view = toCanvas(stable, nodeCatalog)
         setNodes(view.nodes); setEdges(view.edges)
-        setSpec((project) => project ? { ...project, workflows: project.workflows.map((item) => item.id === stable.id ? stable : item) } : project)
+        setSpec((project) => project ? { ...project, workflows: upsertWorkflow(project.workflows, stable) } : project)
       }
       setStalledGenerationId(started.generation_id)
-      setStalledMessage(stalled || `第 ${attempts || 2} 次修复仍无进展${node_id ? `（节点 ${node_id}）` : ''}`)
+      const stallText = stalled || `第 ${attempts || 2} 次修复仍无进展${node_id ? `（节点 ${node_id}）` : ''}`
+      setStalledMessage(stallText)
       setChatMessages((items) => [...items, { role: 'system', content: stalled || '生成连续两次无进展，已暂停' }])
       setRightTab('chat'); setSelected(null); setSelectedEdge(null)
       setGenerationId(null)
       setMessage(stalled || '生成已暂停，请补充修复要求')
+      pushLog('stall', stallText)
       closeSource()
     })
     const applyStreamingWorkflow = (workflow: Workflow, reverted = false) => {
-      if (!workflow || workflow.id !== workflowId) return
+      if (!workflow || workflow.id !== targetWorkflowId) return
       pendingPreview.current = { workflow, reverted }
       if (previewFrame.current != null) return
       previewFrame.current = requestAnimationFrame(() => {
@@ -395,9 +498,9 @@ function StudioCanvas() {
         const pending = pendingPreview.current
         pendingPreview.current = null
         if (!pending) return
-        const view = toCanvas(pending.workflow)
+        const view = toCanvas(pending.workflow, nodeCatalog)
         setNodes(view.nodes); setEdges(view.edges)
-        setSpec((project) => project ? { ...project, workflows: project.workflows.map((item) => item.id === pending.workflow.id ? pending.workflow : item) } : project)
+        setSpec((project) => project ? { ...project, workflows: upsertWorkflow(project.workflows, pending.workflow) } : project)
         setMessage(pending.reverted ? '本步探测未通过，已恢复上一个稳定版本' : `正在实时渲染：${pending.workflow.nodes.length} 个节点、${pending.workflow.edges.length} 条连线…`)
       })
     }
@@ -424,20 +527,21 @@ function StudioCanvas() {
       discardPreview()
       applyCompletedWorkflow(completed, tag)
       if (assistant_message) setChatMessages((items) => [...items, { role: 'assistant', content: assistant_message }])
-      setGenerationId(null); setMessage(successMessage); closeSource()
+      setGenerationId(null); setMessage(successMessage); pushLog('done', successMessage); closeSource()
     })
     const finishError = async (text: string) => {
       flushChatDelta()
       discardPreview()
       closeSource()
+      pushLog('error', text)
       setMessage(`${text}；正在恢复服务端稳定版本…`)
       setChatMessages((items) => [...items, { role: 'system', content: text }])
       try {
         const latest = await loadSpec()
-        const stable = latest.spec.workflows.find((item) => item.id === workflowId)
+        const stable = latest.spec.workflows.find((item) => item.id === targetWorkflowId)
         setSpec(latest.spec); setEtag(latest.etag)
         if (stable) {
-          const view = toCanvas(stable)
+          const view = toCanvas(stable, nodeCatalog)
           setNodes(view.nodes); setEdges(view.edges)
           setTimeout(() => fitView({ padding: 0.22 }), 40)
         }
@@ -464,8 +568,21 @@ function StudioCanvas() {
       if (!await persist()) return
       setChatInput('')
       setChatMessages((items) => [...items.map((item) => item.options ? { ...item, options: undefined } : item), { role: 'user', content: text }])
-      setMessage(`OpenCode 正在读取 ${nodes.length} 个节点和 ${edges.length} 条连线…`)
-      const started = await sendGeneratorMessage(workflowId, text)
+      setMessage('Creator Harness 正在分析意图…')
+      const result = await sendCreatorDecide(text, workflowId)
+      // 闲聊回复 — 直接显示，不启动生成
+      if (result.action === 'chat_reply') {
+        setChatMessages((items) => [...items, { role: 'assistant', content: result.reply as string }])
+        setMessage('')
+        return
+      }
+      // 需澄清 — 显示提示
+      if (result.action === 'clarify') {
+        setMessage(result.message as string)
+        return
+      }
+      // 生成任务 — 走标准 SSE 流
+      const started = result as { generation_id: string; workflow_id: string }
       setStalledGenerationId(null); setStalledMessage('')
       followGeneration(started, '工作流已通过验收并自动采用最佳方案')
     } catch (error) {
@@ -478,8 +595,13 @@ function StudioCanvas() {
     if (!workflowId || generationId || stalledGenerationId) return
     try {
       if (!await persist()) return
-      setRightTab('chat'); setMessage('正在启动最佳工作流选择…')
-      const started = await optimizeWorkflow(workflowId)
+      setRightTab('chat'); setMessage('Creator Harness 正在分析优化意图…')
+      const result = await sendCreatorDecide('优化工作流', workflowId)
+      if (result.action === 'chat_reply' || result.action === 'clarify') {
+        setMessage(result.message || result.reply || '无法启动优化')
+        return
+      }
+      const started = result as { generation_id: string; workflow_id: string }
       setStalledGenerationId(null); setStalledMessage('')
       followGeneration(started, '已采用通过验收的最佳工作流')
     } catch (error) { setMessage(error instanceof Error ? error.message : '无法启动优化') }
@@ -487,17 +609,30 @@ function StudioCanvas() {
 
   async function stopGeneration() {
     if (!generationId) return
-    await cancelGeneration(generationId)
-    setMessage('正在停止 OpenCode 生成器…')
+    await cancelCreatorGeneration(generationId)
+    setMessage('正在停止 Creator Harness 生成器…')
   }
 
   async function continueStalledGeneration() {
     const text = chatInput.trim()
     if (!stalledGenerationId || !text || generationId) return
     try {
-      const started = await resumeGeneration(stalledGenerationId, text)
+      // Creator Harness 内部通过 _find_running_generation 自动找到暂停的生成并继续
+      const result = await sendCreatorDecide(text, workflowId!)
       setStalledGenerationId(null); setStalledMessage(''); setChatInput('')
       setChatMessages((items) => [...items, { role: 'user', content: text }])
+      // 闲聊回复 — 直接显示
+      if (result.action === 'chat_reply') {
+        setChatMessages((items) => [...items, { role: 'assistant', content: result.reply as string }])
+        setMessage('')
+        return
+      }
+      if (result.action === 'clarify') {
+        setMessage(result.message as string)
+        return
+      }
+      // 生成任务 — 走标准 SSE 流
+      const started = result as { generation_id: string; workflow_id: string }
       followGeneration(started, '工作流已通过验收并自动采用最佳方案')
     } catch (error) {
       const detail = error instanceof Error ? error.message : '无法继续修复'
@@ -514,7 +649,7 @@ function StudioCanvas() {
         const stable = latest.spec.workflows.find((item) => item.id === workflowId)
         setSpec(latest.spec); setEtag(latest.etag)
         if (stable) {
-          const view = toCanvas(stable)
+          const view = toCanvas(stable, nodeCatalog)
           setNodes(view.nodes); setEdges(view.edges)
           setTimeout(() => fitView({ padding: 0.22 }), 40)
         }
@@ -619,7 +754,7 @@ function StudioCanvas() {
     </aside>
 
     <main className="canvas-area" onDrop={onDrop} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }}>
-      <ReactFlow nodes={nodes} edges={edges} edgeTypes={edgeTypes} nodesDraggable={!stalledGenerationId} nodesConnectable={!stalledGenerationId} elementsSelectable={!stalledGenerationId} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onNodesDelete={onNodesDelete} onEdgesDelete={onEdgesDelete} onSelectionChange={onSelectionChange} onConnect={onConnect} onNodeClick={(_, node) => { if (!stalledGenerationId) { setSelected(node.id); setSelectedEdge(null); setRightTab('node') } }} onEdgeClick={(_, edge) => { if (!stalledGenerationId) { setSelectedEdge(edge.id); setSelected(null); setRightTab('edge') } }} onPaneClick={() => { setSelected(null); setSelectedEdge(null) }} selectionOnDrag selectionMode={SelectionMode.Partial} panOnDrag={[1, 2]} deleteKeyCode={stalledGenerationId ? null : ['Backspace', 'Delete']} fitView>
+      <ReactFlow nodes={nodes} edges={edges} edgeTypes={edgeTypes} nodeTypes={nodeTypes} nodesDraggable={!stalledGenerationId} nodesConnectable={!stalledGenerationId} elementsSelectable={!stalledGenerationId} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onNodesDelete={onNodesDelete} onEdgesDelete={onEdgesDelete} onSelectionChange={onSelectionChange} onConnect={onConnect} onNodeClick={(_, node) => { if (!stalledGenerationId) { setSelected(node.id); setSelectedEdge(null); setRightTab('node') } }} onEdgeClick={(_, edge) => { if (!stalledGenerationId) { setSelectedEdge(edge.id); setSelected(null); setRightTab('edge') } }} onPaneClick={() => { setSelected(null); setSelectedEdge(null) }} selectionOnDrag selectionMode={SelectionMode.Partial} panOnDrag={[1, 2]} deleteKeyCode={stalledGenerationId ? null : ['Backspace', 'Delete']} fitView>
         <Background color="#3f3f3f" gap={22} size={1}/><Controls/><MiniMap pannable zoomable nodeColor="#bdbdbd" maskColor="#090909b8"/>
         <Panel position="top-left" className="canvas-hint liquid-glass">拖拽节点并连接端点 · 空白处框选 · Delete 删除 · 中/右键平移</Panel>
         {selectionCount > 0 && <Panel position="top-center" className="selection-toolbar liquid-glass nodrag nopan"><span>已选 {selectedNodeCount} 个节点{selectedEdgeCount > 0 ? `、${selectedEdgeCount} 条连线` : ''}</span><button type="button" onClick={deleteSelection} aria-label="删除选中元素">删除所选</button></Panel>}
@@ -657,7 +792,21 @@ function StudioCanvas() {
         <div className="panel-title"><strong>Harness 工作流</strong><span>{run ? `运行 ${run.id.slice(0, 8)} · ${run.status}` : '输入任务后开始执行'}</span></div>
         <label>工作流输入<textarea value={runInput} onChange={(event) => setRunInput(event.target.value)} disabled={!!run && ['queued', 'running'].includes(run.status)} placeholder="输入要交给工作流处理的任务…"/></label>
         {!run || !['queued', 'running'].includes(run.status) ? <button className="run-wide" onClick={executeWorkflow}>▶ 开始运行</button> : <button className="stop-wide" onClick={stopRun}>■ 取消运行</button>}
-        {run && <div className="run-summary"><strong>{run.status}</strong>{run.error && <p>{run.error}</p>}{Object.entries(run.node_states).map(([id, state]) => <div className={`node-run ${state.status}`} key={id} onClick={() => { setSelected(id); setSelectedEdge(null); setRightTab('node') }}><span>{nodes.find((node) => node.id === id)?.data.label || id}</span><em>{runtimeStatusLabels[state.status] || state.status}</em>{state.status === 'waiting' && <span className="approval-actions"><button onClick={(event) => { event.stopPropagation(); void decide(id, true) }}>通过</button><button onClick={(event) => { event.stopPropagation(); void decide(id, false) }}>拒绝</button></span>}</div>)}</div>}
+        {run && <div className="run-summary"><strong>{run.status}</strong>{run.error && <p>{run.error}</p>}{Object.entries(run.node_states).map(([id, state]) => {
+          const label = nodes.find((node) => node.id === id)?.data.label || id
+          const output = state.status === 'completed' ? displayNodeOutput(state.output) : null
+          const error = state.error ? String(state.error) : null
+          const duration = formatRuntimeDuration(state)
+          return <div className={`node-run ${state.status}`} key={id}>
+            <div className="node-run-head" onClick={() => { setSelected(id); setSelectedEdge(null); setRightTab('node') }}>
+              <span className="node-run-label">{label}</span>
+              <em>{runtimeStatusLabels[state.status] || state.status}{duration ? ` · ${duration}` : ''}</em>
+              {state.status === 'waiting' && <span className="approval-actions"><button onClick={(event) => { event.stopPropagation(); void decide(id, true) }}>通过</button><button onClick={(event) => { event.stopPropagation(); void decide(id, false) }}>拒绝</button></span>}
+            </div>
+            {error && <pre className="node-run-output error">{truncateText(error)}</pre>}
+            {output && <pre className="node-run-output">{truncateText(output)}</pre>}
+          </div>
+        })}</div>}
         <div className="run-events">{runEvents.map((item, index) => <code key={index}>{item}</code>)}</div>
       </div> : rightTab === 'edge' ? <>
         <div className="panel-title"><strong>连线设置</strong><span>控制条件分支</span></div>
@@ -669,11 +818,11 @@ function StudioCanvas() {
           <button className="danger" onClick={() => { setEdges((items) => items.filter((edge) => edge.id !== currentEdge.id)); setSelectedEdge(null) }}>删除连线</button>
         </div> : <div className="empty-state"><span>◇</span><p>点击画布中的连线<br/>配置分支条件</p></div>}
       </> : <>
-        <div className="panel-title"><strong>节点设置</strong><span>{selectedNode ? nodeLabel(selectedNode.data.kind) : '请选择一个节点'}</span></div>
+        <div className="panel-title"><strong>节点设置</strong><span>{selectedNode ? nodeLabel(selectedNode.data.kind, nodeCatalog) : '请选择一个节点'}</span></div>
         {selectedNode ? <div className="form-stack">
           {selectedNodeRun && <div className={`node-runtime-card ${selectedNodeRun.status}`}><strong>本次运行：{runtimeStatusLabels[selectedNodeRun.status] || selectedNodeRun.status}</strong>{formatRuntimeDuration(selectedNodeRun) && <small>耗时 {formatRuntimeDuration(selectedNodeRun)}</small>}{selectedNodeRun.warning && <pre>{selectedNodeRun.warning}</pre>}{selectedNodeRun.error && <pre>{selectedNodeRun.error}</pre>}{selectedNodeRun.input !== undefined && <details><summary>输入</summary><pre>{JSON.stringify(selectedNodeRun.input, null, 2)}</pre></details>}{selectedNodeRun.output !== undefined && <details><summary>输出</summary><pre>{JSON.stringify(selectedNodeRun.output, null, 2)}</pre></details>}</div>}
           <label>节点名称<input value={selectedNode.data.description} onChange={(event) => updateSelected('description', event.target.value)}/></label>
-          <label>节点类型<input value={nodeLabel(selectedNode.data.kind)} disabled/></label>
+          <label>节点类型<input value={nodeLabel(selectedNode.data.kind, nodeCatalog)} disabled/></label>
           {harnessNodeKinds.includes(selectedNode.data.kind) && <label>Harness 智能体<select value={selectedNode.data.agent_id || ''} onChange={(event) => updateSelected('agent_id', event.target.value)}><option value="">{selectedNode.data.kind === 'validator' ? '复用上一步 Harness 验证' : '请选择'}</option>{spec?.harness.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>}
           {harnessNodeKinds.includes(selectedNode.data.kind) && <><label>任务标题<input value={String(selectedNode.data.title || '')} onChange={(event) => updateSelected('title', event.target.value)} placeholder="用于 Harness 任务列表"/></label><label>任务提示词<textarea value={String(selectedNode.data.prompt || '')} onChange={(event) => updateSelected('prompt', event.target.value)} placeholder="写明角色、目标、输入、约束和输出；支持 {{input}}、{{latest}}"/></label></>}
           {harnessNodeKinds.includes(selectedNode.data.kind) && selectedHarness && <label>相对工作目录<input value={String(selectedNode.data.relative_path || '.')} onChange={(event) => updateSelected('relative_path', event.target.value)} placeholder="."/></label>}
@@ -700,7 +849,31 @@ function StudioCanvas() {
       </>}
     </aside>
 
-    <footer className="console"><span className="status-dot"/><strong>运行控制台</strong><span>{message}</span><span className="console-meta">{nodes.length} 个节点 · {edges.length} 条连线</span>{runtimeStatus && !runtimeStatus.running && <span className="runtime-warning">Harness 未就绪：需要注册/setup/修正配置</span>}</footer>
+    <footer className={`console ${consoleOpen ? 'open' : ''}`} onClick={() => setConsoleOpen((open) => !open)}>
+      <span className={`console-caret ${consoleOpen ? 'open' : ''}`} aria-hidden="true">▴</span>
+      <span className={`status-dot ${generationId ? 'busy' : ''}`}/>
+      <strong>运行控制台</strong>
+      <span className="console-message">{message}</span>
+      <span className="console-meta">{nodes.length} 节点 · {edges.length} 连线 · {modelStatus.model || generatorModel}{modelStatus.activeCall ? ` · ${modelStatus.activeCall}` : ''}</span>
+      {runtimeStatus && !runtimeStatus.running && <span className="runtime-warning">Harness 未就绪：需要注册/setup/修正配置</span>}
+    </footer>
+    {consoleOpen && <div className="console-drawer structural-glass" onClick={(event) => event.stopPropagation()}>
+      <div className="console-drawer-head">
+        <div className="console-model-state">
+          <strong>模型状态</strong>
+          <span className="model-chip">{modelStatus.model || generatorModel || '未连接'}</span>
+          {modelStatus.activeCall
+            ? <span className="model-active"><i/>调用中 · {modelStatus.activeCall}{modelStatus.outputChars > 0 ? ` · 已输出 ${modelStatus.outputChars} 字` : ''}</span>
+            : <span className="model-idle">空闲</span>}
+          {generationId && <span className="model-thinking">生成进行中…</span>}
+        </div>
+        <button className="console-clear" onClick={() => setGenerationLog([])}>清空</button>
+      </div>
+      <div className="console-drawer-log">
+        {generationLog.length === 0 && <div className="console-empty">暂无日志。启动一次 AI 创建或优化后，这里会实时显示模型调用过程与输出。</div>}
+        {generationLog.map((item, index) => <div key={index} className={`console-log-line ${item.kind}`}><span className="console-log-time">{item.time}</span><span className="console-log-kind">{item.kind}</span><span className="console-log-text">{item.text}</span></div>)}
+      </div>
+    </div>}
   </div>
 }
 

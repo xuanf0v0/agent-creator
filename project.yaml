@@ -42,6 +42,28 @@ harness:
     runtime.example/capability: text-generation
     runtime.example/sandbox: read-only
   protocol: stdin_json
+- id: repository-analysis
+  name: OpenCode 只读仓库分析
+  description: 读取、列出和搜索仓库；禁止运行命令和修改文件
+  backend_id: default
+  agent_id: repository-analysis
+  labels:
+    runtime.example/implementation: openagent-harness-opencode
+    runtime.example/model: deepseek/deepseek-v4-flash
+    runtime.example/capability: repository-analysis
+    runtime.example/sandbox: read-only
+  protocol: stdin_json
+- id: test-runner
+  name: OpenCode 只读测试执行
+  description: 仅运行仓库测试命令；禁止修改项目文件
+  backend_id: default
+  agent_id: test-runner
+  labels:
+    runtime.example/implementation: openagent-harness-opencode
+    runtime.example/model: deepseek/deepseek-v4-flash
+    runtime.example/capability: test-execution
+    runtime.example/sandbox: read-only
+  protocol: stdin_json
 workflows:
 - id: product-selection
   name: 空白工作流
@@ -49,6 +71,117 @@ workflows:
   edges: []
   evaluation:
     cases: []
+- id: n8n-fetch
+  name: n8n 连接器调用示例
+  nodes:
+  - id: trigger
+    type: manual_trigger
+    data: {}
+    position:
+      x: 80.0
+      y: 80.0
+  - id: fetch
+    type: http_request
+    data:
+      url: http://127.0.0.1:5678/webhook/studio-fetch-sheet
+      method: POST
+      headers:
+        Content-Type: application/json
+      body:
+        query: '{{input.query}}'
+        metadata:
+          enabled: '{{input.enabled}}'
+        items:
+        - '{{input.items}}'
+      allow_private: true
+      timeout_seconds: 60
+      fail_on_error: true
+    position:
+      x: 360.0
+      y: 80.0
+  - id: result
+    type: output
+    data: {}
+    position:
+      x: 640.0
+      y: 80.0
+  edges:
+  - source: trigger
+    target: fetch
+  - source: fetch
+    target: result
+  evaluation:
+    cases:
+    - id: ok-response
+      name: n8n 返回正常数据
+      enabled: true
+      input:
+        query: test-query
+        enabled: true
+        items:
+        - 1
+        - 2
+      assertions:
+      - path: status
+        operator: equals
+        expected: 200
+      - path: body
+        operator: exists
+      - path: body.ok
+        operator: equals
+        expected: true
+      - path: body.query
+        operator: equals
+        expected: test-query
+      - path: body.source
+        operator: equals
+        expected: n8n
+      semantic_criteria: []
+      approvals: {}
+      mocks: []
+      timeout_seconds: 90
+- id: n8n-callback
+  name: n8n 回调入站示例
+  nodes:
+  - id: callback
+    type: webhook
+    data:
+      path: /hooks/n8n-callback
+    position:
+      x: 80.0
+      y: 80.0
+  - id: result
+    type: output
+    data: {}
+    position:
+      x: 360.0
+      y: 80.0
+  edges:
+  - source: callback
+    target: result
+  evaluation:
+    cases:
+    - id: callback-payload
+      name: n8n 回调负载
+      enabled: true
+      input:
+        trigger: webhook
+        body:
+          source: n8n
+          message: callback-test
+          received:
+            value: 42
+      assertions:
+      - path: body.source
+        operator: equals
+        expected: n8n
+      - path: body.received.value
+        operator: equals
+        expected: 42
+      semantic_criteria: []
+      approvals: {}
+      mocks: []
+      timeout_seconds: 90
 integrations:
   feishu:
   - id: main

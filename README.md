@@ -75,10 +75,17 @@ Studio 不读取 `AGENT_HARNESS_MANAGEMENT_TOKEN`。管理 Token 只应存在于
 .\scripts\start-all.ps1
 ```
 
-`start-all.ps1` 是 Windows 一键入口：检查并按固定提交安装/升级独立 Harness，必要时只停止
-确认属于 `HarnessRoot` 的旧 8765 监听进程，然后启动 Harness、注册并 setup coding Agent，最后
-在 8787 启动 Studio。React 生产前端由 Studio 直接托管，无需单独启动 Vite。重复执行时，版本
-未变化便不会重新安装。需要强制重装时使用 `.\scripts\start-all.ps1 -ForceInstall`。
+`start-all.ps1` 是 Windows 一键入口：检查并按固定提交安装/升级独立 Harness，启动 Harness、
+Studio、Vite 开发前端和 n8n，并等待四项健康检查通过。默认地址分别是
+`http://127.0.0.1:8765`、`http://127.0.0.1:8787`、`http://127.0.0.1:5173` 和
+`http://127.0.0.1:5678`。重复运行只停止能确认属于当前仓库或当前 Compose 项目的旧进程/容器；
+未知端口占用会显示 PID 和命令行后中止。n8n 重建不会删除 `n8n_data` 卷、凭证或工作流。
+需要强制重装 Harness 时使用 `.\scripts\start-all.ps1 -ForceInstall`。
+
+n8n 需要在项目 `.env` 中配置稳定的 `N8N_ENCRYPTION_KEY`。Studio 调用 n8n 使用
+`127.0.0.1:5678`；n8n 容器回调宿主 Studio 必须使用 `host.docker.internal:8787`。
+版本化示例位于 `n8n/workflows/`，总启动脚本会导入并发布 `studio-fetch-sheet` 和
+`studio-callback-test`。脚本不导入第三方凭证，也不会删除 Docker 卷。
 
 macOS 可使用同等的一键编排入口：
 
@@ -96,14 +103,14 @@ Token。`start-studio.ps1` 会把任务 Token 注入 Studio 进程。OpenCode �
 OpenCode 生成器使用本机 `opencode run --format json`。可通过
 `OPENCODE_BIN` 指定程序，使用 `OPENCODE_GENERATOR_MODEL` 指定生成模型；未设置时
 使用项目中的首个模型；如果两者都没有配置，生成请求会直接失败，不会降级到替身模型。
-Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整路径。
+Windows 下会自动解开 npm 的 `opencode.cmd` shim 并直接调用真实 `opencode.exe`，避免 Harness 任务 prompt 在 cmd 转发时丢失。
 当前项目的生成对话和 Harness 代码任务都明确使用 `deepseek/deepseek-v4-flash`。前者负责理解需求和
 生成工作流，后者通过独立的 `openagent-harness-opencode` 适配器执行实际 Agent 任务。
 页面首次打开会显示 OpenCode 创作对话框；关闭后可通过顶部“OpenCode 创建”按钮或
 右侧“AI 创建”页签重新打开。创作助手支持连续对话：询问概念、当前画布、节点作用、设计建议或错误原因时会直接由真实 OpenCode 回答，不修改画布；需求不完整时会先追问，只有明确要求创建、增加、删除、连接、调整或优化工作流时才进入修改流程。
 
 进入创建或修改流程后，生成器会逐层增量构建：一次只提出一个节点或一条变更。输入、模板、变量、转换、合并和输出节点先做静态校验；AI、工具、HTTP、审批、条件、循环、子工作流和条件连线变更还会沿正式 `WorkflowManager → agent-harness-sdk → /api/v1` 路径真实探测当前层。通过后才接受该层并继续下一个节点或分支。收到 `complete` 后生成并锁定验收用例，执行完整工作流验收；完整验收失败时先复验上轮失败用例，通过后再执行一次全量回归。
-同一稳定图上连续两次出现同一节点、同类错误或无语义变化时，生成器会发送 `generation.stalled` 并暂停；新增/删除回到历史图状态时立即暂停。页面以只读方式保留最后通过的内存草稿，可补充要求后通过 `POST /api/generator/generations/{id}/resume` 继续修复。暂停草稿不会写入 `project.yaml`；Studio 重启后草稿失效，页面会明确恢复磁盘中的原工作流。Harness 基础设施、模型超时和不可恢复错误仍直接失败。
+同一稳定图上连续两次出现同一节点、同类错误或无语义变化时，生成器会发送 `generation.stalled` 并暂停；新增/删除回到历史图状态时立即暂停。失败修复调用若只启动协议但没有返回文本、reasoning、工具或诊断，会在 60 秒终止后使用同一模型自动重试一次；第二次仍超时则发送 `generation.stalled`，并保留两次调用证据。页面以只读方式保留最后通过的内存草稿，可补充要求后通过 `POST /api/generator/generations/{id}/resume` 继续修复。暂停草稿不会写入 `project.yaml`；Studio 重启后草稿失效，页面会明确恢复磁盘中的原工作流。普通规划超时、首次即产生模型活动的非静默超时、Harness 基础设施和不可恢复错误仍直接失败。
 验收运行不写入普通运行历史。
 
 生成器通过标准输入以 UTF-8 传递提示词，不依赖 Windows 命令行长度或模型不可见的文件附件。超过
@@ -117,8 +124,7 @@ Windows 下会自动把 `opencode` 解析为 npm 安装的 `opencode.cmd` 完整
 决策；其他节点不使用 Mock。增量层探测默认最多等待 `OPENAGENT_INCREMENTAL_PROBE_TIMEOUT=120` 秒；
 `OPENAGENT_INCREMENTAL_MAX_ITERATIONS` 可设置创建或修改的最大总迭代次数，默认 100，范围 1–10000。
 OpenCode 首次规划调用默认最多等待 120 秒（`OPENCODE_GENERATOR_CALL_TIMEOUT`，范围 30–1800）；
-修复候选默认最多等待 60 秒（`OPENCODE_REPAIR_CALL_TIMEOUT`，范围 30–600），修复超时不会重复请求，
-以免多个候选串行等待造成无意义的长时间阻塞。
+修复候选默认最多等待 60 秒（`OPENCODE_REPAIR_CALL_TIMEOUT`，范围 30–600）；只有无文本、reasoning、工具和诊断的静默超时会自动重试一次，第二次仍失败则暂停并保留草稿。
 每次 OpenCode 调用还会把用途、进程号、退出码、耗时、超时、诊断摘要和响应尾部写入
 `.openagent-logs/opencode.jsonl`；日志已过滤常见 Bearer/API key/token 字段，不记录完整提示词。
 可通过 `OPENAGENT_OPENCODE_LOG` 指定其他日志文件路径。日志写入失败不会改变生成任务的真实结果。
@@ -145,7 +151,8 @@ Windows 下可在另一个 PowerShell 中运行 `.\scripts\tail-opencode-log.ps1
   `knowledge_retrieval` 支持查询模板、内置文档和 Top-K 召回；
 - 数据处理：`prompt`、`variable_set`、`transform`、`merge`，支持 JSON 解析/序列化、
   路径提取、字段筛选、数组扁平化以及 array/object/concat 合并；
-- 集成：`http_request` 支持方法、请求头、模板化请求体、超时和状态码策略，默认禁止
+- 集成：`http_request` 支持方法、请求头、模板化请求体、超时和状态码策略；结构化请求体中任意
+  嵌套字典或列表里的字符串都支持模板表达式，数字、布尔值和 null 保持原类型。默认禁止
   非 HTTPS 及私网/回环/保留地址，降低 SSRF 风险；
 - 流程控制：`condition`、`switch`、`parallel`、`iteration`、`loop`、`delay`；图本身
   保持无环，迭代/循环限制为 1–100 次，等待限制为 300 秒；
@@ -165,8 +172,9 @@ Agent 节点会使用 `openagent-{run_id}-{node_id}` 作为 Harness 幂等键。
 也不会在任务失败后擅自执行 setup。
 
 Harness 新版沙箱默认拒绝网络。OpenCode 需要访问 DeepSeek API，因此注册脚本在 Harness-owned
-`coding` manifest 中把 task 网络设为 `allow`，并在工具策略中声明 `network`；其他 Agent 若不需要
-联网，应继续保持默认 `deny`。这些运行时字段不会写回 Studio 的 `project.yaml`。
+三个 OpenCode manifest 都需访问 DeepSeek API，因此 task 网络设为 `allow`。`coding` 只做无工具文本推理；
+`repository-analysis` 只允许读取、列出和搜索工作区；`test-runner` 只允许运行已声明的测试命令，工作区保持只读，缓存写入临时目录。
+adapter 若只得到“Ready/Task?”等启动提示会返回 `protocol_output_invalid`，不会把未执行任务伪装成成功节点。
 
 ## 飞书与 QQ 机器人
 

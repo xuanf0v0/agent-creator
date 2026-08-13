@@ -2,7 +2,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from openagent_studio.app import create_app
-from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _EmptyCompactionError, _apply_creation_step, _apply_incremental_step, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _creation_step_errors, _explicit_delete_request, _incremental_max_iterations, _incremental_probe_timeout_seconds, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _repair_timeout_seconds, _step_requires_runtime_probe, _with_file_prompt
+from openagent_studio.generator import Generation, GeneratorManager, SYSTEM_PROMPT, _CompactionTimeoutError, _EmptyCompactionError, _OpenCodeTimeoutError, _apply_creation_step, _apply_incremental_step, _command_exceeds_limit, _compact_prompt_length, _compaction_timeout_seconds, _creation_step_errors, _explicit_delete_request, _incremental_max_iterations, _incremental_probe_timeout_seconds, _incremental_probe_workflow, _invoke_timeout_seconds, _is_command_line_too_long, _normalize_evaluation_result, _normalize_workflow_result, _parse_result, _repair_timeout_seconds, _step_requires_runtime_probe, _with_file_prompt
 from openagent_studio.store import SpecStore
 from openagent_studio.models import EvaluationAssertion, ProjectSpec, QQIntegrationSpec, WorkflowEvaluation, WorkflowNode, WorkflowSpec
 from openagent_studio.workflow_runner import EvaluationPolicy, WorkflowManager, validate_executable_workflow
@@ -396,6 +396,194 @@ def test_generator_opencode_log_records_activity_metrics(monkeypatch, tmp_path: 
     assert record["idle_at_exit_ms"] == 45000
 
 
+def _timeout_error(call_id: str, *, silent: bool = True) -> _OpenCodeTimeoutError:
+    activity = {
+        "output_chars": 0 if silent else 12,
+        "diagnostics": [],
+        "protocol_events": 1 if silent else 2,
+        "event_counts": {"step_start": 1} if silent else {"step_start": 1, "text": 1},
+        "tool_counts": {},
+        "reasoning_chars": 0,
+        "text_events": 0 if silent else 1,
+        "tool_events": 0,
+        "last_event_type": "step_start" if silent else "text",
+        "last_tool": None,
+        "last_activity_ms": 4800,
+        "idle_at_exit_ms": 55200,
+    }
+    return _OpenCodeTimeoutError(
+        f"OpenCode 单次调用超时（60 秒）：{call_id}",
+        call_id=call_id,
+        purpose="增量构建第 2 层（迭代 3）",
+        timeout_seconds=60,
+        activity=activity,
+    )
+
+
+def test_repair_silent_timeout_retries_same_prompt_once(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="timeout-retry", workflow_id="flow", base_etag="etag", draft={}, prompt="x")
+    calls = []
+
+    def fake_invoke(*args, **kwargs):
+        calls.append((args[4], kwargs))
+        if len(calls) == 1:
+            raise _timeout_error("call-1")
+        return '<result>{"action":"complete"}</result>'
+
+    manager._invoke = fake_invoke
+    result = manager._invoke_result(
+        generation, None, [], tmp_path, "同一修复提示", "增量修复",
+        timeout_seconds=60, retry_silent_timeout=True, retry_node_id="worker",
+    )
+
+    assert result == {"action": "complete"}
+    assert [item[0] for item in calls] == ["同一修复提示", "同一修复提示"]
+    assert calls[1][1]["call_attempt"] == 2
+    assert calls[1][1]["previous_call_id"] == "call-1"
+    retry = next(item for item in generation.events if item["event"] == "generation.repairing")
+    assert retry["data"]["phase"] == "model_timeout"
+    assert retry["data"]["attempt"] == 2
+
+
+def test_retry_call_logs_attempt_and_previous_call_id(monkeypatch, tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(
+        id="retry-log", workflow_id="flow", base_etag="etag", draft={},
+        prompt="x", model="provider/model",
+    )
+    records = []
+
+    class FakeStdin:
+        def write(self, _value):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        pid = 1234
+        stdin = FakeStdin()
+        stdout = []
+
+        def wait(self):
+            return 0
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr("openagent_studio.generator.subprocess.Popen", lambda *_args, **_kwargs: FakeProcess())
+    manager._write_opencode_log = lambda _generation, data: records.append(data)
+
+    assert manager._invoke(
+        generation, ProjectSpec(name="测试"), ["opencode", "run"], tmp_path, "提示",
+        timeout_seconds=60, purpose="修复重试", call_attempt=2, previous_call_id="call-1",
+    ) == ""
+
+    assert [record["status"] for record in records] == ["started", "completed"]
+    assert all(record["attempt"] == 2 for record in records)
+    assert all(record["previous_call_id"] == "call-1" for record in records)
+
+
+def test_two_repair_timeouts_stall_and_preserve_store(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "超时暂停", "project_dir": str(tmp_path),
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [
+            {"id": "done", "type": "output", "data": {"template": "旧结果"}},
+        ]}],
+    })
+    store.save(project)
+    original_etag = store.etag()
+    manager = GeneratorManager(store)
+    generation = Generation(
+        id="timeout-stall", workflow_id="flow", base_etag=original_etag,
+        draft=project.workflows[0].model_dump(mode="json"), prompt="修复输出", model="provider/model",
+        initial_failures=[{"phase": "full_evaluation", "node_id": "done", "message": "结果错误"}],
+    )
+    calls = 0
+
+    def fake_invoke(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise _timeout_error(f"call-{calls}")
+
+    manager._invoke = fake_invoke
+    manager._run(generation, project)
+
+    assert calls == 2
+    assert generation.events[-1]["event"] == "generation.stalled"
+    stalled = generation.events[-1]["data"]
+    assert stalled["reason"] == "model_timeout"
+    assert stalled["attempts"] == 2
+    assert stalled["node_id"] == "done"
+    assert stalled["last_failure"]["call_ids"] == ["call-1", "call-2"]
+    assert stalled["last_failure"]["timeout_seconds"] == 60
+    assert store.etag() == original_etag
+    assert store.load().workflows[0].nodes[0].data["template"] == "旧结果"
+
+
+def test_second_active_repair_timeout_still_stalls_with_activity(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "活动超时", "project_dir": str(tmp_path),
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [
+            {"id": "done", "type": "output", "data": {}},
+        ]}],
+    })
+    store.save(project)
+    manager = GeneratorManager(store)
+    generation = Generation(
+        id="active-timeout-stall", workflow_id="flow", base_etag=store.etag(),
+        draft=project.workflows[0].model_dump(mode="json"), prompt="修复输出", model="provider/model",
+        initial_failures=[{"phase": "full_evaluation", "node_id": "done"}],
+    )
+    calls = 0
+
+    def fake_invoke(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise _timeout_error(f"call-{calls}", silent=calls == 1)
+
+    manager._invoke = fake_invoke
+    manager._run(generation, project)
+
+    stalled = generation.events[-1]["data"]
+    assert generation.events[-1]["event"] == "generation.stalled"
+    assert stalled["last_failure"]["timeout_attempts"][0]["silent"] is True
+    assert stalled["last_failure"]["timeout_attempts"][1]["silent"] is False
+    assert stalled["last_failure"]["last_activity"]["output_chars"] == 12
+
+
+def test_planning_silent_timeout_does_not_retry(tmp_path: Path):
+    store = SpecStore(tmp_path / "project.yaml")
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "规划超时", "project_dir": str(tmp_path),
+        "workflows": [{"id": "flow", "name": "流程", "nodes": [
+            {"id": "done", "type": "output", "data": {}},
+        ]}],
+    })
+    store.save(project)
+    manager = GeneratorManager(store)
+    generation = Generation(
+        id="planning-timeout", workflow_id="flow", base_etag=store.etag(),
+        draft=project.workflows[0].model_dump(mode="json"), prompt="调整输出", model="provider/model",
+    )
+    calls = 0
+
+    def fake_invoke(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise _timeout_error("planning-call")
+
+    manager._invoke = fake_invoke
+    manager._run(generation, project)
+
+    assert calls == 1
+    assert generation.events[-1]["event"] == "generation.failed"
+    assert "planning-call" in generation.events[-1]["data"]["message"]
+
+
 def test_generator_normalizes_evaluation_collection_fields():
     normalized = _normalize_evaluation_result({"cases": [{
         "id": "normal", "name": "正常流程", "input": {},
@@ -739,6 +927,60 @@ def test_workflow_runner_calls_harness_task_and_waits_for_approval():
     assert run.outputs["output"]["approved"] is True
 
 
+def test_workflow_runner_rejected_approval_uses_false_branch_without_failing():
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "审批拒绝分支",
+        "workflows": [{"id": "flow", "name": "审批", "nodes": [
+            {"id": "input", "type": "manual_trigger", "data": {}},
+            {"id": "approval", "type": "approval", "data": {"description": "确认结果"}},
+            {"id": "tests", "type": "prompt", "data": {"template": "TESTS_RAN"}},
+            {"id": "approved-output", "type": "output", "data": {}},
+            {"id": "rejected-output", "type": "output", "data": {"template": "{{latest}}"}},
+        ], "edges": [
+            {"source": "input", "target": "approval"},
+            {"source": "approval", "target": "tests"},
+            {"source": "tests", "target": "approved-output"},
+            {"source": "approval", "target": "rejected-output", "condition": "false"},
+        ]}],
+    })
+    manager = WorkflowManager()
+    run = manager.start(project, "flow", {"input": "待审内容"})
+    _wait_for(lambda: run.node_states["approval"]["status"] == "waiting")
+    manager.approve(run.id, "approval", False, "需要修改")
+    _wait_for(lambda: run.status == "completed")
+    assert run.node_states["tests"]["status"] == "skipped"
+    rejected = json.loads(run.outputs["rejected-output"])
+    assert rejected["approved"] is False
+    assert rejected["comment"] == "需要修改"
+
+
+def test_workflow_runner_rejected_approval_reaches_downstream_condition():
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "审批后条件分支",
+        "workflows": [{"id": "flow", "name": "审批后条件分支", "nodes": [
+            {"id": "input", "type": "manual_trigger", "data": {}},
+            {"id": "approval", "type": "approval", "data": {"description": "确认结果"}},
+            {"id": "condition", "type": "condition", "data": {"expression": "latest.approved == true"}},
+            {"id": "approved-output", "type": "output", "data": {}},
+            {"id": "rejected-output", "type": "output", "data": {}},
+        ], "edges": [
+            {"source": "input", "target": "approval"},
+            {"source": "approval", "target": "condition"},
+            {"source": "condition", "target": "approved-output", "condition": "true"},
+            {"source": "condition", "target": "rejected-output", "condition": "false"},
+        ]}],
+    })
+    manager = WorkflowManager()
+    run = manager.start(project, "flow", {"input": "待审内容"})
+    _wait_for(lambda: run.node_states["approval"]["status"] == "waiting")
+    manager.approve(run.id, "approval", False, "证据不足")
+    _wait_for(lambda: run.status == "completed")
+    assert run.node_states["condition"]["status"] == "completed"
+    assert run.outputs["condition"] is False
+    assert run.node_states["approved-output"]["status"] == "skipped"
+    assert run.node_states["rejected-output"]["status"] == "completed"
+
+
 def test_workflow_runner_allows_intermediate_probe_without_output_node():
     project = ProjectSpec.model_validate({
         "version": "1", "name": "中间层探测",
@@ -1055,6 +1297,24 @@ def test_nested_subworkflows_do_not_starve_shared_executor():
     manager.stop_scheduler()
 
 
+def test_creation_step_rejects_template_braces_in_condition_expression():
+    previous = WorkflowSpec.model_validate({
+        "id": "flow", "name": "条件表达式", "nodes": [
+            {"id": "approval", "type": "approval", "data": {}},
+        ], "edges": [],
+    })
+    candidate = WorkflowSpec.model_validate({
+        "id": "flow", "name": "条件表达式", "nodes": [
+            {"id": "approval", "type": "approval", "data": {}},
+            {"id": "condition", "type": "condition", "data": {
+                "expression": "{{approval.approved}} == true",
+            }},
+        ], "edges": [{"source": "approval", "target": "condition"}],
+    })
+    errors = _creation_step_errors(previous, candidate, "add_node", "condition")
+    assert any("不支持模板大括号" in error for error in errors)
+
+
 def test_http_node_rejects_private_address_before_request():
     try:
         WorkflowManager._validate_http_url("https://127.0.0.1/admin", allow_private=False)
@@ -1100,6 +1360,64 @@ def test_http_node_streaming_response_limit():
     manager._validate_http_url = lambda *_args: None
     with pytest.raises(RuntimeError, match="超过 6 字节限制"):
         manager._http_request(workflow_run, node, "")
+    manager.stop_scheduler()
+
+
+def test_http_node_renders_nested_structured_body_and_preserves_types():
+    class ResponseContext:
+        def __enter__(self):
+            self.response = httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=b'{"ok":true}',
+                request=httpx.Request("POST", "https://example.com/data"),
+            )
+            return self.response
+
+        def __exit__(self, *_exc):
+            self.response.close()
+
+    class CapturingClient:
+        def __init__(self):
+            self.kwargs = None
+
+        def stream(self, *_args, **kwargs):
+            self.kwargs = kwargs
+            return ResponseContext()
+
+        def close(self):
+            pass
+
+    manager = WorkflowManager()
+    client = CapturingClient()
+    manager._http_client.close()
+    manager._http_client = client
+    workflow_run = type("Run", (), {
+        "input": {"query": "test-query", "enabled": True},
+        "outputs": {},
+    })()
+    node = WorkflowNode(id="http", type="http_request", data={
+        "url": "https://example.com/data",
+        "method": "POST",
+        "body": {
+            "query": "{{input.query}}",
+            "enabled": "{{input.enabled}}",
+            "count": 3,
+            "items": ["prefix-{{input.query}}", "{{input}}", False, None],
+        },
+    })
+    manager._validate_http_url = lambda *_args: None
+
+    manager._http_request(workflow_run, node, workflow_run.input)
+
+    assert client.kwargs["json"] == {
+        "query": "test-query",
+        "enabled": True,
+        "count": 3,
+        "items": ["prefix-test-query", {"query": "test-query", "enabled": True}, False, None],
+    }
+    assert client.kwargs["content"] is None
+    assert node.data["body"]["query"] == "{{input.query}}"
     manager.stop_scheduler()
 
 
@@ -1390,6 +1708,28 @@ def test_creation_runtime_probe_uses_unsaved_draft(tmp_path: Path, monkeypatch: 
     ) == []
 
 
+def test_incremental_probe_workflow_does_not_repeat_agent_before_approval():
+    workflow = WorkflowSpec.model_validate({
+        "id": "flow", "name": "分层探测", "nodes": [
+            {"id": "input", "type": "manual_trigger", "data": {}},
+            {"id": "analysis", "type": "agent", "data": {"agent_id": "repository-analysis", "prompt": "分析"}},
+            {"id": "approval", "type": "approval", "data": {}},
+            {"id": "condition", "type": "condition", "data": {"expression": "latest.approved == true"}},
+            {"id": "tests", "type": "agent", "data": {"agent_id": "test-runner", "prompt": "测试"}},
+        ], "edges": [
+            {"source": "input", "target": "analysis"},
+            {"source": "analysis", "target": "approval"},
+            {"source": "approval", "target": "condition"},
+            {"source": "condition", "target": "tests", "condition": "true"},
+        ],
+    })
+    probe = _incremental_probe_workflow(workflow, "tests")
+    assert [node.id for node in probe.nodes] == ["approval", "condition", "tests"]
+    assert [(edge.source, edge.target) for edge in probe.edges] == [
+        ("approval", "condition"), ("condition", "tests"),
+    ]
+
+
 def test_incremental_delete_batches_nodes_and_removes_incident_edges():
     workflow = WorkflowSpec.model_validate({
         "id": "flow", "name": "批量删除", "nodes": [
@@ -1460,7 +1800,7 @@ def test_generator_builds_one_node_per_layer_and_saves_after_full_verification(t
     manager._probe_incremental_workflow = lambda *_args: []
     manager._run(generation, project)
     assert len(planning_prompts) == 3
-    assert all("一次只处理一个节点" in prompt for prompt in planning_prompts)
+    assert all("一次新增一个节点" in prompt for prompt in planning_prompts)
     assert len([item for item in generation.events if item["event"] == "generation.layer_completed"]) == 2
     previews = [item for item in generation.events if item["event"] == "workflow.preview"]
     updates = [item for item in generation.events if item["event"] == "workflow.updated"]
@@ -2066,7 +2406,9 @@ def test_qq_reply_uses_platform_specific_paths(monkeypatch):
 def test_route_isolation_create_entry_and_existing_message_route(tmp_path: Path):
     app = create_app(tmp_path / "project.yaml")
     client = TestClient(app)
-    paths = {route.path for route in app.routes}
+    # FastAPI 0.141+ 的 include_router 会在 app.routes 里放入 _IncludedRouter 包装对象，
+    # 它没有 .path 属性；只收集实际注册的路由。
+    paths = {route.path for route in app.routes if hasattr(route, "path")}
     assert "/api/generator/workflows" in paths
     assert "/api/generator/workflows/{workflow_id}/messages" in paths
     assert "/api/generator/generations/{generation_id}/resume" in paths

@@ -63,6 +63,69 @@
         "edit": false,
         "write": false
       }
+    },
+    "openagent-runtime-analysis": {
+      "description": "OpenAgent Harness 的只读仓库分析器",
+      "mode": "primary",
+      "model": "deepseek/deepseek-v4-flash",
+      "steps": 40,
+      "prompt": "你是 OpenAgent Harness 的只读仓库分析器。必须执行用户给出的具体分析任务；允许读取、列出和搜索当前工作区，禁止修改文件、运行命令、调用网络或子 Agent。输出必须说明实际检查的文件和证据。",
+      "permission": {
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "bash": "deny",
+        "edit": "deny",
+        "write": "deny",
+        "webfetch": "deny"
+      },
+      "tools": {
+        "bash": false,
+        "read": true,
+        "grep": true,
+        "glob": true,
+        "list": true,
+        "task": false,
+        "todowrite": false,
+        "question": false,
+        "webfetch": false,
+        "websearch": false,
+        "lsp": false,
+        "skill": false,
+        "edit": false,
+        "write": false
+      }
+    },
+    "openagent-runtime-tests": {
+      "description": "OpenAgent Harness 的只读测试执行器",
+      "mode": "primary",
+      "model": "deepseek/deepseek-v4-flash",
+      "steps": 40,
+      "prompt": "你是 OpenAgent Harness 的只读测试执行器。只允许运行任务指定或仓库已声明的测试命令；禁止修改项目文件、安装依赖、执行格式化或修复命令。缓存和临时文件必须写入系统临时目录；测试要求写回项目时必须明确失败。输出真实命令、退出码和失败摘要。",
+      "permission": {
+        "bash": "allow",
+        "read": "deny",
+        "edit": "deny",
+        "write": "deny",
+        "webfetch": "deny"
+      },
+      "tools": {
+        "bash": true,
+        "read": false,
+        "grep": false,
+        "glob": false,
+        "list": false,
+        "task": false,
+        "todowrite": false,
+        "question": false,
+        "webfetch": false,
+        "websearch": false,
+        "lsp": false,
+        "skill": false,
+        "edit": false,
+        "write": false
+      }
     }
   }
 }

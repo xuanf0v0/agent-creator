@@ -14,6 +14,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from .compiler import compile_opencode
+from .creator import CreatorHarness
+from .creator.routes import router as creator_router
 from .harness_client import DEFAULT_BACKEND_ID, create_harness_client
 from .models import ProjectSpec, WorkflowSpec
 from .store import SpecStore
@@ -28,6 +30,7 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
     generator = GeneratorManager(store)
     workflows = WorkflowManager(os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"))
     platforms = PlatformIntegrationManager(workflows)
+    creator = CreatorHarness(store, general_harness_url=os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"), generator=generator)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -40,6 +43,8 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
     app.state.generator_manager = generator
     app.state.workflow_manager = workflows
     app.state.platform_integration_manager = platforms
+    app.state.creator_harness = creator
+    app.include_router(creator_router)
     static_dir = Path(__file__).parent / "static"
     assets_dir = static_dir / "assets"
     if assets_dir.is_dir():
@@ -55,6 +60,7 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
             etag = store.save(spec, if_match)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        creator.reload()
         return {"etag": etag, "spec": spec.model_dump(mode="json", exclude_none=True)}
 
     @app.post("/api/spec/validate")

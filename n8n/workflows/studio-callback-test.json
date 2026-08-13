@@ -1,0 +1,61 @@
+{
+  "id": "studioCallback1",
+  "name": "studio-callback-test",
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "nodes": [
+    {
+      "id": "callback-webhook",
+      "name": "Callback Test Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [220, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "studio-callback-test",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "studio-callback-test"
+    },
+    {
+      "id": "studio-callback",
+      "name": "Call Studio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8787/hooks/n8n-callback",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ source: 'n8n', message: $json.body.message || 'callback-test', received: $json.body }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "callback-response",
+      "name": "Return Callback Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [700, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, source: 'studio', runId: $json.id, status: $json.status } }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Callback Test Webhook": {
+      "main": [[{ "node": "Call Studio", "type": "main", "index": 0 }]]
+    },
+    "Call Studio": {
+      "main": [[{ "node": "Return Callback Result", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "meta": { "templateCredsSetupCompleted": true },
+  "tags": []
+}

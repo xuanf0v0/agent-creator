@@ -213,6 +213,7 @@ class WorkflowEvaluator:
         index: int,
         *,
         case_ids: set[str] | None = None,
+        on_case: Callable[[dict[str, Any]], None] | None = None,
     ) -> CandidateResult:
         validation = validate_executable_workflow(project, workflow, runtime=True)
         if validation:
@@ -227,7 +228,10 @@ class WorkflowEvaluator:
         if not cases:
             message = "没有匹配的失败验收用例" if case_ids is not None else "没有启用的验收用例"
             return CandidateResult(index, workflow, False, [], complexity_metrics(workflow, 0, index), [message])
-        for case in cases:
+        total = len(cases)
+        for position, case in enumerate(cases, start=1):
+            if on_case is not None:
+                on_case({"phase": "started", "index": position, "total": total, "case_id": case.id, "name": case.name})
             case_started = time.monotonic()
             manager = WorkflowManager(base_url=self.harness_base_url, poll_interval=0.1 if self.live_execution else 0.01)
             policy = EvaluationPolicy(
@@ -275,6 +279,12 @@ class WorkflowEvaluator:
                 result = CaseResult(case.id, not errors and verdict.passed and verdict.score >= 80, output, errors, verdict.score, verdict.passed)
             result.duration_seconds = time.monotonic() - case_started
             case_results.append(result)
+            if on_case is not None:
+                on_case({
+                    "phase": "finished", "index": position, "total": total,
+                    "case_id": case.id, "name": case.name,
+                    "passed": result.passed, "duration_seconds": round(result.duration_seconds, 1),
+                })
         duration = time.monotonic() - started
         passed = bool(case_results) and all(item.passed for item in case_results)
         return CandidateResult(index, workflow, passed, case_results, complexity_metrics(workflow, duration, index))

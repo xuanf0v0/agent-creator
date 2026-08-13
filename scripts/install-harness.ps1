@@ -1,8 +1,9 @@
 param(
-    [string]$HarnessRoot = "D:\Projects\my-harness"
+    [string]$HarnessRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $HarnessRoot) { $HarnessRoot = Join-Path $PSScriptRoot "..\my-harness" }
 $VersionScript = Join-Path $PSScriptRoot "harness-version.ps1"
 . $VersionScript
 $PinnedRef = $HarnessPinnedRef

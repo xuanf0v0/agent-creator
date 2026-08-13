@@ -1,0 +1,42 @@
+{
+  "id": "studioFetchSheet1",
+  "name": "studio-fetch-sheet",
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "nodes": [
+    {
+      "id": "fetch-webhook",
+      "name": "Studio Fetch Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [260, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "studio-fetch-sheet",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "studio-fetch-sheet"
+    },
+    {
+      "id": "fetch-response",
+      "name": "Return Studio Payload",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [500, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, query: $json.body.query, source: 'n8n' } }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Studio Fetch Webhook": {
+      "main": [[{ "node": "Return Studio Payload", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "meta": { "templateCredsSetupCompleted": true },
+  "tags": []
+}

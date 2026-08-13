@@ -1,10 +1,12 @@
 param(
-    [string]$HarnessRoot = "D:\Projects\my-harness",
+    [string]$HarnessRoot = "",
     [string]$HarnessUrl = "http://127.0.0.1:8765",
-    [switch]$SkipHarness
+    [switch]$SkipHarness,
+    [string]$GeneratorMode = ""
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $HarnessRoot) { $HarnessRoot = Join-Path $PSScriptRoot "..\my-harness" }
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $RuntimeEnv = Join-Path $HarnessRoot ".runtime.env"
 $TaskTokenLine = Get-Content -LiteralPath $RuntimeEnv | Where-Object { $_.StartsWith("AGENT_HARNESS_TASK_TOKEN=") } | Select-Object -First 1
@@ -96,5 +98,6 @@ if (-not $SkipHarness -and (Test-Path -LiteralPath $registerScript)) {
 
 $env:AGENT_HARNESS_URL = $HarnessUrl
 $env:AGENT_HARNESS_TASK_TOKEN = $TaskTokenLine.Split("=", 2)[1]
+if ($GeneratorMode) { $env:OPENAGENT_GENERATOR_MODE = $GeneratorMode }
 $PythonBin = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 & $PythonBin -m openagent_studio.app

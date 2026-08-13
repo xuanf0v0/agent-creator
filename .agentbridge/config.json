@@ -1,0 +1,47 @@
+{
+  "version": "1.0",
+  "codex": {
+    "appPort": 4500,
+    "proxyPort": 4501
+  },
+  "turnCoordination": {
+    "attentionWindowSeconds": 15
+  },
+  "idleShutdownSeconds": 30,
+  "budget": {
+    "enabled": true,
+    "pollSeconds": 300,
+    "budgetFreshTtlSec": 25,
+    "idleAdviceActivityWindowSec": 600,
+    "pauseAt": 90,
+    "resumeBelow": 30,
+    "syncDriftPct": 10,
+    "parallel": {
+      "minRemainingPct": 60,
+      "timeWindowSec": 3600
+    },
+    "codexTierControl": false,
+    "codexTiers": {
+      "full": null,
+      "balanced": {
+        "effort": "medium"
+      },
+      "eco": {
+        "effort": "low"
+      }
+    },
+    "maximize": {
+      "targetUtil": 98,
+      "reserveSlopePctPerHour": 0.4,
+      "reserveMaxPct": 7,
+      "finishingHorizonMinutes": 30,
+      "resumeHysteresisPct": 5,
+      "admissionAt": 85,
+      "wrapUpQuota": 2
+    },
+    "allocation": {
+      "minRunwayRatio": 50,
+      "minRunwayGapHours": 2
+    }
+  }
+}

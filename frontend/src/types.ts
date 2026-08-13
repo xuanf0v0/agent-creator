@@ -13,3 +13,26 @@ export type WorkflowRun = { id: string; workflow_id: string; status: 'queued' | 
 export type IntegrationStatus = { id: string; name: string; workflow_id: string; ready: boolean; missing_env: string[]; auto_reply: boolean }
 export type IntegrationsStatus = { feishu: IntegrationStatus[]; qq: IntegrationStatus[] }
 export type RuntimeStatus = { running: boolean; backends: Record<string, { actionable_error?: string; identity_mismatch?: string[]; readiness?: Record<string, { state?: string; error_code?: string; accepts_tasks?: boolean }>; task_agent_error?: string }> }
+
+// Creator Harness types
+export type NodeTypeInfo = {
+  type: NodeKind
+  label: string
+  category: string
+  icon: string
+  description: string
+  requires_agent?: boolean
+  default_data?: Record<string, unknown>
+  color?: string
+}
+
+export type AgentCapability = {
+  agent_id: string
+  name: string
+  description: string
+  capability: string
+  sandbox: string
+  supported_node_types: NodeKind[]
+  backend_id: string
+  ready: boolean
+}

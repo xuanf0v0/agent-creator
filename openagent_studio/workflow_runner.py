@@ -244,13 +244,27 @@ class WorkflowManager:
                 backend_id = run.active_task_backends.get(task_id, DEFAULT_BACKEND_ID)
                 client = self.client_factory(backend_id)
                 try:
-                    client.cancel(task_id)
+                    self._cancel_task_idempotent(client, task_id)
                 finally:
                     client.close()
             except (HarnessAPIError, httpx.HTTPError, RuntimeError):
                 pass
         self._emit(run, "run.cancelling", {"run_id": run.id})
         return run
+
+    @staticmethod
+    def _cancel_task_idempotent(client: Any, task_id: str) -> None:
+        """幂等取消：已终态的任务直接跳过，避免触发 Harness 对终态任务 cancel 的非幂等错误。"""
+        try:
+            task = client.task(task_id)
+            if str(task.get("status")) in TERMINAL_TASK_STATES:
+                return
+        except (HarnessAPIError, httpx.HTTPError):
+            return
+        try:
+            client.cancel(task_id)
+        except (HarnessAPIError, httpx.HTTPError, RuntimeError):
+            pass
 
     def approve(self, run_id: str, node_id: str, approved: bool, comment: str = "") -> WorkflowRun:
         run = self.require(run_id)
@@ -342,7 +356,17 @@ class WorkflowManager:
                         completed.add(node_id)
                         node = nodes[node_id]
                         for index in outgoing[node_id]:
-                            edge_states[index] = "active" if self._edge_matches(workflow.edges[index], output, run) else "inactive"
+                            edge = workflow.edges[index]
+                            if node.type == "approval" and isinstance(output, dict) and "approved" in output:
+                                matches = self._approval_edge_matches(
+                                    edge,
+                                    output,
+                                    run,
+                                    target_type=nodes[edge.target].type,
+                                )
+                            else:
+                                matches = self._edge_matches(edge, output, run)
+                            edge_states[index] = "active" if matches else "inactive"
 
             self._check_cancelled(run)
             run.status, run.completed_at = "completed", time.time()
@@ -402,6 +426,8 @@ class WorkflowManager:
         if node.type == "prompt":
             return self._render(str(node.data.get("template") or node.data.get("prompt") or node.data.get("description") or "{{input}}"), run, latest)
         if node.type in {"llm", "agent", "tool", "code", "validator"}:
+            if run.policy and node.id in run.policy.mocks:
+                return run.policy.mocks[node.id]
             if run.policy and not run.policy.live_execution:
                 if node.type in {"tool", "code"}:
                     return self._evaluation_mock(run, node)
@@ -413,6 +439,8 @@ class WorkflowManager:
         if node.type == "knowledge_retrieval":
             return self._retrieve_knowledge(run, node, latest)
         if node.type == "http_request":
+            if run.policy and node.id in run.policy.mocks:
+                return run.policy.mocks[node.id]
             if run.policy and not run.policy.live_execution:
                 return self._evaluation_mock(run, node)
             return self._http_request(run, node, latest)
@@ -444,9 +472,7 @@ class WorkflowManager:
         if node.type == "approval":
             if run.policy:
                 approved = run.policy.approvals.get(node.id, True)
-                if not approved:
-                    raise RuntimeError(f"验收夹具拒绝了审批节点 {node.id}")
-                return {"approved": True, "comment": "evaluation fixture", "value": latest}
+                return {"approved": approved, "comment": "evaluation fixture", "value": latest}
             return self._wait_for_approval(run, node, latest)
         if node.type == "subworkflow":
             return self._run_subworkflow(run, project, node, latest)
@@ -502,6 +528,8 @@ class WorkflowManager:
                 body = json.loads(rendered)
             except json.JSONDecodeError:
                 body = rendered
+        elif isinstance(body, (dict, list)):
+            body = self._render_body_value(body, run, latest)
         timeout = max(1.0, min(float(node.data.get("timeout_seconds", 30)), 120.0))
         try:
             with self._http_client.stream(
@@ -679,8 +707,8 @@ class WorkflowManager:
                 self._emit(run, "node.progress", {"run_id": run.id, "node_id": node.id, "status": task.get("status"), "task_id": task_id})
         except RunCancelled:
             try:
-                client.cancel(task_id)
-            except (HarnessAPIError, httpx.HTTPError):
+                self._cancel_task_idempotent(client, task_id)
+            except (HarnessAPIError, httpx.HTTPError, RuntimeError):
                 pass
             client.close()
             raise
@@ -784,9 +812,7 @@ class WorkflowManager:
         self._check_cancelled(run)
         decision = run.approval_decisions[node.id]
         self._emit(run, "node.approval_resolved", {"run_id": run.id, "node_id": node.id, **decision})
-        if not decision["approved"]:
-            raise RuntimeError(decision["comment"] or f"审批节点 {node.id} 已拒绝")
-        return {"approved": True, "comment": decision["comment"], "value": latest}
+        return {"approved": bool(decision["approved"]), "comment": decision["comment"], "value": latest}
 
     def _set_node_state(self, run: WorkflowRun, node_id: str, status: str, **extra: Any) -> None:
         with self._lock:
@@ -823,6 +849,31 @@ class WorkflowManager:
                 value = _display_harness_output(value)
             return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", replace, template)
+
+    @classmethod
+    def _render_body_value(cls, value: Any, run: WorkflowRun, latest: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: cls._render_body_value(item, run, latest) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._render_body_value(item, run, latest) for item in value]
+        if not isinstance(value, str):
+            return value
+
+        expression = re.fullmatch(r"\{\{\s*([^{}]+?)\s*\}\}", value)
+        if not expression:
+            return cls._render(value, run, latest)
+        key = expression.group(1).strip()
+        if key in {"input", "latest"}:
+            resolved = latest if key == "latest" else run.input
+        elif key.startswith("nodes."):
+            resolved = _lookup(run.outputs, key[6:])
+        else:
+            resolved = _lookup({"input": run.input, "latest": latest, "nodes": run.outputs}, key)
+            if resolved is None:
+                resolved = _lookup_node_reference(run.outputs, key)
+        if key == "latest" or key.startswith("nodes.") or key.split(".", 1)[0] in run.outputs:
+            return _display_harness_output(resolved)
+        return resolved
 
     @staticmethod
     def _evaluate(expression: str, run: WorkflowRun, latest: Any) -> bool:
@@ -861,6 +912,27 @@ class WorkflowManager:
         if isinstance(output, (str, int, float)) and str(output).lower() == condition:
             return True
         return self._evaluate(edge.condition, run, output)
+
+    def _approval_edge_matches(
+        self,
+        edge: WorkflowEdge,
+        output: dict[str, Any],
+        run: WorkflowRun,
+        *,
+        target_type: str | None = None,
+    ) -> bool:
+        approved = bool(output.get("approved"))
+        condition = str(edge.condition or "").strip().lower()
+        if not condition:
+            # An approval feeding a condition must pass the complete decision
+            # object for both approved and rejected outcomes. Other legacy
+            # unconditional approval edges remain approve-only gates.
+            return target_type == "condition" or approved
+        if condition in {"true", "yes", "success", "passed"}:
+            return approved
+        if condition in {"false", "no", "failure", "failed"}:
+            return not approved
+        return self._edge_matches(edge, approved, run)
 
 
 def _lookup(value: Any, path: str) -> Any:

@@ -1,10 +1,11 @@
 param(
-    [string]$HarnessRoot = "D:\Projects\my-harness",
+    [string]$HarnessRoot = "",
     [string]$HostAddress = "127.0.0.1",
     [int]$Port = 8765
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $HarnessRoot) { $HarnessRoot = Join-Path $PSScriptRoot "..\my-harness" }
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $RuntimeEnv = Join-Path $HarnessRoot ".runtime.env"
 $HarnessBin = Join-Path $HarnessRoot ".venv\Scripts\agent-harness.exe"

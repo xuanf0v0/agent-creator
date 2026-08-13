@@ -1,0 +1,30 @@
+# n8n 连接器后端（AutoFlow 2.0 集成）
+#
+# 用途：把 n8n 的 400+ 第三方 SaaS 连接器暴露给 OpenAgent Studio 工作流。
+# Studio 通过 http_request 节点调用 n8n webhook，n8n 执行连接器逻辑后返回 JSON。
+# 所有第三方 API 密钥由 n8n credential manager 管理，Studio 侧零密钥。
+#
+# 启动：docker compose -f docker-compose.n8n.yml up -d
+# 停止：docker compose -f docker-compose.n8n.yml down
+# 访问：http://127.0.0.1:5678
+
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: studio-n8n
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_WEBHOOK_URL: http://127.0.0.1:5678/
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?请在项目 .env 中设置稳定的 N8N_ENCRYPTION_KEY}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      GENERIC_TIMEZONE: Asia/Shanghai
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:

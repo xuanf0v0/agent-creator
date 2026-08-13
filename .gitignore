@@ -16,3 +16,8 @@ frontend/dist/
 .harness/agent-harness/
 .openagent-logs/
 .claude/worktrees/
+# 本地化 Harness 运行目录（含密钥 .runtime.env、.venv、state.db）
+my-harness/
+
+# 多 Agent 会话续跑状态（机器生成的会话 ID/时间戳，非源码）
+.omo/
