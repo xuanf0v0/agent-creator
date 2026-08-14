@@ -183,12 +183,16 @@ class WorkflowManager:
         errors = validate_executable_workflow(project, workflow, runtime=True, require_output=require_output)
         if errors:
             raise ValueError("；".join(errors))
+        body = body or {}
+        # 验收/增量探测可使用空的合成输入；外部人工启动必须提供真实输入。
+        if policy is None and not _inline and self._manual_trigger_requires_input(workflow, body):
+            if not self._has_manual_trigger_input(body.get("input")):
+                raise ValueError("手动触发器必须填写输入信息后才能启动工作流")
         slot_acquired = False
         if not _inline:
             slot_acquired = self._run_slots.acquire(blocking=False)
             if not slot_acquired:
                 raise RuntimeError(f"工作流运行已达到 {self.max_concurrent_runs} 个并发上限，请稍后重试")
-        body = body or {}
         try:
             run = WorkflowRun(
                 id=uuid4().hex,
@@ -214,6 +218,24 @@ class WorkflowManager:
             if slot_acquired:
                 self._run_slots.release()
             raise
+
+    @staticmethod
+    def _manual_trigger_requires_input(workflow: WorkflowSpec, body: dict[str, Any]) -> bool:
+        trigger_node_id = body.get("_trigger_node_id")
+        if trigger_node_id:
+            trigger = next((node for node in workflow.nodes if node.id == str(trigger_node_id)), None)
+            return trigger is not None and trigger.type == "manual_trigger"
+        return any(node.type == "manual_trigger" for node in workflow.nodes)
+
+    @staticmethod
+    def _has_manual_trigger_input(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (dict, list, tuple, set)):
+            return bool(value)
+        return True
 
     def _trim_runs_locked(self) -> None:
         if len(self.runs) <= self.max_retained_runs:

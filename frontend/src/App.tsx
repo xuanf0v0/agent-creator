@@ -145,6 +145,16 @@ function truncateText(value: string, limit = 1200): string {
   return value.length > limit ? `${value.slice(0, limit)}…（截断，共 ${value.length} 字）` : value
 }
 
+function isTerminalRunStatus(status?: string): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled'
+}
+
+function terminalRunMessage(status: string, error = ''): string {
+  if (status === 'failed') return `工作流失败：${error || '未知错误'}`
+  if (status === 'cancelled') return '工作流已停止，请输入新任务后重新运行'
+  return '工作流已完成，请输入新任务后重新运行'
+}
+
 const runtimeStatusLabels: Record<string, string> = {
   pending: '待运行', running: '运行中', waiting: '等待审批', completed: '已完成', failed: '失败', skipped: '已跳过',
 }
@@ -186,6 +196,7 @@ function StudioCanvas() {
   const [settingsError, setSettingsError] = useState('')
   const generationSource = useRef<EventSource | null>(null)
   const runSource = useRef<EventSource | null>(null)
+  const activeRunId = useRef<string | null>(null)
   const chatDeltaFrame = useRef<number | null>(null)
   const pendingChatDelta = useRef('')
   const previewFrame = useRef<number | null>(null)
@@ -197,6 +208,7 @@ function StudioCanvas() {
   const { screenToFlowPosition, fitView } = useReactFlow()
 
   const workflow = useMemo(() => spec?.workflows.find((item) => item.id === workflowId), [spec, workflowId])
+  const runInputReady = runInput.trim().length > 0
   const selectedNode = nodes.find((item) => item.id === selected)
   const selectedHarness = spec?.harness.find((item) => item.id === selectedNode?.data.agent_id)
   const selectedNodeRun = selectedNode && run?.node_states[selectedNode.id]
@@ -213,14 +225,29 @@ function StudioCanvas() {
   // Creator Harness: node types that require an agent
   const harnessNodeKinds = useMemo(() => nodeCatalog.filter((n) => n.requires_agent).map((n) => n.type), [nodeCatalog])
 
+  const resetRunState = useCallback(() => {
+    runSource.current?.close()
+    runSource.current = null
+    activeRunId.current = null
+    if (runFrame.current != null) cancelAnimationFrame(runFrame.current)
+    runFrame.current = null
+    pendingRunEvents.current = []
+    pendingRun.current = null
+    pendingNodeStates.current = {}
+    setRun(null)
+    setRunInput('')
+    setRunEvents([])
+  }, [])
+
   const openWorkflow = useCallback((project: ProjectSpec, id: string) => {
     const item = project.workflows.find((flow) => flow.id === id)
     if (!item) return
     const view = toCanvas(item, nodeCatalog)
-    setNodes(view.nodes); setEdges(view.edges); setWorkflowId(id); setSelected(null); setSelectedEdge(null); setRun(null)
+    resetRunState()
+    setNodes(view.nodes); setEdges(view.edges); setWorkflowId(id); setSelected(null); setSelectedEdge(null)
     loadCreatorMessages(id).then((items) => setChatMessages(items)).catch(() => setChatMessages([]))
     setTimeout(() => fitView({ padding: 0.22 }), 40)
-  }, [fitView])
+  }, [fitView, resetRunState])
 
   useEffect(() => {
     loadSpec().then(({ spec: project, etag: tag }) => {
@@ -688,6 +715,7 @@ function StudioCanvas() {
 
   function followRun(started: WorkflowRun) {
     runSource.current?.close()
+    activeRunId.current = started.id
     setRun(started); setRightTab('run'); setRunEvents([])
     const source = new EventSource(`/api/workflow-runs/${started.id}/events`)
     runSource.current = source
@@ -711,24 +739,42 @@ function StudioCanvas() {
     const scheduleFlush = () => { if (runFrame.current == null) runFrame.current = requestAnimationFrame(flush) }
     const names = ['run.started', 'node.status', 'node.harness_task', 'node.progress', 'node.approval_required', 'node.approval_resolved', 'run.completed', 'run.failed', 'run.cancelled']
     names.forEach((name) => source.addEventListener(name, (event) => {
+      if (runSource.current !== source) return
       const data = JSON.parse((event as MessageEvent).data)
       pendingRunEvents.current.push(`${name} · ${data.node_id || data.message || data.status || ''}`)
       if (data.run) pendingRun.current = data.run
       else if (data.node_id && data.state) pendingNodeStates.current[data.node_id] = data.state
+      if (name === 'run.completed' || name === 'run.failed' || name === 'run.cancelled') {
+        const status = data.run?.status || (name === 'run.completed' ? 'completed' : name === 'run.failed' ? 'failed' : 'cancelled')
+        closeSource()
+        resetRunState()
+        setMessage(terminalRunMessage(status, data.message || data.run?.error || ''))
+        return
+      }
       scheduleFlush()
-      if (name === 'run.completed' || name === 'run.failed' || name === 'run.cancelled') { flush(); closeSource() }
     }))
     source.addEventListener('stream.reset', () => {
+      if (runSource.current !== source) return
       setMessage('部分运行事件已过期，正在同步真实运行快照…')
       void loadWorkflowRun(started.id).then((latest) => {
+        if (runSource.current !== source) return
+        if (isTerminalRunStatus(latest.status)) {
+          closeSource()
+          resetRunState()
+          setMessage(terminalRunMessage(latest.status, latest.error))
+          return
+        }
         setRun(latest)
         setMessage('运行快照已同步，继续接收实时事件')
-      }).catch((error: Error) => setMessage(`运行快照同步失败：${error.message}`))
+      }).catch((error: Error) => {
+        if (runSource.current === source) setMessage(`运行快照同步失败：${error.message}`)
+      })
     })
   }
 
   async function executeWorkflow() {
     if (!workflowId || stalledGenerationId || saving || run && ['queued', 'running'].includes(run.status)) return
+    if (!runInputReady) { setMessage('请先填写触发节点输入'); return }
     try {
       if (!await persist()) return
       const started = await startWorkflowRun(workflowId, runInput)
@@ -739,7 +785,15 @@ function StudioCanvas() {
 
   async function stopRun() {
     if (!run) return
-    setRun(await cancelWorkflowRun(run.id)); setMessage('正在取消工作流及 Harness 任务…')
+    const runId = run.id
+    const stopped = await cancelWorkflowRun(runId)
+    if (activeRunId.current !== runId) return
+    if (isTerminalRunStatus(stopped.status)) {
+      resetRunState()
+      setMessage(terminalRunMessage(stopped.status, stopped.error))
+      return
+    }
+    setRun(stopped); setMessage('正在取消工作流及 Harness 任务…')
   }
 
   async function decide(nodeId: string, approved: boolean) {
@@ -835,7 +889,7 @@ function StudioCanvas() {
         <button className="ghost" disabled={!!generationId || !!stalledGenerationId || !workflow} onClick={optimizeCurrent}>优化当前工作流</button>
         <button className="opencode-launch" onClick={() => setRightTab('chat')}>✦ OpenCode 创建</button>
         <button className="primary" disabled={saving || !!stalledGenerationId || !workflow} onClick={persist}>{saving ? '保存中…' : '保存工作流'}</button>
-        {run && ['queued', 'running'].includes(run.status) ? <button className="stop-run" onClick={stopRun}>■ 停止</button> : <button className="run" disabled={!workflow || !!stalledGenerationId} onClick={executeWorkflow}>▶ 运行</button>}
+        {run && ['queued', 'running'].includes(run.status) ? <button className="stop-run" onClick={stopRun}>■ 停止</button> : <button className="run" disabled={!workflow || !!stalledGenerationId || !runInputReady} onClick={executeWorkflow}>▶ 运行</button>}
       </div>
     </header>
 
@@ -884,8 +938,8 @@ function StudioCanvas() {
         <button className="run-wide" disabled={!!generationId} onClick={optimizeCurrent}>优化当前工作流</button>
       </div> : rightTab === 'run' ? <div className="run-panel">
         <div className="panel-title"><strong>Harness 工作流</strong><span>{run ? `运行 ${run.id.slice(0, 8)} · ${run.status}` : '输入任务后开始执行'}</span></div>
-        <label>工作流输入<textarea value={runInput} onChange={(event) => setRunInput(event.target.value)} disabled={!!run && ['queued', 'running'].includes(run.status)} placeholder="输入要交给工作流处理的任务…"/></label>
-        {!run || !['queued', 'running'].includes(run.status) ? <button className="run-wide" onClick={executeWorkflow}>▶ 开始运行</button> : <button className="stop-wide" onClick={stopRun}>■ 取消运行</button>}
+        <label>工作流输入<textarea required value={runInput} onChange={(event) => setRunInput(event.target.value)} disabled={!!run && ['queued', 'running'].includes(run.status)} placeholder="输入触发节点信息后开始执行…"/></label>
+        {!run || !['queued', 'running'].includes(run.status) ? <button className="run-wide" disabled={!runInputReady} onClick={executeWorkflow}>▶ 开始运行</button> : <button className="stop-wide" onClick={stopRun}>■ 取消运行</button>}
         {run && <div className="run-summary"><strong>{run.status}</strong>{run.error && <p>{run.error}</p>}{Object.entries(run.node_states).map(([id, state]) => {
           const label = nodes.find((node) => node.id === id)?.data.label || id
           const output = state.status === 'completed' ? displayNodeOutput(state.output) : null

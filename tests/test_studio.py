@@ -927,6 +927,34 @@ def test_workflow_runner_calls_harness_task_and_waits_for_approval():
     assert run.outputs["output"]["approved"] is True
 
 
+def test_code_review_does_not_forward_untrusted_code_to_test_runner():
+    project = SpecStore(Path(__file__).parents[1] / "project.yaml").load()
+    workflow = next(item for item in project.workflows if item.id == "workflow-78d4b5")
+    assert workflow.nodes[1].data["agent_id"] == "coding"
+    assert workflow.nodes[4].data["agent_id"] == "test-runner"
+    submitted: list[dict] = []
+    untrusted_code = "print('SHOULD_NOT_EXECUTE')\n__import__('os').system('echo PWNED')"
+
+    def handler(operation, **kwargs):
+        if operation == "submit":
+            submitted.append(kwargs)
+            return {"id": f"task-{len(submitted)}", "status": "completed"}
+        if operation == "logs":
+            return {"items": [], "next_cursor": 0}
+        if operation == "result":
+            return {"output": {"type": "text", "text": "完成"}}
+        raise AssertionError(operation)
+
+    manager = WorkflowManager(poll_interval=0.001, client_factory=lambda _backend_id: FakeHarnessClient(handler))
+    run = manager.start(project, workflow.id, {"input": untrusted_code})
+    _wait_for(lambda: run.node_states["human_approval"]["status"] == "waiting")
+    assert untrusted_code in submitted[0]["prompt"]
+
+    manager.approve(run.id, "human_approval", True)
+    _wait_for(lambda: run.status == "completed")
+    assert untrusted_code not in submitted[1]["prompt"]
+
+
 def test_workflow_runner_rejected_approval_uses_false_branch_without_failing():
     project = ProjectSpec.model_validate({
         "version": "1", "name": "审批拒绝分支",
@@ -1205,6 +1233,56 @@ def test_webhook_node_starts_workflow(tmp_path: Path):
     run_id = response.json()["id"]
     _wait_for(lambda: client.get(f"/api/workflow-runs/{run_id}").json()["status"] == "completed")
     assert client.get(f"/api/workflow-runs/{run_id}").json()["outputs"]["result"]["body"] == {"market": "US"}
+
+
+def test_manual_trigger_requires_non_blank_input_but_webhook_trigger_does_not():
+    project = ProjectSpec.model_validate({
+        "version": "1", "name": "触发输入",
+        "workflows": [{"id": "flow", "name": "触发流程", "nodes": [
+            {"id": "manual", "type": "manual_trigger", "data": {}},
+            {"id": "hook", "type": "webhook", "data": {"path": "/hooks/trigger-input", "method": "POST"}},
+            {"id": "manual-output", "type": "output", "data": {"template": "manual"}},
+            {"id": "hook-output", "type": "output", "data": {"template": "hook"}},
+        ], "edges": [
+            {"source": "manual", "target": "manual-output"},
+            {"source": "hook", "target": "hook-output"},
+        ]}],
+    })
+    manager = WorkflowManager()
+
+    with pytest.raises(ValueError, match="手动触发器.*输入"):
+        manager.start(project, "flow", {"input": ""})
+    with pytest.raises(ValueError, match="手动触发器.*输入"):
+        manager.start(project, "flow", {"input": " \n\t"})
+    with pytest.raises(ValueError, match="手动触发器.*输入"):
+        manager.start(project, "flow", {"input": {}})
+
+    manual_run = manager.start(project, "flow", {"input": "开始"})
+    _wait_for(lambda: manual_run.status == "completed")
+    assert manual_run.outputs["manual-output"] == "manual"
+
+    webhook_run = manager.start(project, "flow", {"input": {}, "_trigger_node_id": "hook"})
+    _wait_for(lambda: webhook_run.status == "completed")
+    assert webhook_run.outputs["hook-output"] == "hook"
+
+
+def test_manual_trigger_api_rejects_empty_input(tmp_path: Path):
+    app = create_app(tmp_path / "project.yaml")
+    client = TestClient(app)
+    payload = {"version": "1", "name": "人工触发", "workflows": [{
+        "id": "flow", "name": "人工流程",
+        "nodes": [
+            {"id": "manual", "type": "manual_trigger", "data": {}},
+            {"id": "output", "type": "output", "data": {}},
+        ],
+        "edges": [{"source": "manual", "target": "output"}],
+    }]}
+    assert client.put("/api/spec", json=payload).status_code == 200
+
+    response = client.post("/api/workflows/flow/runs", json={"input": "  \n"})
+
+    assert response.status_code == 422
+    assert "手动触发器" in response.json()["detail"]
 
 
 def test_cron_matching_supports_steps_and_ranges():
