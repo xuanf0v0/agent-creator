@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 import pytest
 from fastapi.testclient import TestClient
 from openagent_studio.app import create_app
@@ -812,18 +813,28 @@ def test_generator_call_timeout_is_bounded(monkeypatch):
     assert _invoke_timeout_seconds() == 1800
 
 
-def test_generator_call_timeout_default_is_long_context_safe(monkeypatch):
+def test_generator_call_timeout_default_is_unbounded(monkeypatch):
     monkeypatch.delenv("OPENCODE_GENERATOR_CALL_TIMEOUT", raising=False)
-    assert _invoke_timeout_seconds() == 120
+    assert _invoke_timeout_seconds() == 0
 
 
-def test_generator_repair_probe_and_iteration_defaults_are_bounded(monkeypatch):
+def test_generator_repair_timeout_default_is_unbounded(monkeypatch):
     monkeypatch.delenv("OPENCODE_REPAIR_CALL_TIMEOUT", raising=False)
     monkeypatch.delenv("OPENAGENT_INCREMENTAL_PROBE_TIMEOUT", raising=False)
     monkeypatch.delenv("OPENAGENT_INCREMENTAL_MAX_ITERATIONS", raising=False)
-    assert _repair_timeout_seconds() == 60
+    assert _repair_timeout_seconds() == 0
     assert _incremental_probe_timeout_seconds() == 120
     assert _incremental_max_iterations() == 100
+
+
+def test_windows_startup_forces_agent_loop_when_mode_is_not_explicit():
+    script = (Path(__file__).parents[1] / "scripts" / "start-studio.ps1").read_text(encoding="utf-8")
+    assert '$env:OPENAGENT_GENERATOR_MODE = if ($GeneratorMode) { $GeneratorMode } else { "agent_loop" }' in script
+
+
+def test_shell_startup_defaults_to_agent_loop():
+    script = (Path(__file__).parents[1] / "scripts" / "start-studio.sh").read_text(encoding="utf-8")
+    assert 'export OPENAGENT_GENERATOR_MODE="${OPENAGENT_GENERATOR_MODE:-agent_loop}"' in script
 
 
 def test_generator_compaction_limits_are_bounded(monkeypatch):
@@ -1742,6 +1753,53 @@ def test_evaluation_mode_uses_real_logic_and_effect_mocks():
     _wait_for(lambda: run.status == "failed")
     assert "缺少 mock" in run.error
     assert run.id not in manager.runs
+
+
+def test_evaluation_cases_run_in_parallel():
+    workflow = WorkflowSpec.model_validate({
+        "id": "flow", "name": "并发验收", "nodes": [
+            {"id": "start", "type": "manual_trigger", "data": {}},
+            {"id": "result", "type": "output", "data": {"template": "{{input}}"}},
+        ],
+        "edges": [{"source": "start", "target": "result"}],
+        "evaluation": {"cases": [
+            {
+                "id": "case-one", "name": "用例一", "input": "one",
+                "assertions": [{"path": "output", "operator": "equals", "expected": "one"}],
+                "semantic_criteria": ["输出正确"],
+            },
+            {
+                "id": "case-two", "name": "用例二", "input": "two",
+                "assertions": [{"path": "output", "operator": "equals", "expected": "two"}],
+                "semantic_criteria": ["输出正确"],
+            },
+        ]},
+    })
+    project = ProjectSpec.model_validate({"version": "1", "name": "并发验收", "workflows": [workflow]})
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def semantic_judge(_workflow, _case, _output):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.05)
+            return SemanticVerdict(True, 100)
+        finally:
+            with lock:
+                active -= 1
+
+    events = []
+    evaluator = WorkflowEvaluator(lambda _prompt, value: value, semantic_judge, live_execution=True)
+    result = evaluator.evaluate(project, workflow, 0, on_case=events.append)
+
+    assert result.passed is True
+    assert peak == 2
+    assert [item["phase"] for item in events].count("started") == 2
+    assert [item["phase"] for item in events].count("finished") == 2
 
 
 def test_opencode_must_explicitly_confirm_acceptance():

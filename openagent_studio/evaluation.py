@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
 import os
@@ -219,7 +220,6 @@ class WorkflowEvaluator:
         if validation:
             return CandidateResult(index, workflow, False, [], complexity_metrics(workflow, 0, index), validation)
         self.ensure_runtime_ready(project, workflow)
-        case_results: list[CaseResult] = []
         started = time.monotonic()
         cases = [
             case for case in workflow.evaluation.cases
@@ -229,62 +229,70 @@ class WorkflowEvaluator:
             message = "没有匹配的失败验收用例" if case_ids is not None else "没有启用的验收用例"
             return CandidateResult(index, workflow, False, [], complexity_metrics(workflow, 0, index), [message])
         total = len(cases)
-        for position, case in enumerate(cases, start=1):
-            if on_case is not None:
+        if on_case is not None:
+            for position, case in enumerate(cases, start=1):
                 on_case({"phase": "started", "index": position, "total": total, "case_id": case.id, "name": case.name})
+
+        def evaluate_case(item: tuple[int, EvaluationCase]) -> CaseResult:
+            position, case = item
             case_started = time.monotonic()
             manager = WorkflowManager(base_url=self.harness_base_url, poll_interval=0.1 if self.live_execution else 0.01)
             policy = EvaluationPolicy(
-                mocks={item.node_id: item.response for item in case.mocks}, approvals=case.approvals,
+                mocks={mock.node_id: mock.response for mock in case.mocks}, approvals=case.approvals,
                 model_inference=self.model_inference, live_execution=self.live_execution,
             )
             try:
                 run = manager.start(project, workflow.id, {"input": case.input}, policy=policy, record=False)
             except (RuntimeError, ValueError) as exc:
-                case_results.append(CaseResult(case.id, False, errors=[str(exc)]))
-                continue
-            deadline = time.monotonic() + case.timeout_seconds
-            while run.status not in {"completed", "failed", "cancelled"} and time.monotonic() < deadline:
-                time.sleep(0.01)
-            if run.status not in {"completed", "failed", "cancelled"}:
-                run.cancel_event.set()
-                result = CaseResult(case.id, False, errors=["验收执行超时"])
-            elif run.status != "completed":
-                if run.error_code in {"setup_required", "agent_process_failed", "agent_timeout", "agent_permission_denied", "sandbox_unavailable", "sandbox_denied", "protocol_output_invalid"} or run.error.startswith((
-                    "Harness 不可用：",
-                    "Harness 基础设施错误：",
-                    "Harness 任务 API 契约不兼容：",
-                    "Harness 请求失败（502）",
-                    "Harness 请求失败（503）",
-                    "Harness 请求失败（504）",
-                )):
-                    raise HarnessInfrastructureError(
-                        f"Harness 验收基础设施失败：{run.error}。候选工作流未进入无效修复。"
-                    )
-                result = CaseResult(case.id, False, errors=[run.error or run.status])
+                result = CaseResult(case.id, False, errors=[str(exc)])
             else:
-                final_ids = [node.id for node in workflow.nodes if node.type == "output" and node.id in run.outputs]
-                if len(final_ids) == 1:
-                    output = run.outputs[final_ids[0]]
-                elif final_ids:
-                    output = {node_id: run.outputs[node_id] for node_id in final_ids}
+                deadline = time.monotonic() + case.timeout_seconds
+                while run.status not in {"completed", "failed", "cancelled"} and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if run.status not in {"completed", "failed", "cancelled"}:
+                    run.cancel_event.set()
+                    result = CaseResult(case.id, False, errors=["验收执行超时"])
+                elif run.status != "completed":
+                    if run.error_code in {"setup_required", "agent_process_failed", "agent_timeout", "agent_permission_denied", "sandbox_unavailable", "sandbox_denied", "protocol_output_invalid"} or run.error.startswith((
+                        "Harness 不可用：",
+                        "Harness 基础设施错误：",
+                        "Harness 任务 API 契约不兼容：",
+                        "Harness 请求失败（502）",
+                        "Harness 请求失败（503）",
+                        "Harness 请求失败（504）",
+                    )):
+                        raise HarnessInfrastructureError(
+                            f"Harness 验收基础设施失败：{run.error}。候选工作流未进入无效修复。"
+                        )
+                    result = CaseResult(case.id, False, errors=[run.error or run.status])
                 else:
-                    output = run.outputs
-                errors = [error for assertion in case.assertions if (error := check_assertion(output, assertion))]
-                verdict = self.semantic_judge(workflow, case, output)
-                if not verdict.passed:
-                    errors.extend(verdict.issues or ["OpenCode 未确认该用例通过"])
-                if verdict.score < 80:
-                    errors.append(f"语义质量分 {verdict.score} 低于 80")
-                result = CaseResult(case.id, not errors and verdict.passed and verdict.score >= 80, output, errors, verdict.score, verdict.passed)
+                    final_ids = [node.id for node in workflow.nodes if node.type == "output" and node.id in run.outputs]
+                    if len(final_ids) == 1:
+                        output = run.outputs[final_ids[0]]
+                    elif final_ids:
+                        output = {node_id: run.outputs[node_id] for node_id in final_ids}
+                    else:
+                        output = run.outputs
+                    errors = [error for assertion in case.assertions if (error := check_assertion(output, assertion))]
+                    verdict = self.semantic_judge(workflow, case, output)
+                    if not verdict.passed:
+                        errors.extend(verdict.issues or ["OpenCode 未确认该用例通过"])
+                    if verdict.score < 80:
+                        errors.append(f"语义质量分 {verdict.score} 低于 80")
+                    result = CaseResult(case.id, not errors and verdict.passed and verdict.score >= 80, output, errors, verdict.score, verdict.passed)
             result.duration_seconds = time.monotonic() - case_started
-            case_results.append(result)
             if on_case is not None:
                 on_case({
                     "phase": "finished", "index": position, "total": total,
                     "case_id": case.id, "name": case.name,
                     "passed": result.passed, "duration_seconds": round(result.duration_seconds, 1),
                 })
+            return result
+
+        # Cases are independent DAG executions. Run them concurrently so one slow
+        # live Harness task cannot hold all later acceptance cases behind it.
+        with ThreadPoolExecutor(max_workers=min(3, total), thread_name_prefix="evaluation-case") as executor:
+            case_results = list(executor.map(evaluate_case, enumerate(cases, start=1)))
         duration = time.monotonic() - started
         passed = bool(case_results) and all(item.passed for item in case_results)
         return CandidateResult(index, workflow, passed, case_results, complexity_metrics(workflow, duration, index))

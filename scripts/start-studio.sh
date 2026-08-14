@@ -25,6 +25,6 @@ fi
 verify_instance
 "$PROJECT_ROOT/scripts/register-harness-agent.sh" --harness-root "$HARNESS_ROOT" --base-url "$HARNESS_URL"
 export AGENT_HARNESS_URL="$HARNESS_URL" OPENAGENT_SPEC="${OPENAGENT_SPEC:-$PROJECT_ROOT/project.yaml}"
-# 生成引擎模式：blueprint（直出，create 默认）| toolcalls（模型自主建图，modify/repair 默认）| chain/incremental（逃生舱）
-export OPENAGENT_GENERATOR_MODE="${OPENAGENT_GENERATOR_MODE:-toolcalls}"
+# 生成引擎模式：agent_loop（LLM 自主 DAG 循环，默认）| blueprint/toolcalls/chain/incremental（显式逃生舱）
+export OPENAGENT_GENERATOR_MODE="${OPENAGENT_GENERATOR_MODE:-agent_loop}"
 exec "$PROJECT_ROOT/.venv/bin/python" -m openagent_studio.app

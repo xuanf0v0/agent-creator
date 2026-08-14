@@ -122,9 +122,10 @@ Agent Loop 默认不设生成迭代上限，持续到验收成功；`OPENAGENT_A
 右侧“验收标准”可编辑真实运行输入、输出检查、语义目标、审批决策和单用例超时。确定性断言只负责在
 真实运行完成后检查输出字段、值、类型或格式，不能代替真实执行。审批节点在无人值守验收时使用用例中的
 决策；其他节点不使用 Mock。Agent Loop 的每次真实验收默认使用 `OPENAGENT_INCREMENTAL_PROBE_TIMEOUT=120` 秒探测边界；旧 `chain`/`incremental` 模式仍支持 `OPENAGENT_INCREMENTAL_MAX_ITERATIONS`，仅作为显式逃生舱。
-OpenCode 首次规划调用默认最多等待 120 秒（`OPENCODE_GENERATOR_CALL_TIMEOUT`，范围 30–1800）；
-修复候选默认最多等待 60 秒（`OPENCODE_REPAIR_CALL_TIMEOUT`，范围 30–600）；每次 OpenCode 调用超时都会由同一生成任务自动继续重试。
-`OPENAGENT_MODEL_TIMEOUT_RETRIES=0`（默认）表示不设超时重试上限，正数表示允许的自动重试次数。
+OpenCode 首次规划和修复调用默认不设模型截止时间（`OPENCODE_GENERATOR_CALL_TIMEOUT=0`、
+`OPENCODE_REPAIR_CALL_TIMEOUT=0`，由用户停止生成）；设置正数可启用 30–1800 秒、30–600 秒截止时间。
+启用截止时间后，每次 OpenCode 调用超时都会由同一生成任务自动继续重试。`OPENAGENT_MODEL_TIMEOUT_RETRIES=0`（默认）
+表示不设超时重试上限，正数表示允许的自动重试次数。
 每次 OpenCode 调用还会把用途、进程号、退出码、耗时、超时、诊断摘要和响应尾部写入
 `.openagent-logs/opencode.jsonl`；日志已过滤常见 Bearer/API key/token 字段，不记录完整提示词。
 可通过 `OPENAGENT_OPENCODE_LOG` 指定其他日志文件路径。日志写入失败不会改变生成任务的真实结果。

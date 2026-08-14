@@ -281,6 +281,8 @@ class Generation:
     next_event_sequence: int = 0
     max_events: int = 1000
     process: subprocess.Popen | None = None
+    active_processes: set[Any] = field(default_factory=set, repr=False)
+    process_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     cancelled: bool = False
     completed: bool = False
     session_id: str | None = None
@@ -298,6 +300,17 @@ class Generation:
     question: str | None = None
     last_failure: dict[str, Any] | None = None
     initial_failures: list[dict[str, Any]] = field(default_factory=list)
+
+    def register_process(self, process: subprocess.Popen) -> None:
+        with self.process_lock:
+            self.active_processes.add(process)
+            self.process = process
+
+    def unregister_process(self, process: subprocess.Popen) -> None:
+        with self.process_lock:
+            self.active_processes.discard(process)
+            if self.process is process:
+                self.process = next(iter(self.active_processes), None)
 
     def emit(self, event: str, data: dict[str, Any]) -> None:
         with self.event_signal:
@@ -589,8 +602,13 @@ class GeneratorManager:
     def cancel(self, generation_id: str) -> Generation:
         generation = self.require(generation_id)
         generation.cancelled = True
-        if generation.process and generation.process.poll() is None:
-            _terminate_process_tree(generation.process)
+        with generation.process_lock:
+            processes = list(generation.active_processes)
+            if generation.process is not None and generation.process not in processes:
+                processes.append(generation.process)
+        for process in processes:
+            if process.poll() is None:
+                _terminate_process_tree(process)
         generation.completed = True
         generation.stalled = False
         generation.awaiting_input = False
@@ -2006,7 +2024,7 @@ class GeneratorManager:
             command, cwd=workdir, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE, bufsize=1, env=environment, encoding="utf-8", errors="replace",
         )
-        generation.process = process
+        generation.register_process(process)
         assert process.stdout is not None
         assert process.stdin is not None
         process.stdin.write(f"{COMPACTION_PROMPT}\n\n待压缩原始上下文：\n{context}")
@@ -2048,6 +2066,7 @@ class GeneratorManager:
             code = process.wait()
         finally:
             timer.cancel()
+            generation.unregister_process(process)
             self._write_opencode_log(generation, {
                 "call_id": call_id,
                 "purpose": "上下文提炼",
@@ -2156,7 +2175,7 @@ class GeneratorManager:
                 "error": _redact_log_text(str(exc)),
             })
             raise
-        generation.process = current_process
+        generation.register_process(current_process)
         assert current_process.stdout is not None
         assert current_process.stdin is not None
         current_process.stdin.write(prompt)
@@ -2168,10 +2187,12 @@ class GeneratorManager:
             if current_process.poll() is None:
                 _terminate_process_tree(current_process)
 
-        call_timeout = timeout_seconds or _invoke_timeout_seconds()
-        timer = threading.Timer(call_timeout, stop_timed_out_process)
-        timer.daemon = True
-        timer.start()
+        call_timeout = _invoke_timeout_seconds() if timeout_seconds is None else max(0, int(timeout_seconds))
+        timer: threading.Timer | None = None
+        if call_timeout > 0:
+            timer = threading.Timer(call_timeout, stop_timed_out_process)
+            timer.daemon = True
+            timer.start()
         retry_metadata = {
             "attempt": call_attempt,
             **({"previous_call_id": previous_call_id} if previous_call_id else {}),
@@ -2236,7 +2257,9 @@ class GeneratorManager:
                         })
             code = current_process.wait()
         finally:
-            timer.cancel()
+            if timer is not None:
+                timer.cancel()
+            generation.unregister_process(current_process)
             activity_metrics = {
                 "output_chars": len(assistant_text),
                 "diagnostics": [_redact_log_text(item) for item in diagnostics[-10:]],
@@ -2707,28 +2730,26 @@ def _redact_log_value(value: Any) -> Any:
 
 
 def _invoke_timeout_seconds() -> int:
+    """Return model-call deadline in seconds; zero means user-cancel only."""
     try:
-        return max(30, min(int(os.environ.get("OPENCODE_GENERATOR_CALL_TIMEOUT", "120")), 1800))
+        configured = int(os.environ.get("OPENCODE_GENERATOR_CALL_TIMEOUT", "0"))
+        return 0 if configured == 0 else max(30, min(configured, 1800))
     except ValueError:
-        return 120
+        return 0
 
 
 def _planning_timeout_seconds() -> int:
-    """Planning calls stay bounded; repair calls use separate shorter bound."""
+    """Planning calls have no deadline unless explicitly configured."""
     return _invoke_timeout_seconds()
 
 
 def _repair_timeout_seconds() -> int:
-    """Keep optimization repair attempts short enough to fail fast.
-
-    Repair prompts are bounded and should not hold the whole optimization loop
-    hostage to a slow model. Set OPENCODE_REPAIR_CALL_TIMEOUT to opt into a
-    different bound (30..600 seconds).
-    """
+    """Return repair-call deadline; zero lets model continue until completion."""
     try:
-        return max(30, min(int(os.environ.get("OPENCODE_REPAIR_CALL_TIMEOUT", "60")), 600))
+        configured = int(os.environ.get("OPENCODE_REPAIR_CALL_TIMEOUT", "0"))
+        return 0 if configured == 0 else max(30, min(configured, 600))
     except ValueError:
-        return 60
+        return 0
 
 
 def _model_timeout_retry_limit() -> int:

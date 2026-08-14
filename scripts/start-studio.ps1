@@ -98,6 +98,6 @@ if (-not $SkipHarness -and (Test-Path -LiteralPath $registerScript)) {
 
 $env:AGENT_HARNESS_URL = $HarnessUrl
 $env:AGENT_HARNESS_TASK_TOKEN = $TaskTokenLine.Split("=", 2)[1]
-if ($GeneratorMode) { $env:OPENAGENT_GENERATOR_MODE = $GeneratorMode }
+$env:OPENAGENT_GENERATOR_MODE = if ($GeneratorMode) { $GeneratorMode } else { "agent_loop" }
 $PythonBin = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 & $PythonBin -m openagent_studio.app
