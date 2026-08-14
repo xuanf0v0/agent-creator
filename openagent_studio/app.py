@@ -18,6 +18,7 @@ from .creator import CreatorHarness
 from .creator.routes import router as creator_router
 from .harness_client import DEFAULT_BACKEND_ID, create_harness_client
 from .models import ProjectSpec, WorkflowSpec
+from .provider_settings import ProviderSettingsStore, ProviderSettingsUpdate
 from .store import SpecStore
 from .workflow_validation import workflow_delete_blockers
 from .generator import GeneratorManager
@@ -27,7 +28,13 @@ from .platform_integrations import PlatformIntegrationManager
 
 def create_app(spec_path: Path | None = None) -> FastAPI:
     store = SpecStore(spec_path or Path(os.environ.get("OPENAGENT_SPEC", "project.yaml")))
-    generator = GeneratorManager(store)
+    provider_settings_path = os.environ.get("OPENAGENT_PROVIDER_SETTINGS")
+    provider_settings = ProviderSettingsStore(
+        Path(provider_settings_path).expanduser()
+        if provider_settings_path
+        else store.path.parent / ".openagent-provider-settings.json"
+    )
+    generator = GeneratorManager(store, provider_settings=provider_settings)
     workflows = WorkflowManager(os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"))
     platforms = PlatformIntegrationManager(workflows)
     creator = CreatorHarness(store, general_harness_url=os.environ.get("AGENT_HARNESS_URL", "http://127.0.0.1:8765"), generator=generator)
@@ -40,6 +47,7 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
 
     app = FastAPI(title="OpenAgent Studio", version="0.1.0", lifespan=lifespan)
     app.state.store = store
+    app.state.provider_settings = provider_settings
     app.state.generator_manager = generator
     app.state.workflow_manager = workflows
     app.state.platform_integration_manager = platforms
@@ -84,6 +92,28 @@ def create_app(spec_path: Path | None = None) -> FastAPI:
             "permissions": [{"value": "allow", "label": "自动允许"}, {"value": "ask", "label": "每次询问"}, {"value": "deny", "label": "禁止"}],
             "runtime_types": [{"value": "service", "label": "后台服务"}, {"value": "task", "label": "一次性任务"}],
         }
+
+    @app.get("/api/settings/provider")
+    def get_provider_settings():
+        try:
+            return provider_settings.public()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.put("/api/settings/provider")
+    def put_provider_settings(payload: ProviderSettingsUpdate):
+        try:
+            settings = provider_settings.save(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return provider_settings.public() | {"model_ref": settings.model_ref}
+
+    @app.delete("/api/settings/provider")
+    def delete_provider_settings():
+        provider_settings.clear()
+        return provider_settings.public()
 
     @app.get("/api/workflows")
     def list_workflows():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from .evaluation import CandidateResult, HarnessInfrastructureError, SemanticVer
 from .creator.chains import command_chain_catalog_text
 from .models import WORKFLOW_NODE_TYPES, EvaluationCase, WorkflowEvaluation, WorkflowSpec
 from .process_utils import resolve_executable
+from .provider_settings import ProviderSettingsStore
 from .store import SpecStore
 from .workflow_runner import EvaluationPolicy, TERMINAL_RUN_STATES, WorkflowManager, validate_executable_workflow
 
@@ -357,8 +359,12 @@ class _BuildProgressGuard:
 
 
 class GeneratorManager:
-    def __init__(self, store: SpecStore, max_generations: int = 100, max_history_messages: int = 100, max_generation_events: int = 1000, max_concurrent_generations: int = 4):
+    def __init__(self, store: SpecStore, max_generations: int = 100, max_history_messages: int = 100, max_generation_events: int = 1000, max_concurrent_generations: int = 4, provider_settings: ProviderSettingsStore | None = None):
         self.store = store
+        settings_path = os.environ.get("OPENAGENT_PROVIDER_SETTINGS")
+        self.provider_settings = provider_settings or ProviderSettingsStore(
+            Path(settings_path).expanduser() if settings_path else store.path.parent / ".openagent-provider-settings.json"
+        )
         self.max_concurrent_generations = max(1, max_concurrent_generations)
         self.max_generations = max(1, max_generations)
         self.max_history_messages = max(1, max_history_messages)
@@ -373,6 +379,9 @@ class GeneratorManager:
 
     def model(self, spec: Any | None = None) -> str:
         project = spec or self.store.load()
+        settings = self.provider_settings.load()
+        if settings is not None:
+            return settings.model_ref
         model = os.environ.get("OPENCODE_GENERATOR_MODEL") or next((agent.model for agent in project.agents if agent.model), None)
         if not model:
             raise RuntimeError("未配置 OpenCode 生成模型，请设置 OPENCODE_GENERATOR_MODEL 或 agents[].model")
@@ -388,14 +397,17 @@ class GeneratorManager:
             resolved_binary = resolve_executable(binary, self._environment(project))
         except FileNotFoundError as exc:
             binary_error = str(exc)
+        settings = self.provider_settings.load()
         provider_id = model.split("/", 1)[0] if "/" in model else ""
         provider = next((item for item in project.providers if item.id == provider_id), None)
-        credential_env = provider.api_key_env if provider else None
-        credential_ready = not credential_env or bool(self._environment(project).get(credential_env))
+        credential_env = None if settings is not None else (provider.api_key_env if provider else None)
+        credential_ready = True if settings is not None else not credential_env or bool(self._environment(project).get(credential_env))
         return {
             "backend": "opencode", "binary": resolved_binary or binary, "binary_ready": bool(resolved_binary),
             "binary_error": binary_error, "model": model, "ready": credential_ready and bool(resolved_binary),
             "credential_env": credential_env,
+            "provider_settings_configured": settings is not None,
+            "provider_protocol": settings.protocol if settings is not None else None,
         }
 
     def ensure_ready(self, spec: Any | None = None) -> dict[str, Any]:
@@ -406,8 +418,7 @@ class GeneratorManager:
             raise RuntimeError(f"真实模型 {status['model']} 缺少环境变量 {status['credential_env']}")
         return status
 
-    @staticmethod
-    def _environment(spec: Any) -> dict[str, str]:
+    def _environment(self, spec: Any) -> dict[str, str]:
         environment = os.environ.copy()
         model = os.environ.get("OPENCODE_GENERATOR_MODEL") or next((agent.model for agent in spec.agents if agent.model), "")
         provider_id = model.split("/", 1)[0] if "/" in model else ""
@@ -423,6 +434,7 @@ class GeneratorManager:
                     key, value = key.strip(), value.strip().strip("'\"")
                     if key and not environment.get(key):
                         environment[key] = value
+        environment.update(self.provider_settings.environment_overrides())
         return environment
 
     def create(self, message: str, *, workflow_id: str, name: str | None = None, direct: bool = False) -> Generation:
@@ -802,7 +814,9 @@ class GeneratorManager:
                 "case_ids": sorted(failed_case_ids),
             })
             focused = evaluator.evaluate(
-                project, candidate, iteration, case_ids=set(failed_case_ids), on_case=emit_case,
+                project, candidate, iteration,
+                case_ids=set(failed_case_ids),
+                **({"on_case": emit_case} if "on_case" in inspect.signature(evaluator.evaluate).parameters else {}),
             )
             if not focused.passed:
                 return focused, {
@@ -812,7 +826,10 @@ class GeneratorManager:
                 "stage": "final_regression",
                 "iteration": iteration,
             })
-        result = evaluator.evaluate(project, candidate, iteration, on_case=emit_case)
+        result = evaluator.evaluate(
+            project, candidate, iteration,
+            **({"on_case": emit_case} if "on_case" in inspect.signature(evaluator.evaluate).parameters else {}),
+        )
         return result, {case.case_id for case in result.cases if not case.passed}
 
     def _build_creation(

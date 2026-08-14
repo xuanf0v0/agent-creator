@@ -15,6 +15,8 @@ frontend/dist/
 .harness/PROGRESS.md
 .harness/agent-harness/
 .openagent-logs/
+.openagent-provider-settings.json
+.openagent-provider-settings.*.tmp
 .claude/worktrees/
 # 本地化 Harness 运行目录（含密钥 .runtime.env、.venv、state.db）
 my-harness/

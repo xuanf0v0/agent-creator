@@ -182,6 +182,181 @@ workflows:
       approvals: {}
       mocks: []
       timeout_seconds: 90
+- id: workflow-78d4b5
+  name: 代码审查工作流：分析→审批→测试
+  nodes:
+  - id: manual_trigger
+    type: manual_trigger
+    data:
+      input_label: 待审查代码
+      description: 粘贴或提供待审查的代码作为工作流输入
+    position:
+      x: 0.0
+      y: 0.0
+  - id: code_analyze
+    type: agent
+    data:
+      agent_id: coding
+      prompt: 审查输入的目标代码 {{input}}。请执行代码审查并输出：1) 总体评价；2) 发现的问题列表（含严重级别）；3) 具体修改建议；4)
+        是否建议批准。仅处理输入代码，不要扫描仓库。
+      description: code_analyze
+    position:
+      x: 0.0
+      y: 150.0
+  - id: human_approval
+    type: approval
+    data:
+      title: 代码审查人工审批
+      description: 请审批上方代码分析结论：批准后将继续运行测试，拒绝则终止流程。
+    position:
+      x: 0.0
+      y: 300.0
+  - id: approval_check
+    type: condition
+    data:
+      expression: latest.approved == true
+      description: approval_check
+    position:
+      x: 0.0
+      y: 450.0
+  - id: run_tests
+    type: agent
+    data:
+      agent_id: test-runner
+      prompt: 根据输入 {{input}} 与审查结论 {{nodes.code_analyze}}，运行仓库测试命令并报告执行结果；若测试失败，列出失败用例与原因。
+      description: run_tests
+    position:
+      x: 300.0
+      y: 450.0
+  - id: output_pass
+    type: output
+    data:
+      template: 代码审查通过。审查结论：{{nodes.code_analyze}}；人工审批：{{nodes.human_approval}}；测试执行结果：{{nodes.run_tests}}。
+      description: output_pass
+    position:
+      x: 300.0
+      y: 600.0
+  - id: output_reject
+    type: output
+    data:
+      template: 代码审查未通过，流程终止。审批结果：{{nodes.human_approval}}；审查结论：{{nodes.code_analyze}}。
+      description: output_reject
+    position:
+      x: 0.0
+      y: 600.0
+  edges:
+  - source: manual_trigger
+    target: code_analyze
+  - source: code_analyze
+    target: human_approval
+  - source: human_approval
+    target: approval_check
+  - source: approval_check
+    target: run_tests
+    condition: 'true'
+  - source: approval_check
+    target: output_reject
+    condition: 'false'
+  - source: run_tests
+    target: output_pass
+  evaluation:
+    cases:
+    - id: cr-normal-full-flow
+      name: 正常流程：分析→审批通过→测试→通过输出
+      enabled: true
+      input: "待审查代码：\ndef add(a, b):\n    return a + b\n\nresult = add(1, 2)\ndef\
+        \ divide(a, b):\n    return a / b"
+      assertions:
+      - path: output
+        operator: exists
+      - path: output
+        operator: contains
+        expected: 代码审查通过
+      semantic_criteria:
+      - 输出明确给出通过结论
+      - 输出包含审查结论、审批结果与测试执行结果
+      - 审批节点状态为已批准时走测试分支
+      approvals:
+        human_approval: true
+      mocks:
+      - node_id: code_analyze
+        response:
+          overall: 代码结构清晰，存在除零未处理风险
+          issues:
+          - level: warning
+            message: divide 函数未处理除零异常
+          suggestions:
+          - 为除零增加防御性检查
+          approved: true
+      - node_id: run_tests
+        response:
+          status: passed
+          summary: 2 个用例全部通过
+          failed: []
+      timeout_seconds: 300
+    - id: cr-boundary-minimal-input
+      name: 边界流程：最小输入代码仍走完整通过链路
+      enabled: true
+      input: '待审查代码：
+
+        x = 1
+
+        print(x)'
+      assertions:
+      - path: output
+        operator: exists
+      - path: output
+        operator: contains
+        expected: 代码审查通过
+      semantic_criteria:
+      - 最小合法输入也能走通分析、审批、测试完整链路
+      - 输出不因输入简短而缺失模板字段
+      approvals:
+        human_approval: true
+      mocks:
+      - node_id: code_analyze
+        response:
+          overall: 简单脚本，无实质问题
+          issues: []
+          suggestions: []
+          approved: true
+      - node_id: run_tests
+        response:
+          status: passed
+          summary: 无测试文件，视为通过
+          failed: []
+      timeout_seconds: 300
+    - id: cr-failure-approval-rejected
+      name: 失败风险：审批拒绝后终止流程并输出拒绝结果
+      enabled: true
+      input: "待审查代码：\ndef fetch_data(url):\n    import requests\n    return requests.get(url,\
+        \ timeout=60).json()"
+      assertions:
+      - path: output
+        operator: exists
+      - path: output
+        operator: contains
+        expected: 代码审查未通过
+      semantic_criteria:
+      - 审批拒绝时条件分支走 false 路径
+      - 输出包含审批结果与审查结论
+      - 流程在拒绝后终止，不执行测试节点
+      approvals:
+        human_approval: false
+      mocks:
+      - node_id: code_analyze
+        response:
+          overall: 存在明显质量问题：同步请求阻塞、超时过长、无错误处理
+          issues:
+          - level: critical
+            message: 网络错误与超时未捕获
+          - level: warning
+            message: 同步请求阻塞主线程
+          suggestions:
+          - 使用异步请求并捕获异常
+          - 缩短超时并增加重试
+          approved: false
+      timeout_seconds: 300
 integrations:
   feishu:
   - id: main

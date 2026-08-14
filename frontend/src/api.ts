@@ -1,4 +1,4 @@
-import type { AgentCapability, IntegrationsStatus, NodeTypeInfo, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
+import type { AgentCapability, IntegrationsStatus, NodeTypeInfo, ProjectSpec, ProviderSettings, ProviderProtocol, RuntimeStatus, Workflow, WorkflowRun } from './types'
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) {
@@ -23,7 +23,7 @@ export async function saveWorkflow(workflow: Workflow, etag: string) {
 }
 
 export function loadGeneratorStatus() {
-  return jsonRequest<{ backend: 'opencode'; binary: string; model: string; ready: boolean; credential_env?: string }>('/api/generator/status')
+  return jsonRequest<{ backend: 'opencode'; binary: string; binary_error?: string; model: string; ready: boolean; credential_env?: string }>('/api/generator/status')
 }
 
 export function loadIntegrationsStatus() {
@@ -32,6 +32,20 @@ export function loadIntegrationsStatus() {
 
 export function loadRuntimeStatus() {
   return jsonRequest<RuntimeStatus>('/api/runtime/status')
+}
+
+export function loadProviderSettings() {
+  return jsonRequest<ProviderSettings>('/api/settings/provider')
+}
+
+export function saveProviderSettings(payload: { protocol: ProviderProtocol; base_url: string; model: string; api_key?: string; clear_api_key?: boolean }) {
+  return jsonRequest<ProviderSettings>('/api/settings/provider', {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+  })
+}
+
+export function clearProviderSettings() {
+  return jsonRequest<ProviderSettings>('/api/settings/provider', { method: 'DELETE' })
 }
 
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {

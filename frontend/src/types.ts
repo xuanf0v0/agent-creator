@@ -13,6 +13,17 @@ export type WorkflowRun = { id: string; workflow_id: string; status: 'queued' | 
 export type IntegrationStatus = { id: string; name: string; workflow_id: string; ready: boolean; missing_env: string[]; auto_reply: boolean }
 export type IntegrationsStatus = { feishu: IntegrationStatus[]; qq: IntegrationStatus[] }
 export type RuntimeStatus = { running: boolean; backends: Record<string, { actionable_error?: string; identity_mismatch?: string[]; readiness?: Record<string, { state?: string; error_code?: string; accepts_tasks?: boolean }>; task_agent_error?: string }> }
+export type ProviderProtocol = 'openai-responses' | 'openai-chat' | 'anthropic-messages'
+export type ProviderSettings = {
+  configured: boolean
+  provider: 'openai' | 'anthropic'
+  protocol: ProviderProtocol
+  base_url: string
+  model: string
+  api_key_configured: boolean
+  api_key_masked: string
+  model_ref?: string
+}
 
 // Creator Harness types
 export type NodeTypeInfo = {

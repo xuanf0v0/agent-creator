@@ -4,14 +4,21 @@ import {
   SelectionMode, addEdge, applyEdgeChanges, applyNodeChanges, getBezierPath, useReactFlow,
   type Connection, type Edge, type EdgeChange, type EdgeProps, type EdgeTypes, type Node, type NodeChange, type NodeProps, type NodeTypes,
 } from '@xyflow/react'
-import { ApiError, cancelCreatorGeneration, cancelWorkflowRun, loadCreatorAgents, loadCreatorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadNodeTypes, loadRuntimeStatus, loadSpec, loadWorkflowRun, resolveApproval, saveWorkflow, sendCreatorDecide, startWorkflowRun } from './api'
-import type { AgentCapability, EvaluationCase, IntegrationsStatus, NodeKind, NodeTypeInfo, ProjectSpec, RuntimeStatus, Workflow, WorkflowRun } from './types'
+import { ApiError, cancelCreatorGeneration, cancelWorkflowRun, clearProviderSettings, loadCreatorAgents, loadCreatorMessages, loadGeneratorStatus, loadIntegrationsStatus, loadNodeTypes, loadProviderSettings, loadRuntimeStatus, loadSpec, loadWorkflowRun, resolveApproval, saveProviderSettings, saveWorkflow, sendCreatorDecide, startWorkflowRun } from './api'
+import type { AgentCapability, EvaluationCase, IntegrationsStatus, NodeKind, NodeTypeInfo, ProjectSpec, ProviderProtocol, ProviderSettings, RuntimeStatus, Workflow, WorkflowRun } from './types'
 
 type CanvasData = { label: string; description: string; kind: NodeKind; icon: string; typeLabel: string; category: string; agent_id?: string; [key: string]: unknown }
 type CanvasNode = Node<CanvasData>
 type ChatMessage = { role: 'user' | 'assistant' | 'system'; content: string; options?: string[] }
 type ConsoleLogEntry = { time: string; kind: string; text: string }
 type ModelStatus = { model: string; activeCall: string | null; outputChars: number; startedAt: number | null }
+type ProviderSettingsForm = { protocol: ProviderProtocol; base_url: string; model: string; api_key: string; clear_api_key: boolean }
+
+const providerProtocolOptions: Array<{ value: ProviderProtocol; label: string; hint: string }> = [
+  { value: 'openai-responses', label: 'OpenAI Responses API', hint: 'OpenAI 原生 Responses 接口' },
+  { value: 'openai-chat', label: 'OpenAI Chat Completions / Compatible', hint: 'OpenAI Chat Completions 与兼容网关' },
+  { value: 'anthropic-messages', label: 'Anthropic Messages API', hint: 'Anthropic 原生 Messages 接口' },
+]
 
 // Default fallback node catalog (used before loading from backend)
 const defaultNodeCatalog: NodeTypeInfo[] = [
@@ -172,6 +179,11 @@ function StudioCanvas() {
   const [consoleOpen, setConsoleOpen] = useState(false)
   const [generationLog, setGenerationLog] = useState<ConsoleLogEntry[]>([])
   const [modelStatus, setModelStatus] = useState<ModelStatus>({ model: '', activeCall: null, outputChars: 0, startedAt: null })
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [providerSettings, setProviderSettings] = useState<ProviderSettings | null>(null)
+  const [settingsForm, setSettingsForm] = useState<ProviderSettingsForm>({ protocol: 'openai-chat', base_url: '', model: 'gpt-4o-mini', api_key: '', clear_api_key: false })
+  const [settingsSaving, setSettingsSaving] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
   const generationSource = useRef<EventSource | null>(null)
   const runSource = useRef<EventSource | null>(null)
   const chatDeltaFrame = useRef<number | null>(null)
@@ -218,7 +230,18 @@ function StudioCanvas() {
     }).catch((error: Error) => setMessage(error.message))
   }, [openWorkflow])
 
-  useEffect(() => { loadGeneratorStatus().then((status) => setGeneratorModel(status.ready ? status.model : `${status.model}（缺少 ${status.credential_env}）`)).catch((error: Error) => setGeneratorModel(error.message)) }, [])
+  useEffect(() => { loadGeneratorStatus().then((status) => setGeneratorModel(status.ready ? status.model : `${status.model}（${status.binary_error || `缺少 ${status.credential_env || 'API key'}`}）`)).catch((error: Error) => setGeneratorModel(error.message)) }, [])
+  useEffect(() => {
+    loadProviderSettings().then((settings) => {
+      setProviderSettings(settings)
+      setSettingsForm((current) => ({
+        ...current,
+        protocol: settings.protocol,
+        base_url: settings.base_url,
+        model: settings.model,
+      }))
+    }).catch(() => setProviderSettings(null))
+  }, [])
   useEffect(() => { loadIntegrationsStatus().then(setIntegrations).catch(() => setIntegrations({ feishu: [], qq: [] })) }, [])
   useEffect(() => { loadRuntimeStatus().then(setRuntimeStatus).catch(() => setRuntimeStatus(null)) }, [])
   // Creator Harness: load dynamic node types and agent capabilities
@@ -725,6 +748,76 @@ function StudioCanvas() {
     catch (error) { setMessage(error instanceof Error ? error.message : '审批失败') }
   }
 
+  async function refreshGeneratorStatus() {
+    try {
+      const status = await loadGeneratorStatus()
+      setGeneratorModel(status.ready ? status.model : `${status.model}（${status.binary_error || `缺少 ${status.credential_env || 'API key'}`}）`)
+    } catch (error) {
+      setGeneratorModel(error instanceof Error ? error.message : '无法读取模型状态')
+    }
+  }
+
+  async function openProviderSettings() {
+    setSettingsOpen(true)
+    setSettingsError('')
+    try {
+      const settings = await loadProviderSettings()
+      setProviderSettings(settings)
+      setSettingsForm({ protocol: settings.protocol, base_url: settings.base_url, model: settings.model, api_key: '', clear_api_key: false })
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : '无法读取全局模型设置')
+    }
+  }
+
+  async function submitProviderSettings() {
+    if (!settingsForm.base_url.trim() || !settingsForm.model.trim()) {
+      setSettingsError('Base URL 和模型编号不能为空')
+      return
+    }
+    if (!providerSettings?.api_key_configured && !settingsForm.api_key.trim()) {
+      setSettingsError('首次配置必须填写 API key')
+      return
+    }
+    setSettingsSaving(true)
+    setSettingsError('')
+    try {
+      const saved = await saveProviderSettings({
+        protocol: settingsForm.protocol,
+        base_url: settingsForm.base_url.trim(),
+        model: settingsForm.model.trim(),
+        ...(settingsForm.api_key.trim() ? { api_key: settingsForm.api_key.trim() } : {}),
+        clear_api_key: settingsForm.clear_api_key,
+      })
+      setProviderSettings(saved)
+      setSettingsForm((current) => ({ ...current, api_key: '', clear_api_key: false }))
+      await refreshGeneratorStatus()
+      setSettingsOpen(false)
+      setMessage('全局模型设置已保存；后续 OpenCode 调用将使用新配置')
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : '保存全局模型设置失败')
+    } finally {
+      setSettingsSaving(false)
+    }
+  }
+
+  async function restoreProjectProviderSettings() {
+    if (!window.confirm('恢复 project.yaml / opencode.json 中的原有模型配置？')) return
+    setSettingsSaving(true)
+    setSettingsError('')
+    try {
+      const restored = await clearProviderSettings()
+      setProviderSettings(restored)
+      setSettingsForm({ protocol: restored.protocol, base_url: restored.base_url, model: restored.model, api_key: '', clear_api_key: false })
+      await refreshGeneratorStatus()
+      setSettingsOpen(false)
+      setMessage('已恢复项目原有模型配置')
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : '恢复项目模型配置失败')
+    } finally {
+      setSettingsSaving(false)
+    }
+  }
+
   return <div className="studio-shell">
     <video className="workspace-video" autoPlay loop muted playsInline preload="metadata" aria-hidden="true">
       <source src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260315_073750_51473149-4350-4920-ae24-c8214286f323.mp4" type="video/mp4"/>
@@ -737,6 +830,7 @@ function StudioCanvas() {
         <select value={workflowId} disabled={!!stalledGenerationId} onChange={(event) => spec && openWorkflow(spec, event.target.value)}>
           {spec?.workflows.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
         </select>
+        <button className="settings-launch" onClick={() => void openProviderSettings()} aria-label="打开全局模型设置">⚙ 全局设置</button>
         <button className="ghost" onClick={() => fitView({ padding: 0.22 })}>适应画布</button>
         <button className="ghost" disabled={!!generationId || !!stalledGenerationId || !workflow} onClick={optimizeCurrent}>优化当前工作流</button>
         <button className="opencode-launch" onClick={() => setRightTab('chat')}>✦ OpenCode 创建</button>
@@ -873,6 +967,32 @@ function StudioCanvas() {
         {generationLog.length === 0 && <div className="console-empty">暂无日志。启动一次 AI 创建或优化后，这里会实时显示模型调用过程与输出。</div>}
         {generationLog.map((item, index) => <div key={index} className={`console-log-line ${item.kind}`}><span className="console-log-time">{item.time}</span><span className="console-log-kind">{item.kind}</span><span className="console-log-text">{item.text}</span></div>)}
       </div>
+    </div>}
+    {settingsOpen && <div className="settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !settingsSaving) setSettingsOpen(false) }}>
+      <section className="settings-modal structural-glass" role="dialog" aria-modal="true" aria-labelledby="provider-settings-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="settings-modal-head">
+          <div><strong id="provider-settings-title">全局模型设置</strong><small>OpenCode 创作助手使用的 provider</small></div>
+          <button type="button" className="settings-close" onClick={() => setSettingsOpen(false)} disabled={settingsSaving} aria-label="关闭全局模型设置">×</button>
+        </div>
+        <form className="settings-form" onSubmit={(event) => { event.preventDefault(); void submitProviderSettings() }}>
+          <label>协议<select value={settingsForm.protocol} onChange={(event) => setSettingsForm((current) => ({ ...current, protocol: event.target.value as ProviderProtocol }))}>
+            {providerProtocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select></label>
+          <small className="settings-hint">{providerProtocolOptions.find((option) => option.value === settingsForm.protocol)?.hint}</small>
+          <label>Base URL<input value={settingsForm.base_url} onChange={(event) => setSettingsForm((current) => ({ ...current, base_url: event.target.value }))} placeholder={settingsForm.protocol === 'anthropic-messages' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'} autoComplete="url"/></label>
+          <label>模型编号<input value={settingsForm.model} onChange={(event) => setSettingsForm((current) => ({ ...current, model: event.target.value }))} placeholder={settingsForm.protocol === 'anthropic-messages' ? 'claude-sonnet-4-20250514' : 'gpt-4o-mini'} autoComplete="off"/></label>
+          <label>API key<input type="password" value={settingsForm.api_key} onChange={(event) => setSettingsForm((current) => ({ ...current, api_key: event.target.value }))} placeholder={providerSettings?.api_key_configured ? '已保存；留空保持不变' : '输入 API key'} autoComplete="new-password"/></label>
+          {providerSettings?.api_key_configured && <small className="settings-hint">当前密钥：{providerSettings.api_key_masked}。输入新值可替换。</small>}
+          <div className="settings-security-note">密钥只保存在本机后端设置文件，运行时注入 OpenCode 子进程；不会写入 project.yaml、opencode.json 或前端本地存储。</div>
+          {settingsError && <div className="settings-error" role="alert">{settingsError}</div>}
+          <div className="settings-actions">
+            <button type="button" className="settings-reset" onClick={() => void restoreProjectProviderSettings()} disabled={settingsSaving}>恢复项目原有配置</button>
+            <span className="settings-actions-spacer"/>
+            <button type="button" className="ghost" onClick={() => setSettingsOpen(false)} disabled={settingsSaving}>取消</button>
+            <button type="submit" className="primary" disabled={settingsSaving}>{settingsSaving ? '保存中…' : '保存设置'}</button>
+          </div>
+        </form>
+      </section>
     </div>}
   </div>
 }
