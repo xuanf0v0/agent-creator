@@ -248,7 +248,7 @@ class WorkflowGenerator:
     def _find_running_generation(self, workflow_id: str) -> Any | None:
         """查找指定工作流是否有进行中的生成。"""
         for gen in self._generations.values():
-            if gen.workflow_id == workflow_id and not gen.completed and not gen.cancelled:
+            if gen.workflow_id == workflow_id and (not gen.completed or getattr(gen, "awaiting_input", False)) and not gen.cancelled:
                 return gen
         return None
 
@@ -256,6 +256,8 @@ class WorkflowGenerator:
         """获取生成状态字符串。"""
         if generation.cancelled:
             return "cancelled"
+        if getattr(generation, "awaiting_input", False):
+            return "waiting_input"
         if generation.completed:
             return "completed"
         if generation.stalled:
@@ -272,6 +274,8 @@ class WorkflowGenerator:
             "workflow_id": generation.workflow_id,
             "status": self._generation_status(generation),
             "stalled": generation.stalled,
+            "awaiting_input": getattr(generation, "awaiting_input", False),
+            "question": getattr(generation, "question", None),
             "cancelled": generation.cancelled,
             "completed": generation.completed,
             "mode": generation.mode,
@@ -301,7 +305,7 @@ class WorkflowGenerator:
     def get_chat_status(self, workflow_id: str) -> dict[str, Any]:
         """获取工作流的聊天状态（用于是否需要显示聊天面板）。"""
         generations = self.list_generations(workflow_id)
-        active = [g for g in generations if g["status"] == "running"]
+        active = [g for g in generations if g["status"] in {"running", "waiting_input"}]
         return {
             "has_history": len(self.get_messages(workflow_id)) > 0,
             "active_generation": active[0] if active else None,

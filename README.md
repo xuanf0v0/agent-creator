@@ -9,7 +9,7 @@
 - 编译 OpenCode 配置，并通过独立 `agent-harness-sdk` 调用稳定 `/api/v1`；
 - React + TypeScript + React Flow 正规前端；
 - 画布式节点拖放、连线、属性编辑、缩放和小地图；
-- OpenCode 驱动的 AI 对话生成器，按节点和层级增量构建，并只保存真实运行通过的完整工作流；
+- OpenCode 驱动的 AI 对话生成器，按 LLM Agent Loop 自主编排 DAG，并只保存真实运行通过的完整工作流；
 - 接入独立 my-harness 的 Workflow 执行器，支持任务提交、状态、日志、结果和取消；
 - 条件分支、并行调度、有限循环、人工审批、验证器、输出聚合和运行取消；
 - 基于 SSE 的实时节点状态、Harness 任务进度和运行事件面板。
@@ -109,8 +109,8 @@ Windows 下会自动解开 npm 的 `opencode.cmd` shim 并直接调用真实 `op
 页面首次打开会显示 OpenCode 创作对话框；关闭后可通过顶部“OpenCode 创建”按钮或
 右侧“AI 创建”页签重新打开。创作助手支持连续对话：询问概念、当前画布、节点作用、设计建议或错误原因时会直接由真实 OpenCode 回答，不修改画布；需求不完整时会先追问，只有明确要求创建、增加、删除、连接、调整或优化工作流时才进入修改流程。
 
-进入创建或修改流程后，生成器会逐层增量构建：一次只提出一个节点或一条变更。输入、模板、变量、转换、合并和输出节点先做静态校验；AI、工具、HTTP、审批、条件、循环、子工作流和条件连线变更还会沿正式 `WorkflowManager → agent-harness-sdk → /api/v1` 路径真实探测当前层。通过后才接受该层并继续下一个节点或分支。收到 `complete` 后生成并锁定验收用例，执行完整工作流验收；完整验收失败时先复验上轮失败用例，通过后再执行一次全量回归。
-同一稳定图上连续两次出现同一节点、同类错误或无语义变化时，生成器会发送 `generation.stalled` 并暂停；新增/删除回到历史图状态时立即暂停。失败修复调用若只启动协议但没有返回文本、reasoning、工具或诊断，会在 60 秒终止后使用同一模型自动重试一次；第二次仍超时则发送 `generation.stalled`，并保留两次调用证据。页面以只读方式保留最后通过的内存草稿，可补充要求后通过 `POST /api/generator/generations/{id}/resume` 继续修复。暂停草稿不会写入 `project.yaml`；Studio 重启后草稿失效，页面会明确恢复磁盘中的原工作流。普通规划超时、首次即产生模型活动的非静默超时、Harness 基础设施和不可恢复错误仍直接失败。
+进入创建或修改流程后，默认进入 LLM Agent Loop：模型自主选择建图、改图、真实验收、诊断、修复、提问和最终化动作；服务端只做结构化协议校验、DAG 校验、Harness 工具执行和保存安全门。每次接受图变更都拒绝循环边；有限循环必须使用 `loop`/`iteration` 节点。只有当前 DAG 经过真实 `WorkflowManager → agent-harness-sdk → /api/v1` 验收且模型选择 `finalize` 后才保存。
+Agent Loop 默认不设生成迭代上限，持续到验收成功；`OPENAGENT_AGENT_LOOP_MAX_ITERATIONS` 可显式设置正数安全上限，`0` 表示持续运行。模型可输出 `ask_user`，前端显示问题，用户回答后沿同一草稿和上下文继续，不打开超时暂停对话框。任意 OpenCode 模型调用超时都保持同一模型、提示词和当前工作流上下文自动重试；设置 `OPENAGENT_MODEL_TIMEOUT_RETRIES` 为正数可注入有限超时重试预算。用户可随时点击“停止生成”；Harness 基础设施和不可恢复协议错误仍按真实错误终止。
 验收运行不写入普通运行历史。
 
 生成器通过标准输入以 UTF-8 传递提示词，不依赖 Windows 命令行长度或模型不可见的文件附件。超过
@@ -121,10 +121,10 @@ Windows 下会自动解开 npm 的 `opencode.cmd` shim 并直接调用真实 `op
 
 右侧“验收标准”可编辑真实运行输入、输出检查、语义目标、审批决策和单用例超时。确定性断言只负责在
 真实运行完成后检查输出字段、值、类型或格式，不能代替真实执行。审批节点在无人值守验收时使用用例中的
-决策；其他节点不使用 Mock。增量层探测默认最多等待 `OPENAGENT_INCREMENTAL_PROBE_TIMEOUT=120` 秒；
-`OPENAGENT_INCREMENTAL_MAX_ITERATIONS` 可设置创建或修改的最大总迭代次数，默认 100，范围 1–10000。
+决策；其他节点不使用 Mock。Agent Loop 的每次真实验收默认使用 `OPENAGENT_INCREMENTAL_PROBE_TIMEOUT=120` 秒探测边界；旧 `chain`/`incremental` 模式仍支持 `OPENAGENT_INCREMENTAL_MAX_ITERATIONS`，仅作为显式逃生舱。
 OpenCode 首次规划调用默认最多等待 120 秒（`OPENCODE_GENERATOR_CALL_TIMEOUT`，范围 30–1800）；
-修复候选默认最多等待 60 秒（`OPENCODE_REPAIR_CALL_TIMEOUT`，范围 30–600）；只有无文本、reasoning、工具和诊断的静默超时会自动重试一次，第二次仍失败则暂停并保留草稿。
+修复候选默认最多等待 60 秒（`OPENCODE_REPAIR_CALL_TIMEOUT`，范围 30–600）；每次 OpenCode 调用超时都会由同一生成任务自动继续重试。
+`OPENAGENT_MODEL_TIMEOUT_RETRIES=0`（默认）表示不设超时重试上限，正数表示允许的自动重试次数。
 每次 OpenCode 调用还会把用途、进程号、退出码、耗时、超时、诊断摘要和响应尾部写入
 `.openagent-logs/opencode.jsonl`；日志已过滤常见 Bearer/API key/token 字段，不记录完整提示词。
 可通过 `OPENAGENT_OPENCODE_LOG` 指定其他日志文件路径。日志写入失败不会改变生成任务的真实结果。

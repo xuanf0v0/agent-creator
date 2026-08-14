@@ -22,6 +22,7 @@ class FakeGeneration:
     completed: bool = False
     cancelled: bool = False
     stalled: bool = False
+    awaiting_input: bool = False
     process: Any = None
     mode: str = "modify"
     messages: list[dict[str, str]] = field(default_factory=list)
@@ -230,6 +231,17 @@ def test_find_running_generation():
     # 第二次调用应找到已有运行中的 generation 并 resume
     result = wg.generate(message="再改一下", workflow_id="flow-1")
     assert result["generation_id"] == "gen-start"  # 同一个 generation
+
+
+def test_waiting_user_generation_is_resumable():
+    store = FakeStore()
+    gm = FakeGeneratorManager()
+    wg = WorkflowGenerator(store=store, generator_manager=gm)
+    waiting = FakeGeneration(id="gen-question", workflow_id="flow-1", completed=True, awaiting_input=True)
+    wg._generations[waiting.id] = waiting
+
+    assert wg._find_running_generation("flow-1") is waiting
+    assert wg._generation_status(waiting) == "waiting_input"
 
 
 def test_generation_status_running():

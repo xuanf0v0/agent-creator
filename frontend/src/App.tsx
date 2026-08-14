@@ -173,6 +173,7 @@ function StudioCanvas() {
   const [chatInput, setChatInput] = useState('')
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [generationId, setGenerationId] = useState<string | null>(null)
+  const [waitingForAgentInput, setWaitingForAgentInput] = useState(false)
   const [stalledGenerationId, setStalledGenerationId] = useState<string | null>(null)
   const [stalledMessage, setStalledMessage] = useState('')
   const [generatorModel, setGeneratorModel] = useState('正在读取模型…')
@@ -460,6 +461,7 @@ function StudioCanvas() {
     }
     const stages: Record<string, string> = {
       understanding: 'OpenCode 正在理解问题和判断是否需要修改画布…',
+      agent_loop_turn: 'LLM Agent Loop 正在决定下一步动作…',
       checking_runtime: '正在检查 Harness 验收运行时…',
       planning_layer: '正在规划下一层节点或分支…',
       planning_creation_layer: '正在规划新工作流的下一层节点…',
@@ -517,13 +519,40 @@ function StudioCanvas() {
       setMessage(text)
       pushLog('error', text)
     })
-    listen('generation.repairing', ({ message: repairMessage, node_id, phase, attempt, attempts }) => {
-      const retry = phase === 'model_timeout' && attempt ? `（${attempt}/${attempts || 2}）` : ''
+    listen('generation.repairing', ({ message: repairMessage, node_id, phase, attempt }) => {
+      const retry = phase === 'model_timeout' && attempt ? `（第 ${attempt} 次尝试）` : ''
       const text = `${repairMessage}${retry}${node_id ? `（节点 ${node_id}）` : ''}`
       setMessage(text)
       pushLog('repair', text)
     })
-    listen('generation.stalled', ({ message: stalled, node_id, attempts, workflow: stable }) => {
+    listen('generation.agent_tool', ({ action, accepted, passed, message: toolMessage, question }) => {
+      const result = passed === true ? '验收通过' : accepted === false ? '被拒绝' : accepted === true ? '已执行' : ''
+      const text = question || toolMessage || `Agent 动作：${action}${result ? `（${result}）` : ''}`
+      setMessage(text)
+      pushLog(accepted === false ? 'error' : 'stage', text)
+    })
+    listen('generation.question', ({ question, options, workflow: waiting }) => {
+      flushChatDelta()
+      discardPreview()
+      if (waiting?.id === targetWorkflowId) applyStreamingWorkflow(waiting)
+      setChatMessages((items) => [...items, { role: 'assistant', content: question || '请补充工作流所需信息', options: Array.isArray(options) ? options : [] }])
+      setGenerationId(null)
+      setWaitingForAgentInput(true)
+      setRightTab('chat')
+      setMessage('等待你的回答，回答后 Agent Loop 将继续')
+      pushLog('stage', 'Agent 正在等待用户回答，收到后继续当前草稿')
+      closeSource()
+    })
+    listen('generation.stalled', ({ reason, message: stalled, node_id, attempts, workflow: stable }) => {
+      // Older backends could convert a model timeout into stalled. Treat that
+      // event as recoverable too, so reconnect/retry stays in the live SSE
+      // generation instead of opening a user-input dialog.
+      if (reason === 'model_timeout') {
+        const retryText = stalled || `模型调用超时，正在自动继续第 ${attempts || 2} 次尝试`
+        setMessage(retryText)
+        pushLog('repair', retryText)
+        return
+      }
       if (stable?.id === targetWorkflowId) {
         const view = toCanvas(stable, nodeCatalog)
         setNodes(view.nodes); setEdges(view.edges)
@@ -577,7 +606,7 @@ function StudioCanvas() {
       discardPreview()
       applyCompletedWorkflow(completed, tag)
       if (assistant_message) setChatMessages((items) => [...items, { role: 'assistant', content: assistant_message }])
-      setGenerationId(null); setMessage(successMessage); pushLog('done', successMessage); closeSource()
+      setGenerationId(null); setWaitingForAgentInput(false); setMessage(successMessage); pushLog('done', successMessage); closeSource()
     })
     const finishError = async (text: string) => {
       flushChatDelta()
@@ -604,9 +633,9 @@ function StudioCanvas() {
       }
     }
     listen('stream.reset', () => { void finishError('生成事件已过期，正在重新同步稳定版本') })
-    listen('generation.failed', ({ message: text }) => { void finishError(`优化失败：${text}`) })
+    listen('generation.failed', ({ message: text }) => { setWaitingForAgentInput(false); void finishError(`优化失败：${text}`) })
     listen('generation.conflict', ({ message: text }) => { void finishError(text) })
-    listen('generation.cancelled', () => { void finishError('已停止本轮优化，原工作流未改变') })
+    listen('generation.cancelled', () => { setWaitingForAgentInput(false); void finishError('已停止本轮优化，原工作流未改变') })
     source.onerror = () => { if (source.readyState === EventSource.CLOSED) { closeSource(); setGenerationId(null) } }
   }
 
@@ -615,11 +644,12 @@ function StudioCanvas() {
     if (!text || !workflowId || generationId || stalledGenerationId) return
     try {
       setMessage('正在同步完整画布给 OpenCode…')
-      if (!await persist()) return
+      if (!waitingForAgentInput && !await persist()) return
       setChatInput('')
       setChatMessages((items) => [...items.map((item) => item.options ? { ...item, options: undefined } : item), { role: 'user', content: text }])
       setMessage('Creator Harness 正在分析意图…')
       const result = await sendCreatorDecide(text, workflowId)
+      setWaitingForAgentInput(false)
       // 闲聊回复 — 直接显示，不启动生成
       if (result.action === 'chat_reply') {
         setChatMessages((items) => [...items, { role: 'assistant', content: result.reply as string }])
@@ -915,7 +945,7 @@ function StudioCanvas() {
         <div className="generator-title"><span className="ai-orb">✦</span><div><strong>OpenCode 创作助手</strong><small>真实模型：{generatorModel}</small></div></div>
         <div className="chat-messages">
           {chatMessages.length === 0 && <div className="chat-empty"><p>你可以这样说：</p><button onClick={() => setChatInput('创建一个代码审查流程，先分析代码，再人工审批，最后运行测试')}>创建代码审查流程</button><button onClick={() => setChatInput('在当前流程的验证前增加一个人工审批节点')}>增量修改当前流程</button></div>}
-          {chatMessages.map((item, index) => <div key={index} className={`chat-message ${item.role}`}><span>{item.role === 'user' ? '你' : item.role === 'assistant' ? 'AI' : '!'}</span><div className="chat-message-body"><p>{item.content}</p>{item.options?.length === 3 && index === chatMessages.length - 1 && <div className="chat-options">{item.options.map((option) => <button key={option} disabled={!!generationId || !!stalledGenerationId} onClick={() => void generateFromChat(option)}>{option}</button>)}<small>或在下方输入你的自定义答案</small></div>}</div></div>)}
+          {chatMessages.map((item, index) => <div key={index} className={`chat-message ${item.role}`}><span>{item.role === 'user' ? '你' : item.role === 'assistant' ? 'AI' : '!'}</span><div className="chat-message-body"><p>{item.content}</p>{item.options && item.options.length > 0 && index === chatMessages.length - 1 && <div className="chat-options">{item.options.map((option) => <button key={option} disabled={!!generationId || !!stalledGenerationId} onClick={() => void generateFromChat(option)}>{option}</button>)}<small>或在下方输入你的自定义答案</small></div>}</div></div>)}
           {generationId && <div className="thinking"><i/><i/><i/><span>OpenCode 正在思考…</span></div>}
           {stalledGenerationId && !generationId && <div className="stalled-card"><strong>生成已暂停</strong><p>{stalledMessage}</p><textarea value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder="补充具体修复方向后继续…"/><button className="send" disabled={!chatInput.trim()} onClick={() => void continueStalledGeneration()}>继续修复</button></div>}
         </div>

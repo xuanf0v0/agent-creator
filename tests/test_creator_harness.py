@@ -26,6 +26,7 @@ class FakeGeneration:
     completed: bool = False
     cancelled: bool = False
     stalled: bool = False
+    awaiting_input: bool = False
     process: Any = None
     mode: str = "modify"
     messages: list[dict[str, str]] = dataclasses.field(default_factory=list)
@@ -205,6 +206,19 @@ def test_harness_decide_modify_routes_to_generator():
     result = harness.decide("添加一个审批节点", workflow_id="flow-1")
     assert "generation_id" in result
     assert result.get("workflow_id") == "flow-1"
+
+
+def test_harness_routes_answer_to_waiting_agent_loop():
+    harness = make_harness()
+    waiting = FakeGeneration(
+        id="gen-question", workflow_id="flow-1", completed=True, awaiting_input=True,
+    )
+    harness.workflow_generator._generations[waiting.id] = waiting
+
+    result = harness.decide("需要审批", workflow_id="flow-1")
+
+    assert result["generation_id"] == "gen-question"
+    assert result["workflow_id"] == "flow-1"
 
 
 def test_harness_decide_optimize_routes_to_generator():

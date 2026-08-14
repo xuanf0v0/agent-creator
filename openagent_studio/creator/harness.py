@@ -151,6 +151,14 @@ class CreatorHarness:
         if not self._decision_engine:
             return {"error": "Decision Engine 不可用"}
 
+        # An agent question is already inside the model-driven loop. Route
+        # answer directly to the same draft before intent classification;
+        # short answers such as "需要" are not reliable intent signals.
+        if self._workflow_generator and workflow_id:
+            active = self._workflow_generator.get_chat_status(workflow_id).get("active_generation")
+            if active and active.get("status") == "waiting_input":
+                return self._workflow_generator.generate(message=message, workflow_id=workflow_id)
+
         # 步骤 1: 解析意图
         intent_result = self._decision_engine.decide(message, workflow_id, history)
 

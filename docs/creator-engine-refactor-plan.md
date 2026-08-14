@@ -115,11 +115,10 @@ finalize → 保存 → SSE 推前端                 ← 复用现有 _finalize
 
 ### Phase 3 — 意图路由 + 配置开关
 - `CreatorHarness` / `WorkflowGenerator` 按意图 + 环境变量路由模式：
-  - create → `BLUEPRINT`（直出）
-  - modify/repair → `TOOLCALLS`（默认）或 `CHAIN`（降级）
-  - optimize → `CHAIN`（`optimize_only` 保留）
-- 环境变量 `OPENAGENT_GENERATOR_MODE`（`blueprint|toolcalls|chain|incremental`）做全局默认，legacy `incremental` 保留为逃生舱。
-- 前端零改动（`sendCreatorDecide` 内部已路由）。
+  - create/modify/repair/optimize → `AGENT_LOOP`（默认）
+  - `blueprint|toolcalls|chain|incremental` 仅显式配置时使用
+- 环境变量 `OPENAGENT_GENERATOR_MODE`（`agent_loop|blueprint|toolcalls|chain|incremental`）做全局默认，legacy 模式保留为逃生舱。
+- 生成 API 与 `sendCreatorDecide` 契约保持不变；前端仅增加 Agent Loop 事件日志和 `ask_user` 回答 UI。
 
 ### Phase 4 — （可选）真·函数调用
 - 若 OpenCode 部署支持 tool definitions，把「图工具协议」升级为原生 function calling（`opencode.json` 开工具 + 服务端注册 tool handler）。这是纯增量，Phase 2 的协议层已为此预留接口。
@@ -158,15 +157,14 @@ finalize → 保存 → SSE 推前端                 ← 复用现有 _finalize
 - **Phase 1** ✅ 已完成 — `creator/chains.py` 命令链目录 + `_apply_incremental_step` 支持 `nodes` 批次 + `INCREMENTAL_STEP_PROMPT` 放宽粒度
 - **Phase 2** ✅ 已完成 — `TOOLCALLS_PROMPT` + `_build_toolcalls()`（多操作有序数组 + 逐操作校验/回填）+ `_coerce_action_list`
 - **Phase 3** ✅ 已完成 — `Generation.build_mode` 字段 + `_modify_build_mode()`（读 `OPENAGENT_GENERATOR_MODE`）+ `_run` 分发（blueprint/toolcalls/creation/incremental）
-- **Phase 4** ⏳ 进行中 — 测试已覆盖（`test_creator_chains.py`、`test_creator_toolcalls.py`），需端到端运行时验证
+- **Phase 4** ✅ 完成 — Agent Loop 默认控制 create/modify/repair/optimize；DAG 校验、显式 evaluate/finalize、ask_user/resume、超时自动重试已接入，需端到端运行时验证
 
 ### 已决策（按建议默认）
 1. 工具调用先协议式（非真 function calling）
-2. modify/repair 默认 `toolcalls`，`chain`/`incremental` 为降级/逃生舱
+2. 所有生成意图默认 `agent_loop`；旧 `toolcalls`/`chain`/`incremental` 为降级/逃生舱
 3. 保留 `incremental` 逃生舱（`OPENAGENT_GENERATOR_MODE=incremental`）
 
 ### 当前默认路由
-- create → `blueprint`（`create_direct` → `_build_direct`）
-- modify/repair → `toolcalls`（`start` → `_build_toolcalls`，`OPENAGENT_GENERATOR_MODE` 可切 `chain`/`incremental`）
-- optimize → `incremental`（`optimize` → `start(optimize_only=True)` → `_build_incrementally`）
-
+- create → `agent_loop`（`create_direct` 保留公共兼容名，内部进入 `_build_agent_loop`）
+- modify/repair → `agent_loop`（`start` → `_build_agent_loop`）
+- optimize → `agent_loop`（`optimize` → `start(optimize_only=True)` → `_build_agent_loop`）

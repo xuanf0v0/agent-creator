@@ -94,6 +94,10 @@ class _GenerationStalled(RuntimeError):
     """Generation paused with its last accepted draft kept in memory."""
 
 
+class _GenerationAwaitingInput(RuntimeError):
+    """The model explicitly requested user input; draft remains resumable."""
+
+
 _OPENCODE_LOG_LOCK = threading.Lock()
 
 
@@ -219,12 +223,15 @@ DIRECT_CREATION_PROMPT = """你是 OpenAgent Studio 的工作流直出生成器�
 最近失败证据（修复时务必先诊断并改正，再输出完整工作流）：{feedback}"""
 
 
-TOOLCALLS_PROMPT = """你是 OpenAgent Studio 的图工具调用构建器。你有权在一次响应里输出**一个或多个**图操作（有序数组），服务端会逐个校验并应用，把每个操作的结果（成功/失败原因）回填给你，你再决定下一步。
+AGENT_LOOP_PROMPT = """你是 OpenAgent Studio 的 DAG 工作流 Agent。你拥有一个持续运行的 agent loop：每次响应选择下一步动作，服务端只作为确定性工具宿主执行并返回证据；不要假设服务端会替你推进阶段。你可以反复规划、改图、验收、诊断和修复，直到真实验收通过。
 只输出 <result>{{JSON}}</result>，JSON 必须是一个**操作数组**，每个元素是以下动作之一：
 - {{"action":"add_node","nodes":[{{完整 WorkflowNode}},...],"edges":[{{"source":"...","target":"...","condition":"可选"}}],"summary":"本批目的"}}（一次可加 1~12 个语义相关节点，用命令链组织）
 - {{"action":"update_node","node":{{完整 WorkflowNode}},"edges":[{{...}}],"summary":"修复原因"}}（一次只更新一个节点）
 - {{"action":"delete_node","node_ids":["已有id",...],"summary":"批量删除原因"}}
-- {{"action":"complete","summary":"为什么当前图已完整满足目标"}}
+- {{"action":"evaluate","summary":"请求真实 Harness 验收"}}
+- {{"action":"finalize","summary":"验收已通过，保存当前 DAG"}}
+- {{"action":"ask_user","question":"必须由用户决定的问题","options":["可选答案"]}}
+- {{"action":"complete","summary":"兼容旧协议：等价于 evaluate 后立即 finalize"}}
 
 硬约束：
 1. 一次响应可以是 1 个操作，也可以是有序的多个操作（例如先 add_node 建入口，再 add_node 建审批门，再 complete）；服务端按顺序应用，前面的成功会保留，中间某步失败会回填错误让你修正。
@@ -233,14 +240,19 @@ TOOLCALLS_PROMPT = """你是 OpenAgent Studio 的图工具调用构建器。你�
 4. 失败修复阶段先诊断失败证据，用 update_node 修复原节点，严禁 delete_node 规避错误；只有用户明确要求删除才 delete_node。
 5. 节点 type 必须合法；AI 节点填 agent_id + 完整 prompt，按 capability 选择：读/搜仓库用 repository-analysis，跑测试用 test-execution，禁止交给 no-tools/text-generation。当分析/处理对象只是上游传入的代码片段、文本或数据（而非仓库文件本身）时，属于纯文本处理，必须选择 text-generation（coding）智能体，禁止因此选择 repository-analysis；只有确实需要读取、搜索、列出仓库文件时才选择 repository-analysis。
 6. condition 的 expression 引用审批结果用 latest.approved == true（禁用模板大括号），出边 condition 只能是字符串 true/false。
-7. 只有图完整（含必要分支与 output）才输出 complete。
-8. probe_input/probe_approvals 必须让本响应新增的节点被真实探测执行。
-9. 不得修改 evaluation。
+7. 只有图完整（含必要分支与 output）才请求 evaluate；evaluate 失败后必须根据真实证据继续修复。
+8. 只有 evaluate 已通过且图未被后续修改时才输出 finalize；服务端不会替你保存未验收图。
+9. 如果目标信息确实缺失，输出 ask_user；不要猜测会改变工作流结构的关键业务规则。
+10. probe_input/probe_approvals 必须让本响应新增的节点被真实探测执行。
+11. 不得修改 evaluation。
 {chains}
 可用 Harness 智能体：{catalog}
 用户完整目标：{request}
 当前已接受工作流：{workflow}
 最近失败证据（逐条诊断并修正后再继续）：{feedback}"""
+
+# Backward-compatible name for callers/tests that still refer to Phase 2.
+TOOLCALLS_PROMPT = AGENT_LOOP_PROMPT
 
 
 COMPACTION_PROMPT = """请在内部无损压缩下方的工作流生成上下文，只输出精炼后的中文上下文，不要解释压缩过程，也不要完成原任务。
@@ -282,6 +294,8 @@ class Generation:
     direct: bool = False
     build_mode: str = "incremental"
     stalled: bool = False
+    awaiting_input: bool = False
+    question: str | None = None
     last_failure: dict[str, Any] | None = None
     initial_failures: list[dict[str, Any]] = field(default_factory=list)
 
@@ -464,7 +478,7 @@ class GeneratorManager:
                 model=model,
                 mode="create",
                 direct=direct,
-                build_mode="blueprint" if direct else "incremental",
+                build_mode=_create_build_mode(),
             )
             self.generations[generation.id] = generation
             self.active[workflow_id] = generation.id
@@ -508,8 +522,10 @@ class GeneratorManager:
                 harness_agent_ids={item.id for item in spec.harness},
                 model=model,
                 optimize_only=optimize_only,
-                chat_routing=not optimize_only,
-                build_mode="incremental" if optimize_only else _modify_build_mode(),
+                # Agent Loop owns next action; intent routing remains Creator
+                # Harness entry behavior, not a second generation controller.
+                chat_routing=False,
+                build_mode=_modify_build_mode(),
             )
             self.generations[generation.id] = generation
             self.active[workflow_id] = generation.id
@@ -528,7 +544,7 @@ class GeneratorManager:
             raise ValueError("请输入继续修复所需的补充说明")
         with self._lock:
             previous = self.require(generation_id)
-            if not previous.stalled or previous.last_failure is None:
+            if not (previous.stalled or previous.awaiting_input) or previous.last_failure is None:
                 raise ValueError("这个生成任务不处于可继续修复状态")
             if self.store.etag() != previous.base_etag:
                 raise RuntimeError("工作流在暂停期间已被修改，不能继续旧草稿；请重新发起生成")
@@ -539,7 +555,8 @@ class GeneratorManager:
                     raise RuntimeError("这个工作流正在生成，请先等待或停止当前生成")
             spec = self.store.load()
             model = self.ensure_ready(spec)["model"]
-            prompt = f"{previous.prompt}\n\n用户针对暂停错误补充的修复要求：{message}"
+            context_label = "用户回答 Agent 问题" if previous.awaiting_input else "用户针对暂停错误补充的修复要求"
+            prompt = f"{previous.prompt}\n\n{context_label}：{message}"
             generation = Generation(
                 id=uuid.uuid4().hex,
                 max_events=self.max_generation_events,
@@ -576,6 +593,7 @@ class GeneratorManager:
             _terminate_process_tree(generation.process)
         generation.completed = True
         generation.stalled = False
+        generation.awaiting_input = False
         generation.emit("generation.cancelled", {"generation_id": generation.id})
         with self._lock:
             self._trim_generations_locked()
@@ -667,7 +685,11 @@ class GeneratorManager:
             if spec.harness and generation.mode != "create":
                 generation.emit("generation.stage", {"stage": "checking_runtime", "operation": generation.mode, "validation_tier": "runtime_readiness"})
                 evaluator.ensure_harness_ready({item.backend_id for item in spec.harness})
-            if generation.build_mode == "blueprint":
+            if generation.build_mode == "agent_loop":
+                winner = self._build_agent_loop(
+                    generation, spec, command, workdir, original, evaluator, catalog_json,
+                )
+            elif generation.build_mode == "blueprint":
                 winner = self._build_direct(
                     generation, spec, command, workdir, original, evaluator, catalog_json,
                 )
@@ -685,7 +707,9 @@ class GeneratorManager:
                 )
             generation.emit("generation.stage", {"stage": "saving"})
             generation.draft = winner.model_dump(mode="json")
-            if generation.build_mode == "blueprint":
+            if generation.build_mode == "agent_loop":
+                summary = "已由 LLM Agent Loop 自主规划、修复并完成 DAG 真实验收。"
+            elif generation.build_mode == "blueprint":
                 summary = "已一次性生成完整工作流，并通过静态校验与真实验收；失败时已自动反馈修复。"
             elif generation.build_mode == "toolcalls":
                 summary = "已按你的要求完成工作流调整；由模型自主规划图操作，每步校验并对受影响路径与整体结果完成探测与验收。"
@@ -698,7 +722,7 @@ class GeneratorManager:
                 generation.events[-1]["data"]["assistant_message"] = summary
                 self.history.setdefault(generation.workflow_id, []).append({"role": "assistant", "content": summary})
                 self.history[generation.workflow_id] = self.history[generation.workflow_id][-self.max_history_messages:]
-        except _GenerationStalled:
+        except (_GenerationStalled, _GenerationAwaitingInput):
             return
         except Exception as exc:
             if generation.cancelled:
@@ -708,6 +732,36 @@ class GeneratorManager:
         finally:
             with self._lock:
                 self._trim_generations_locked()
+
+    @staticmethod
+    def _await_user(
+        generation: Generation,
+        current: WorkflowSpec,
+        question: str,
+        options: Any,
+        iteration: int,
+    ) -> None:
+        generation.draft = current.model_dump(mode="json")
+        generation.awaiting_input = True
+        generation.stalled = False
+        generation.completed = True
+        generation.question = question
+        generation.last_failure = {
+            "phase": "awaiting_input",
+            "question": question,
+            "options": options if isinstance(options, list) else [],
+            "iteration": iteration,
+            "workflow": generation.draft,
+        }
+        generation.emit("generation.question", {
+            "generation_id": generation.id,
+            "workflow_id": generation.workflow_id,
+            "question": question,
+            "options": options if isinstance(options, list) else [],
+            "workflow": generation.draft,
+            "iteration": iteration,
+        })
+        raise _GenerationAwaitingInput(question)
 
     @staticmethod
     def _stall(
@@ -748,9 +802,8 @@ class GeneratorManager:
         })
         raise _GenerationStalled(message)
 
-    @classmethod
-    def _stall_for_model_timeout(
-        cls,
+    @staticmethod
+    def _record_model_timeout(
         generation: Generation,
         current: WorkflowSpec,
         error: _OpenCodeTimeoutError,
@@ -758,8 +811,8 @@ class GeneratorManager:
         accepted_layers: int,
         iteration: int,
         node_id: str | None,
-    ) -> None:
-        attempts = json.loads(json.dumps(error.timeout_attempts, ensure_ascii=False))
+    ) -> dict[str, Any]:
+        attempts = json.loads(json.dumps(error.timeout_attempts or [error.evidence()], ensure_ascii=False))
         failure = {
             "phase": "model_timeout",
             "reason": "model_timeout",
@@ -781,10 +834,16 @@ class GeneratorManager:
             "reverted": True,
             "reason": "model_timeout",
         })
-        cls._stall(
-            generation, current, failure,
-            accepted_layers=accepted_layers, iteration=iteration,
-        )
+        generation.emit("generation.repairing", {
+            "phase": "model_timeout",
+            "node_id": node_id,
+            "attempt": len(attempts) + 1,
+            "attempts": len(attempts) + 1,
+            "timeout_attempts": len(attempts),
+            "message": "模型调用超时，正在继续当前生成循环",
+            "strategy": "continue_generation",
+        })
+        return failure
 
     @staticmethod
     def _evaluate_failed_cases_first(
@@ -877,13 +936,12 @@ class GeneratorManager:
                     retry_node_id=latest_failure.get("node_id"),
                 )
             except _OpenCodeTimeoutError as exc:
-                if len(exc.timeout_attempts) < 2:
-                    raise
-                self._stall_for_model_timeout(
+                failures.append(self._record_model_timeout(
                     generation, current, exc,
                     accepted_layers=accepted_layers, iteration=iteration,
                     node_id=latest_failure.get("node_id"),
-                )
+                ))
+                continue
             try:
                 candidate, action, touched_node_id, summary = _apply_creation_step(
                     current, raw, generation.harness_agent_ids,
@@ -1126,12 +1184,11 @@ class GeneratorManager:
                     retry_silent_timeout=bool(failures),
                 )
             except _OpenCodeTimeoutError as exc:
-                if len(exc.timeout_attempts) < 2:
-                    raise
-                self._stall_for_model_timeout(
+                failures.append(self._record_model_timeout(
                     generation, current, exc,
                     accepted_layers=attempt, iteration=attempt, node_id=None,
-                )
+                ))
+                continue
             # 规范化 + 静态校验
             try:
                 normalized = _normalize_workflow_result(
@@ -1209,7 +1266,7 @@ class GeneratorManager:
                 "attempt": attempt, "reverted": True, "reason": "full_evaluation",
             })
 
-    def _build_toolcalls(
+    def _build_agent_loop(
         self,
         generation: Generation,
         spec: Any,
@@ -1219,20 +1276,27 @@ class GeneratorManager:
         evaluator: WorkflowEvaluator,
         catalog_json: str,
     ) -> WorkflowSpec:
-        """工具调用模式（借鉴 WorkflowAgent 的 Agent + Tools 架构）。
+        """LLM Agent Loop（DAG 工具宿主，兼容旧 toolcalls 协议）。
 
         与 _build_incrementally 的区别：模型一次响应可以输出**多个**图操作
         （有序数组），服务端逐个校验、逐个应用、逐个回填结果，模型据此自主
         决定下一步，而不是「每次响应只能一个操作」。控制权从服务端硬编码
-        转移到模型，服务端只做确定性校验与运行时探测兜底。
+        转移到模型，服务端只做确定性校验与运行时探测兜底；agent_loop
+        还允许模型显式选择 evaluate、finalize 和 ask_user。
         """
         current = original.model_copy(deep=True)
         failures = [json.loads(json.dumps(item, ensure_ascii=False)) for item in generation.initial_failures]
         accepted_layers = 0
         evaluation_locked = False
+        evaluation_passed = False
+        evaluation_fingerprint: str | None = None
         failed_case_ids: set[str] = set()
         progress = _BuildProgressGuard.from_workflow(current)
-        max_iterations = _incremental_max_iterations()
+        max_iterations = (
+            _agent_loop_max_iterations()
+            if generation.build_mode == "agent_loop"
+            else _incremental_max_iterations()
+        )
         iteration = 0
         chains_text = command_chain_catalog_text()
         while True:
@@ -1242,10 +1306,11 @@ class GeneratorManager:
             if max_iterations and iteration > max_iterations:
                 raise RuntimeError(f"工具调用构建达到最大迭代次数 {max_iterations}，原工作流未改变")
             generation.emit("generation.stage", {
-                "stage": "toolcalls_planning", "iteration": iteration,
+                "stage": "agent_loop_turn" if generation.build_mode == "agent_loop" else "toolcalls_planning",
+                "iteration": iteration,
                 "accepted_layers": accepted_layers,
             })
-            prompt = TOOLCALLS_PROMPT.format(
+            prompt = AGENT_LOOP_PROMPT.format(
                 chains=chains_text,
                 catalog=catalog_json,
                 request=generation.prompt,
@@ -1262,13 +1327,12 @@ class GeneratorManager:
                     retry_node_id=latest_failure.get("node_id"),
                 )
             except _OpenCodeTimeoutError as exc:
-                if len(exc.timeout_attempts) < 2:
-                    raise
-                self._stall_for_model_timeout(
+                failures.append(self._record_model_timeout(
                     generation, current, exc,
                     accepted_layers=accepted_layers, iteration=iteration,
                     node_id=latest_failure.get("node_id"),
-                )
+                ))
+                continue
             try:
                 actions = _coerce_action_list(raw)
             except RuntimeError as exc:
@@ -1282,8 +1346,26 @@ class GeneratorManager:
                 if generation.cancelled:
                     raise RuntimeError("生成已取消")
                 raw_action = str(action.get("action", "")).strip()
-                # 完成信号：整图完整 → 运行时验收
-                if raw_action == "complete":
+                if raw_action == "ask_user":
+                    question = str(action.get("question") or action.get("message") or "").strip()
+                    if not question:
+                        failure = {
+                            "phase": "agent_loop_contract", "message": "ask_user 缺少 question",
+                            "iteration": iteration, "candidate_accepted": False,
+                        }
+                        failures.append(failure)
+                        generation.emit("generation.layer_failed", failure)
+                        halted = True
+                        break
+                    generation.emit("generation.agent_tool", {
+                        "action": raw_action, "accepted": True,
+                        "question": question, "options": action.get("options", []),
+                        "iteration": iteration,
+                    })
+                    self._await_user(generation, current, question, action.get("options", []), iteration)
+
+                # LLM 显式请求真实验收；complete 保留旧协议的隐式 finalize 语义。
+                if raw_action in {"evaluate", "complete"}:
                     if not evaluation_locked:
                         generation.emit("generation.stage", {"stage": "preparing_cases"})
                         case_prompt = (
@@ -1303,12 +1385,21 @@ class GeneratorManager:
                     result, failed_case_ids = self._evaluate_failed_cases_first(
                         generation, evaluator, project, current, iteration, failed_case_ids,
                     )
+                    evaluation_passed = bool(result.passed)
+                    evaluation_fingerprint = _workflow_semantic_fingerprint(current)
+                    generation.emit("generation.agent_tool", {
+                        "action": raw_action, "accepted": evaluation_passed,
+                        "passed": evaluation_passed, "iteration": iteration,
+                        "feedback": self._result_feedback(result),
+                    })
                     if result.passed:
-                        generation.emit("generation.workflow_verified", {
-                            "validation_tier": "full_runtime_evaluation",
-                            "layers": accepted_layers, "iterations": iteration,
-                        })
-                        return current
+                        if raw_action == "complete":
+                            generation.emit("generation.workflow_verified", {
+                                "validation_tier": "full_runtime_evaluation",
+                                "layers": accepted_layers, "iterations": iteration,
+                            })
+                            return current
+                        continue
                     failure = {
                         "phase": "full_evaluation", "feedback": self._result_feedback(result),
                         "iteration": iteration, "action": "complete", "candidate_accepted": False,
@@ -1321,6 +1412,30 @@ class GeneratorManager:
                     })
                     halted = True
                     break
+                if raw_action == "finalize":
+                    current_fingerprint = _workflow_semantic_fingerprint(current)
+                    if not evaluation_passed or current_fingerprint != evaluation_fingerprint:
+                        failure = {
+                            "phase": "agent_loop_finalize",
+                            "message": "finalize 前必须先让当前未变更 DAG 通过 evaluate",
+                            "iteration": iteration, "candidate_accepted": False,
+                        }
+                        failures.append(failure)
+                        generation.emit("generation.agent_tool", {
+                            "action": raw_action, "accepted": False,
+                            "iteration": iteration, "message": failure["message"],
+                        })
+                        generation.emit("generation.layer_failed", failure)
+                        halted = True
+                        break
+                    generation.emit("generation.agent_tool", {
+                        "action": raw_action, "accepted": True, "iteration": iteration,
+                    })
+                    generation.emit("generation.workflow_verified", {
+                        "validation_tier": "full_runtime_evaluation",
+                        "layers": accepted_layers, "iterations": iteration,
+                    })
+                    return current
                 # 普通操作：逐个校验、应用、探测
                 try:
                     candidate, act, touched, probe_input, probe_approvals, summary = _apply_incremental_step(
@@ -1339,9 +1454,11 @@ class GeneratorManager:
                 static_errors = _incremental_connectivity_errors(
                     spec, current, candidate, act, touched, require_output=False,
                 )
-                if static_errors and act != "delete_node":
+                dag_errors = _dag_errors(candidate)
+                static_errors = list(dict.fromkeys([*dag_errors, *static_errors]))
+                if static_errors and (act != "delete_node" or dag_errors):
                     failure = {
-                        "phase": "connectivity", "errors": static_errors, "action": act,
+                        "phase": "dag" if dag_errors else "connectivity", "errors": static_errors, "action": act,
                         "node_id": touched, "iteration": iteration, "candidate_accepted": False,
                     }
                     failures.append(failure)
@@ -1383,6 +1500,8 @@ class GeneratorManager:
                 if not progress.accept(candidate):
                     raise RuntimeError("内部进展状态不一致：候选图已被接受")
                 current = candidate
+                evaluation_passed = False
+                evaluation_fingerprint = None
                 generation.draft = current.model_dump(mode="json")
                 accepted_layers += 1
                 generation.emit("generation.layer_completed", {
@@ -1396,6 +1515,21 @@ class GeneratorManager:
             if halted:
                 failures = failures[-5:]
                 continue
+
+    def _build_toolcalls(
+        self,
+        generation: Generation,
+        spec: Any,
+        command: list[str],
+        workdir: Path,
+        original: WorkflowSpec,
+        evaluator: WorkflowEvaluator,
+        catalog_json: str,
+    ) -> WorkflowSpec:
+        """Compatibility wrapper for legacy toolcalls mode."""
+        return self._build_agent_loop(
+            generation, spec, command, workdir, original, evaluator, catalog_json,
+        )
 
     def _build_incrementally(
         self,
@@ -1458,13 +1592,12 @@ class GeneratorManager:
                     retry_node_id=latest_failure.get("node_id"),
                 )
             except _OpenCodeTimeoutError as exc:
-                if len(exc.timeout_attempts) < 2:
-                    raise
-                self._stall_for_model_timeout(
+                failures.append(self._record_model_timeout(
                     generation, current, exc,
                     accepted_layers=accepted_layers, iteration=iteration,
                     node_id=latest_failure.get("node_id"),
-                )
+                ))
+                continue
             raw_action = raw.get("action") if isinstance(raw, dict) else None
             if generation.optimize_only and raw_action == "delete_node":
                 failure = {
@@ -2183,31 +2316,15 @@ class GeneratorManager:
         retry_silent_timeout: bool = False,
         retry_node_id: str | None = None,
     ) -> Any:
-        try:
-            text = self._invoke_for_result(
-                generation, spec, command, workdir, prompt, timeout_seconds, purpose,
-            )
-        except _OpenCodeTimeoutError as first:
-            if not retry_silent_timeout or not first.silent:
-                raise
-            generation.emit("generation.repairing", {
-                "phase": "model_timeout",
-                "node_id": retry_node_id,
-                "attempt": 2,
-                "attempts": 2,
-                "previous_call_id": first.call_id,
-                "message": "OpenCode 修复调用静默超时，正在使用同一模型自动重试",
-                "strategy": "retry_same_model",
-            })
-            retry_purpose = f"{purpose}（静默超时自动重试 2/2）"
-            try:
-                text = self._invoke_for_result(
-                    generation, spec, command, workdir, prompt, timeout_seconds, retry_purpose,
-                    call_attempt=2, previous_call_id=first.call_id,
-                )
-            except _OpenCodeTimeoutError as second:
-                second.timeout_attempts = [*first.timeout_attempts, second.evidence()]
-                raise
+        """Parse model result while recovering every model timeout.
+
+        ``retry_silent_timeout`` remains accepted for embedding compatibility;
+        timeout activity level no longer changes recovery policy.
+        """
+        text = self._invoke_with_timeout_recovery(
+            generation, spec, command, workdir, prompt, timeout_seconds, purpose,
+            retry_node_id=retry_node_id,
+        )
         try:
             return _parse_result(text)
         except StructuredResultError:
@@ -2215,13 +2332,75 @@ class GeneratorManager:
                 f"{prompt}\n\n你上一次没有返回可解析的结构化 JSON。请重新完成同一任务，只输出一个 "
                 "<result>{合法 JSON}</result>，不要使用注释、尾随逗号、单引号或任何额外说明。"
             )
-            retry_text = self._invoke_for_result(
+            retry_text = self._invoke_with_timeout_recovery(
                 generation, spec, command, workdir, retry_prompt, timeout_seconds, f"{purpose}（严格重试）",
+                retry_node_id=retry_node_id,
             )
             try:
                 return _parse_result(retry_text)
             except StructuredResultError as exc:
                 raise StructuredResultError(f"{purpose}未返回有效的结构化 JSON（已自动严格重试 1 次）") from exc
+
+    def _invoke_with_timeout_recovery(
+        self,
+        generation: Generation,
+        spec: Any,
+        command: list[str],
+        workdir: Path,
+        prompt: str,
+        timeout_seconds: int | None,
+        purpose: str,
+        *,
+        retry_node_id: str | None = None,
+    ) -> str:
+        """Retry model timeouts without converting them into user work.
+
+        Timeout is recoverable model/process state. Keep same prompt, model,
+        and workflow context; only explicit cancellation or configured retry
+        budget ends this loop. Normal process/protocol errors still propagate.
+        """
+        timeout_count = 0
+        timeout_attempts: list[dict[str, Any]] = []
+        call_attempt = 1
+        previous_call_id: str | None = None
+        while True:
+            if generation.cancelled:
+                raise RuntimeError("生成已取消")
+            kwargs: dict[str, Any] = {}
+            if call_attempt != 1:
+                kwargs["call_attempt"] = call_attempt
+            if previous_call_id is not None:
+                kwargs["previous_call_id"] = previous_call_id
+            try:
+                text = self._invoke_for_result(
+                    generation, spec, command, workdir, prompt, timeout_seconds, purpose,
+                    **kwargs,
+                )
+                if generation.cancelled:
+                    raise RuntimeError("生成已取消")
+                return text
+            except _OpenCodeTimeoutError as exc:
+                if generation.cancelled:
+                    raise RuntimeError("生成已取消") from exc
+                evidence = exc.timeout_attempts or [exc.evidence()]
+                timeout_count += len(evidence)
+                timeout_attempts = [*timeout_attempts, *evidence][-20:]
+                limit = _model_timeout_retry_limit()
+                if limit and timeout_count > limit:
+                    exc.timeout_attempts = timeout_attempts
+                    raise
+                call_attempt = timeout_count + 1
+                previous_call_id = exc.call_id
+                generation.emit("generation.repairing", {
+                    "phase": "model_timeout",
+                    "node_id": retry_node_id,
+                    "attempt": call_attempt,
+                    "attempts": call_attempt,
+                    "previous_call_id": exc.call_id,
+                    "timeout_attempts": timeout_count,
+                    "message": f"{purpose}调用超时，正在自动继续第 {call_attempt} 次尝试",
+                    "strategy": "retry_same_model",
+                })
 
     def _invoke_for_result(
         self,
@@ -2377,10 +2556,10 @@ class GeneratorManager:
     @staticmethod
     def _result_feedback(result: CandidateResult) -> dict[str, Any]:
         return {
-            "validation_errors": result.errors,
+            "validation_errors": getattr(result, "errors", []),
             "case_failures": [
                 {"case_id": case.case_id, "errors": case.errors, "semantic_score": case.semantic_score, "opencode_verified": case.opencode_verified}
-                for case in result.cases if not case.passed
+                for case in getattr(result, "cases", []) if not case.passed
             ],
         }
 
@@ -2552,6 +2731,14 @@ def _repair_timeout_seconds() -> int:
         return 60
 
 
+def _model_timeout_retry_limit() -> int:
+    """Return optional finite timeout retry budget; zero means unlimited."""
+    try:
+        return max(0, min(int(os.environ.get("OPENAGENT_MODEL_TIMEOUT_RETRIES", "0")), 10000))
+    except ValueError:
+        return 0
+
+
 def _incremental_probe_timeout_seconds() -> int:
     try:
         return max(30, min(int(os.environ.get("OPENAGENT_INCREMENTAL_PROBE_TIMEOUT", "120")), 1800))
@@ -2567,6 +2754,14 @@ def _incremental_max_iterations() -> int:
         return 100
 
 
+def _agent_loop_max_iterations() -> int:
+    """Return optional safety cap; zero means LLM loop continues until success."""
+    try:
+        return max(0, min(int(os.environ.get("OPENAGENT_AGENT_LOOP_MAX_ITERATIONS", "0")), 100000))
+    except ValueError:
+        return 0
+
+
 def _direct_max_attempts() -> int:
     """直出生成最多重试几轮（静态校验失败或验收失败都会计入）。"""
     try:
@@ -2579,15 +2774,21 @@ def _modify_build_mode() -> str:
     """修改/修复工作流的生成模式。
 
     从 OPENAGENT_GENERATOR_MODE 读取，取值：
-    - "toolcalls"：工具调用模式（默认）—— 模型一次输出多个图操作，自主建图
+    - "agent_loop"：LLM Agent Loop（默认）—— 模型自主选择建图、验收、修复、结束
+    - "toolcalls"：兼容工具调用模式——模型一次输出多个图操作
     - "chain" / "incremental"：增量链模式（逃生舱）—— 每轮一个语义批次
     - "blueprint"：蓝图直出（整图重写，一般不用于 modify）
-    未知或未设置时默认 toolcalls。
+    未知或未设置时默认 agent_loop。
     """
-    value = os.environ.get("OPENAGENT_GENERATOR_MODE", "toolcalls").strip().lower()
-    if value in {"toolcalls", "chain", "incremental", "blueprint"}:
+    value = os.environ.get("OPENAGENT_GENERATOR_MODE", "agent_loop").strip().lower()
+    if value in {"agent_loop", "toolcalls", "chain", "incremental", "blueprint"}:
         return value
-    return "toolcalls"
+    return "agent_loop"
+
+
+def _create_build_mode() -> str:
+    """Creation uses same model-driven loop; legacy modes remain explicit opt-ins."""
+    return _modify_build_mode()
 
 
 def _compaction_timeout_seconds() -> int:
@@ -2865,6 +3066,45 @@ def _edge_key(value: Any) -> tuple[str, str, str | None]:
     if isinstance(value, dict):
         return str(value.get("source", "")), str(value.get("target", "")), value.get("condition")
     return value.source, value.target, value.condition
+
+
+def _dag_errors(workflow: WorkflowSpec) -> list[str]:
+    """Validate graph shape only; partial DAGs may omit output/runtime fields."""
+    node_ids = [node.id for node in workflow.nodes]
+    known = set(node_ids)
+    errors: list[str] = []
+    if len(node_ids) != len(known):
+        errors.append("工作流包含重复节点编号")
+    indegree = {node_id: 0 for node_id in known}
+    outgoing = {node_id: [] for node_id in known}
+    seen_edges: set[tuple[str, str, str | None]] = set()
+    for edge in workflow.edges:
+        key = (edge.source, edge.target, edge.condition)
+        if key in seen_edges:
+            errors.append("工作流包含重复连线")
+        seen_edges.add(key)
+        if edge.source not in known or edge.target not in known:
+            errors.append(f"连线引用了不存在的节点：{edge.source} → {edge.target}")
+            continue
+        if edge.source == edge.target:
+            errors.append(f"不允许自环连线：{edge.source}")
+            continue
+        indegree[edge.target] += 1
+        outgoing[edge.source].append(edge.target)
+    if errors:
+        return list(dict.fromkeys(errors))
+    queue = [node_id for node_id, degree in indegree.items() if degree == 0]
+    visited = 0
+    while queue:
+        node_id = queue.pop()
+        visited += 1
+        for target in outgoing[node_id]:
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                queue.append(target)
+    if visited != len(known):
+        errors.append("工作流包含图循环；请使用循环节点表达有限次数循环")
+    return errors
 
 
 def _apply_creation_step(

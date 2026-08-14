@@ -149,6 +149,31 @@ def test_generator_applies_incremental_operations(tmp_path: Path):
     assert [event["event"] for event in generation.events] == ["workflow.node.added", "workflow.node.added", "workflow.edge.added"]
 
 
+def test_public_generation_entries_default_to_agent_loop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """create/start/optimize must all enter LLM-controlled Agent Loop by default."""
+    monkeypatch.delenv("OPENAGENT_GENERATOR_MODE", raising=False)
+    store = SpecStore(tmp_path / "project.yaml")
+    store.save(ProjectSpec.model_validate({
+        "version": "1",
+        "name": "入口选择",
+        "workflows": [{"id": "existing", "name": "已有流程", "nodes": [], "edges": []}],
+    }))
+    manager = GeneratorManager(store)
+    monkeypatch.setattr(manager, "ensure_ready", lambda _spec: {"model": "test-model"})
+    launched: list[Generation] = []
+    monkeypatch.setattr(manager, "_launch", lambda generation, _spec: launched.append(generation))
+
+    created = manager.create("创建新流程", workflow_id="created")
+    started = manager.start("existing", "修改已有流程")
+    started.completed = True
+    optimized = manager.optimize("existing")
+
+    assert [item.build_mode for item in (created, started, optimized)] == [
+        "agent_loop", "agent_loop", "agent_loop",
+    ]
+    assert launched == [created, started, optimized]
+
+
 def test_generator_detects_long_commands_and_windows_error(monkeypatch):
     monkeypatch.setenv("OPENAGENT_COMPACT_COMMAND_LENGTH", "1000")
 
@@ -446,6 +471,44 @@ def test_repair_silent_timeout_retries_same_prompt_once(tmp_path: Path):
     assert retry["data"]["attempt"] == 2
 
 
+def test_model_timeout_keeps_retrying_until_result_without_stalling(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="timeout-until-success", workflow_id="flow", base_etag="etag", draft={}, prompt="x")
+    calls = 0
+
+    def fake_invoke(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise _timeout_error(f"call-{calls}")
+        return '<result>{"action":"complete"}</result>'
+
+    manager._invoke = fake_invoke
+    result = manager._invoke_result(
+        generation, None, [], tmp_path, "同一修复提示", "增量修复",
+        timeout_seconds=60, retry_silent_timeout=True, retry_node_id="worker",
+    )
+
+    assert result == {"action": "complete"}
+    assert calls == 3
+    assert not any(item["event"] == "generation.stalled" for item in generation.events)
+    retries = [item for item in generation.events if item["event"] == "generation.repairing"]
+    assert [item["data"]["attempt"] for item in retries] == [2, 3]
+
+
+def test_model_timeout_retry_honors_user_cancellation(tmp_path: Path):
+    manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
+    generation = Generation(id="timeout-cancel", workflow_id="flow", base_etag="etag", draft={}, prompt="x")
+
+    def fake_invoke(*_args, **_kwargs):
+        generation.cancelled = True
+        raise _timeout_error("cancelled-call")
+
+    manager._invoke = fake_invoke
+    with pytest.raises(RuntimeError, match="生成已取消"):
+        manager._invoke_result(generation, None, [], tmp_path, "提示", "修复")
+
+
 def test_retry_call_logs_attempt_and_previous_call_id(monkeypatch, tmp_path: Path):
     manager = GeneratorManager(SpecStore(tmp_path / "project.yaml"))
     generation = Generation(
@@ -485,7 +548,9 @@ def test_retry_call_logs_attempt_and_previous_call_id(monkeypatch, tmp_path: Pat
     assert all(record["previous_call_id"] == "call-1" for record in records)
 
 
-def test_two_repair_timeouts_stall_and_preserve_store(tmp_path: Path):
+def test_two_repair_timeouts_fail_without_stall_dialog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setenv("OPENAGENT_MODEL_TIMEOUT_RETRIES", "1")
+    monkeypatch.setenv("OPENAGENT_INCREMENTAL_MAX_ITERATIONS", "1")
     store = SpecStore(tmp_path / "project.yaml")
     project = ProjectSpec.model_validate({
         "version": "1", "name": "超时暂停", "project_dir": str(tmp_path),
@@ -512,18 +577,20 @@ def test_two_repair_timeouts_stall_and_preserve_store(tmp_path: Path):
     manager._run(generation, project)
 
     assert calls == 2
-    assert generation.events[-1]["event"] == "generation.stalled"
-    stalled = generation.events[-1]["data"]
-    assert stalled["reason"] == "model_timeout"
-    assert stalled["attempts"] == 2
-    assert stalled["node_id"] == "done"
-    assert stalled["last_failure"]["call_ids"] == ["call-1", "call-2"]
-    assert stalled["last_failure"]["timeout_seconds"] == 60
+    assert generation.events[-1]["event"] == "generation.failed"
+    assert not any(item["event"] == "generation.stalled" for item in generation.events)
+    timeout_failure = next(item for item in generation.events if item["event"] == "generation.layer_failed")
+    assert timeout_failure["data"]["reason"] == "model_timeout"
+    assert timeout_failure["data"]["node_id"] == "done"
+    assert timeout_failure["data"]["call_ids"] == ["call-1", "call-2"]
+    assert timeout_failure["data"]["timeout_seconds"] == 60
     assert store.etag() == original_etag
     assert store.load().workflows[0].nodes[0].data["template"] == "旧结果"
 
 
-def test_second_active_repair_timeout_still_stalls_with_activity(tmp_path: Path):
+def test_second_active_repair_timeout_keeps_activity_without_stall_dialog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setenv("OPENAGENT_MODEL_TIMEOUT_RETRIES", "1")
+    monkeypatch.setenv("OPENAGENT_INCREMENTAL_MAX_ITERATIONS", "1")
     store = SpecStore(tmp_path / "project.yaml")
     project = ProjectSpec.model_validate({
         "version": "1", "name": "活动超时", "project_dir": str(tmp_path),
@@ -548,14 +615,17 @@ def test_second_active_repair_timeout_still_stalls_with_activity(tmp_path: Path)
     manager._invoke = fake_invoke
     manager._run(generation, project)
 
-    stalled = generation.events[-1]["data"]
-    assert generation.events[-1]["event"] == "generation.stalled"
-    assert stalled["last_failure"]["timeout_attempts"][0]["silent"] is True
-    assert stalled["last_failure"]["timeout_attempts"][1]["silent"] is False
-    assert stalled["last_failure"]["last_activity"]["output_chars"] == 12
+    assert generation.events[-1]["event"] == "generation.failed"
+    assert not any(item["event"] == "generation.stalled" for item in generation.events)
+    timeout_failure = next(item for item in generation.events if item["event"] == "generation.layer_failed")
+    assert timeout_failure["data"]["timeout_attempts"][0]["silent"] is True
+    assert timeout_failure["data"]["timeout_attempts"][1]["silent"] is False
+    assert timeout_failure["data"]["last_activity"]["output_chars"] == 12
 
 
-def test_planning_silent_timeout_does_not_retry(tmp_path: Path):
+def test_planning_timeout_retries_then_fails_without_stall_dialog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setenv("OPENAGENT_MODEL_TIMEOUT_RETRIES", "1")
+    monkeypatch.setenv("OPENAGENT_INCREMENTAL_MAX_ITERATIONS", "1")
     store = SpecStore(tmp_path / "project.yaml")
     project = ProjectSpec.model_validate({
         "version": "1", "name": "规划超时", "project_dir": str(tmp_path),
@@ -579,9 +649,10 @@ def test_planning_silent_timeout_does_not_retry(tmp_path: Path):
     manager._invoke = fake_invoke
     manager._run(generation, project)
 
-    assert calls == 1
+    assert calls == 2
     assert generation.events[-1]["event"] == "generation.failed"
-    assert "planning-call" in generation.events[-1]["data"]["message"]
+    assert any("planning-call" in str(item["data"].get("message")) for item in generation.events if item["event"] == "generation.layer_failed")
+    assert not any(item["event"] == "generation.stalled" for item in generation.events)
 
 
 def test_generator_normalizes_evaluation_collection_fields():
